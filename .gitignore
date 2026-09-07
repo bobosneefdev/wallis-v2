@@ -1,0 +1,6 @@
+node_modules/
+apps/desktop/dist/
+**/.turbo/
+**/*.tsbuildinfo
+src-tauri/target/
+*.rs.bk
