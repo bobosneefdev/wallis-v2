@@ -92,11 +92,13 @@ chroot "$rootfs" su -s /bin/bash - wallis -c \
   "/bin/bash /tmp/hermes-install.sh --branch '$HERMES_AGENT_VERSION' --commit '$HERMES_AGENT_COMMIT' --skip-setup --skip-browser --skip-computer-use --no-skills --non-interactive"
 
 hermes_bin=/home/wallis/.local/bin/hermes
+hermes_uv=/home/wallis/.hermes/bin/uv
 hermes_python=/home/wallis/.hermes/hermes-agent/venv/bin/python
 chroot "$rootfs" test -x "$hermes_bin"
+chroot "$rootfs" test -x "$hermes_uv"
 chroot "$rootfs" test -x "$hermes_python"
 chroot "$rootfs" su -s /bin/bash - wallis -c \
-  "PATH=/home/wallis/.hermes/hermes-agent/venv/bin:/home/wallis/.local/bin:\$PATH \"$hermes_python\" -m pip install --no-cache-dir \"mnemosyne-hermes==$MNEMOSYNE_HERMES_VERSION\" && \"$hermes_bin\" config set memory.provider mnemosyne && \"$hermes_bin\" config set memory.memory_enabled false && \"$hermes_bin\" config set user_profile_enabled false"
+  "PATH=/home/wallis/.hermes/hermes-agent/venv/bin:/home/wallis/.local/bin:\$PATH \"$hermes_uv\" pip install --python \"$hermes_python\" --no-cache-dir \"mnemosyne-hermes==$MNEMOSYNE_HERMES_VERSION\" && \"$hermes_bin\" config set memory.provider mnemosyne && \"$hermes_bin\" config set memory.memory_enabled false && \"$hermes_bin\" config set user_profile_enabled false"
 chroot "$rootfs" su -s /bin/bash - wallis -c \
   "PATH=/home/wallis/.hermes/hermes-agent/venv/bin:/home/wallis/.local/bin:\$PATH \"$hermes_bin\" --version >/dev/null && \"$hermes_bin\" config get memory.provider | grep -Fx mnemosyne && \"$hermes_bin\" config get memory.memory_enabled | grep -Eiq '^(false|0)$' && \"$hermes_bin\" config get user_profile_enabled | grep -Eiq '^(false|0)$' && \"$hermes_bin\" memory status"
 
