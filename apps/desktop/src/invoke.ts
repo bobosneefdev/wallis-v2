@@ -7,10 +7,15 @@ export type SetupStatus = {
 export type RuntimeStatus = {
   state: "stopped" | "running" | "unavailable";
   message: string;
+  discordReady: boolean;
+  memoryReady: boolean;
 };
+
+export type SecretStatus = { hasToken: boolean };
 
 export type WallisConfig = {
   discordApplicationId: string;
+  discordAllowedUsers: string;
   personaName: string;
   memoryProvider: "mnemosyne";
   autoStart: boolean;
@@ -28,6 +33,8 @@ type Commands = {
   import_wallis: RuntimeStatus;
   get_config: WallisConfig;
   save_config: WallisConfig;
+  get_secret_status: SecretStatus;
+  save_discord_token: SecretStatus;
 };
 
 declare global {
@@ -38,6 +45,7 @@ declare global {
 
 const fallback: WallisConfig = {
   discordApplicationId: "",
+  discordAllowedUsers: "",
   personaName: "Wallis",
   memoryProvider: "mnemosyne",
   autoStart: false,

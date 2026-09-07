@@ -4,19 +4,26 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::Mutex;
 #[cfg(target_os = "windows")]
 use std::time::Duration;
-use tauri::State;
+use tauri::{Manager, State};
 
 const DISTRO: &str = "Wallis";
 const USER: &str = "wallis";
+const CONFIG_FILE: &str = "config.json";
+const TOKEN_FILE: &str = "discord-token.dpapi";
 const WSL_CONF: &str = "[automount]\nenabled=false\n\n[interop]\nenabled=false\nappendWindowsPath=false\n\n[user]\ndefault=wallis\n";
 
-#[derive(Default)]
-struct AppState { config: Mutex<WallisConfig>, hermes: Mutex<Option<Child>> }
+struct AppState { config: Mutex<WallisConfig>, app_data: Mutex<Option<PathBuf>>, memory_ready: Mutex<bool>, hermes: Mutex<Option<Child>> }
+
+impl Default for AppState {
+    fn default() -> Self { Self { config: Mutex::new(WallisConfig::default()), app_data: Mutex::new(None), memory_ready: Mutex::new(false), hermes: Mutex::new(None) } }
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WallisConfig {
     discord_application_id: String,
+    #[serde(default)]
+    discord_allowed_users: String,
     persona_name: String,
     memory_provider: String,
     auto_start: bool,
@@ -27,7 +34,7 @@ struct WallisConfig {
 
 impl Default for WallisConfig {
     fn default() -> Self {
-        Self { discord_application_id: String::new(), persona_name: "Wallis".into(), memory_provider: "mnemosyne".into(), auto_start: false, rootfs_archive: String::new(), rootfs_sha256: String::new(), distro_root: String::new() }
+        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), persona_name: "Wallis".into(), memory_provider: "mnemosyne".into(), auto_start: false, rootfs_archive: String::new(), rootfs_sha256: String::new(), distro_root: String::new() }
     }
 }
 
@@ -37,7 +44,11 @@ struct SetupStatus { wsl2_available: bool, wsl_version: String, message: String 
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RuntimeStatus { state: String, message: String }
+struct RuntimeStatus { state: String, message: String, discord_ready: bool, memory_ready: bool }
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecretStatus { has_token: bool }
 
 fn decode_wsl_output(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes.chunks_exact(2).any(|pair| pair[1] == 0) {
@@ -91,6 +102,106 @@ fn default_distro_root() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\Users\\Public\\AppData\\Local")).join("Wallis").join("distro")
 }
 
+fn config_path(app_data: &std::path::Path) -> PathBuf { app_data.join(CONFIG_FILE) }
+fn token_path(app_data: &std::path::Path) -> PathBuf { app_data.join(TOKEN_FILE) }
+
+fn load_config_file(path: &std::path::Path) -> Result<WallisConfig, String> {
+    if !path.is_file() { return Ok(WallisConfig::default()); }
+    serde_json::from_slice(&std::fs::read(path).map_err(|error| format!("Unable to read Wallis configuration: {error}"))?)
+        .map_err(|error| format!("Wallis configuration is invalid: {error}"))
+}
+
+fn save_config_file(path: &std::path::Path, config: &WallisConfig) -> Result<(), String> {
+    let parent = path.parent().ok_or("Unable to determine the Wallis configuration folder.")?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("Unable to create the Wallis configuration folder: {error}"))?;
+    let temporary = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(config).map_err(|error| format!("Unable to serialize Wallis configuration: {error}"))?;
+    std::fs::write(&temporary, bytes).map_err(|error| format!("Unable to write Wallis configuration: {error}"))?;
+    let result = std::fs::copy(&temporary, path).map(|_| ()).map_err(|error| format!("Unable to replace Wallis configuration: {error}"));
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
+fn validate_allowed_users(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || !value.split(',').all(|id| (10..=25).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_digit())) {
+        return Err("Add at least one numeric Discord user ID to the allow-list.".into());
+    }
+    Ok(value.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn protect_token(path: &std::path::Path, token: &str) -> Result<(), String> {
+    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN};
+    use windows_sys::Win32::Foundation::LocalFree;
+    let mut input = CRYPT_INTEGER_BLOB { cbData: token.len() as u32, pbData: token.as_ptr() as *mut u8 };
+    let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+    let ok = unsafe { CryptProtectData(&mut input, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output) };
+    if ok == 0 { return Err("Windows could not protect the Discord token.".into()); }
+    let temporary = path.with_extension("dpapi.tmp");
+    let result = std::fs::write(&temporary, unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) })
+        .map_err(|error| format!("Unable to store the protected Discord token: {error}"))
+        .and_then(|_| {
+            let backup = path.with_extension("dpapi.bak");
+            let _ = std::fs::remove_file(&backup);
+            if path.exists() { std::fs::rename(path, &backup).map_err(|error| format!("Unable to replace the protected Discord token: {error}"))?; }
+            match std::fs::rename(&temporary, path) {
+                Ok(()) => { let _ = std::fs::remove_file(backup); Ok(()) }
+                Err(error) => {
+                    let _ = std::fs::rename(&backup, path);
+                    Err(format!("Unable to replace the protected Discord token: {error}"))
+                }
+            }
+        });
+    unsafe { LocalFree(output.pbData as *mut _); }
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn unprotect_token(path: &std::path::Path) -> Result<String, String> {
+    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+    use windows_sys::Win32::Foundation::LocalFree;
+    let bytes = std::fs::read(path).map_err(|error| format!("Unable to read the protected Discord token: {error}"))?;
+    let mut input = CRYPT_INTEGER_BLOB { cbData: bytes.len() as u32, pbData: bytes.as_ptr() as *mut u8 };
+    let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+    let ok = unsafe { CryptUnprotectData(&mut input, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), 0, &mut output) };
+    if ok == 0 { return Err("Windows could not unlock the Discord token. Save it again.".into()); }
+    let result = String::from_utf8(unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec()).map_err(|_| "The stored Discord token is invalid UTF-8.".to_string());
+    unsafe { LocalFree(output.pbData as *mut _); }
+    result
+}
+
+#[cfg(not(target_os = "windows"))]
+fn protect_token(_path: &std::path::Path, _token: &str) -> Result<(), String> { Err("Wallis currently requires Windows DPAPI for token storage.".into()) }
+#[cfg(not(target_os = "windows"))]
+fn unprotect_token(_path: &std::path::Path) -> Result<String, String> { Err("Wallis currently requires Windows DPAPI for token storage.".into()) }
+
+fn validate_token(token: &str) -> Result<(), String> {
+    if token.is_empty() || token.len() > 512 || token.bytes().any(|byte| byte == b'\r' || byte == b'\n' || byte == 0) { return Err("Discord token must be non-empty and cannot contain newlines.".into()); }
+    Ok(())
+}
+
+fn validate_persona_name(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let valid_prefix = value == "Wallis" || value.strip_prefix("Wallis").and_then(|rest| rest.chars().next()).map_or(false, |first| !first.is_alphanumeric());
+    if !valid_prefix || value.len() > 80 || value.chars().any(char::is_control) { return Err("Persona name must start with Wallis and contain no control characters.".into()); }
+    Ok(value.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn apply_soul(persona_name: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut child = Command::new("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "tee", "/home/wallis/.hermes/SOUL.md"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|error| format!("Unable to configure the Wallis persona: {error}"))?;
+    let content = format!("# Wallis identity\nYou are {persona_name}, the Wallis assistant.\n");
+    child.stdin.take().ok_or("Unable to open the persona configuration input.")?.write_all(content.as_bytes()).map_err(|error| format!("Unable to write the Wallis persona: {error}"))?;
+    let result = child.wait_with_output().map_err(|error| format!("Unable to apply the Wallis persona: {error}"))?;
+    if result.status.success() { Ok(()) } else { Err("Hermes could not apply the Wallis persona in the distro.".into()) }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_soul(_persona_name: &str) -> Result<(), String> { Err("Wallis currently requires Windows with WSL2.".into()) }
+
 fn validate_import_inputs(archive: &str, expected_sha256: &str, install_root: Option<&str>) -> Result<(PathBuf, String, PathBuf), String> {
     let archive = PathBuf::from(archive.trim());
     if !archive.is_absolute() || !archive.is_file() { return Err("Choose an existing rootfs .tar archive using an absolute path.".into()); }
@@ -106,6 +217,39 @@ fn wsl_output(args: &[&str]) -> Result<Output, String> { Command::new("wsl.exe")
 
 #[cfg(not(target_os = "windows"))]
 fn wsl_output(_args: &[&str]) -> Result<Output, String> { Err("Wallis currently requires Windows with WSL2.".into()) }
+
+fn hermes_command(args: &[&str]) -> Result<Output, String> {
+    let mut command = vec!["--distribution", DISTRO, "--user", USER, "--", "hermes"];
+    command.extend_from_slice(args);
+    wsl_output(&command)
+}
+
+fn memory_ready() -> Result<bool, String> {
+    let output = hermes_command(&["memory", "status"])?;
+    if !output.status.success() { return Ok(false); }
+    let text = decode_wsl_output(&output.stdout).to_ascii_lowercase();
+    Ok(text.contains("mnemosyne") && !text.contains("unavailable") && !text.contains("error"))
+}
+
+fn configure_hermes(persona_name: &str) -> Result<(), String> {
+    apply_soul(persona_name)?;
+    for args in [&["config", "set", "memory.provider", "mnemosyne"][..], &["config", "set", "memory.memory_enabled", "false"][..], &["config", "set", "user_profile_enabled", "false"][..]] {
+        let output = hermes_command(&args)?;
+        if !output.status.success() { return Err(format!("Hermes could not apply its Mnemosyne configuration ({}).", args.join(" "))); }
+    }
+    if !memory_ready()? { return Err("Mnemosyne is not ready. Install mnemosyne-hermes in the Wallis distro and try again.".into()); }
+    Ok(())
+}
+
+fn prerequisites(state: &AppState) -> Result<(String, String), String> {
+    let config = state.config.lock().expect("config state poisoned").clone();
+    let allowed = validate_allowed_users(&config.discord_allowed_users)?;
+    let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
+    if !token_path(&app_data).is_file() { return Err("No Discord token is configured. Save the bot token before starting Hermes.".into()); }
+    let token = unprotect_token(&token_path(&app_data))?;
+    validate_token(&token)?;
+    Ok((token, allowed))
+}
 
 fn check_wsl2() -> Result<(String, String), String> {
     let status = wsl_output(&["--status"])?;
@@ -129,7 +273,8 @@ fn inspect_hermes() -> Result<bool, String> {
     Ok(gateway_running(&decode_wsl_output(&output.stdout)))
 }
 
-fn stopped(message: impl Into<String>) -> RuntimeStatus { RuntimeStatus { state: "stopped".into(), message: message.into() } }
+fn status(state: &str, message: impl Into<String>, discord_ready: bool, memory_ready: bool) -> RuntimeStatus { RuntimeStatus { state: state.into(), message: message.into(), discord_ready, memory_ready } }
+fn stopped(message: impl Into<String>, discord_ready: bool, memory_ready: bool) -> RuntimeStatus { status("stopped", message, discord_ready, memory_ready) }
 
 #[tauri::command]
 fn get_setup_status() -> SetupStatus {
@@ -137,16 +282,21 @@ fn get_setup_status() -> SetupStatus {
 }
 
 #[tauri::command]
-fn get_runtime_status() -> RuntimeStatus {
-    if let Err(message) = check_wsl2() { return RuntimeStatus { state: "unavailable".into(), message }; }
+fn get_runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
+    if let Err(message) = check_wsl2() { return status("unavailable", message, false, false); }
     match distro_info() {
-        Ok(None) => stopped("Wallis is not imported. Import a verified rootfs archive to continue."),
+        Ok(None) => stopped("Wallis is not imported. Import a verified rootfs archive to continue.", false, false),
         Ok(Some(version)) => match require_wsl2_version(&version).and_then(|_| inspect_hermes()) {
-            Ok(true) => RuntimeStatus { state: "running".into(), message: "Hermes is running as the non-root wallis user.".into() },
-            Ok(false) => stopped("Wallis is imported; Hermes is stopped."),
-            Err(message) => RuntimeStatus { state: "unavailable".into(), message },
+            Ok(running) => {
+                let discord_ready = prerequisites(&state).is_ok();
+                let memory = memory_ready().unwrap_or_else(|_| *state.memory_ready.lock().expect("memory state poisoned"));
+                *state.memory_ready.lock().expect("memory state poisoned") = memory;
+                if running { status("running", "Hermes is running as the non-root wallis user.", discord_ready, memory) }
+                else { stopped("Wallis is imported; Hermes is stopped.", discord_ready, memory) }
+            }
+            Err(message) => status("unavailable", message, false, false),
         },
-        Err(message) => RuntimeStatus { state: "unavailable".into(), message },
+        Err(message) => status("unavailable", message, false, false),
     }
 }
 
@@ -167,7 +317,7 @@ fn import_wallis(rootfs_archive: String, expected_sha256: String, install_root: 
         let imported = Command::new("wsl.exe").args(["--import", DISTRO, root, path, "--version", "2"]).output().map_err(|error| format!("Unable to import the Wallis distro: {error}"))?;
         if !imported.status.success() { return Err("WSL rejected the Wallis rootfs import. Verify the archive is a Linux rootfs tar and WSL2 is supported.".into()); }
         apply_wsl_conf()?;
-        Ok(stopped("Wallis imported as WSL2 and configured for the non-root wallis user."))
+        Ok(stopped("Wallis imported as WSL2 and configured for the non-root wallis user.", false, false))
     }
     #[cfg(not(target_os = "windows"))]
     { let _ = (archive, expected_sha256, root); Err("Wallis currently requires Windows with WSL2.".into()) }
@@ -185,15 +335,26 @@ fn apply_wsl_conf() -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn start_hermes(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
+fn start_hermes_impl(state: &AppState) -> Result<RuntimeStatus, String> {
     let (_, _) = check_wsl2()?;
     match distro_info()? { None => return Err("Wallis is not imported. Import a verified rootfs archive first.".into()), Some(version) => require_wsl2_version(&version)? }
-    if inspect_hermes()? { return Ok(RuntimeStatus { state: "running".into(), message: "Hermes is already running as the non-root wallis user.".into() }); }
+    let config = state.config.lock().expect("config state poisoned").clone();
+    let persona_name = validate_persona_name(&config.persona_name)?;
+    let (token, allowed) = prerequisites(state)?;
+    configure_hermes(&persona_name)?;
+    *state.memory_ready.lock().expect("memory state poisoned") = true;
+    if inspect_hermes()? { return Ok(status("running", "Hermes is already running as the non-root wallis user.", true, true)); }
     #[cfg(target_os = "windows")]
     {
-        let child = Command::new("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "hermes", "gateway"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|error| format!("Unable to start Hermes as wallis: {error}"))?;
-        let mut child = child;
+        const GATEWAY_SCRIPT: &str = "IFS= read -r DISCORD_BOT_TOKEN; export DISCORD_BOT_TOKEN; IFS= read -r DISCORD_ALLOWED_USERS; export DISCORD_ALLOWED_USERS; exec hermes gateway";
+        let mut child = Command::new("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "bash", "-lc", GATEWAY_SCRIPT]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|error| format!("Unable to start Hermes as wallis: {error}"))?;
+        {
+            use std::io::Write;
+            let stdin = child.stdin.as_mut().ok_or("Unable to open the Hermes gateway input.")?;
+            stdin.write_all(token.as_bytes()).map_err(|error| format!("Unable to provide the Discord token to Hermes: {error}"))?;
+            stdin.write_all(b"\n").and_then(|_| stdin.write_all(allowed.as_bytes())).and_then(|_| stdin.write_all(b"\n")).map_err(|error| format!("Unable to provide the Hermes allow-list to Hermes: {error}"))?;
+        }
+        drop(child.stdin.take());
         for _ in 0..30 {
             if let Some(status) = child.try_wait().map_err(|error| format!("Unable to inspect the Hermes gateway startup: {error}"))? {
                 return Err(format!("Hermes gateway exited during startup ({status}). Check its configuration and credentials inside the Wallis distro."));
@@ -208,7 +369,7 @@ fn start_hermes(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
             };
             if running {
                 *state.hermes.lock().expect("Hermes state poisoned") = Some(child);
-                return Ok(RuntimeStatus { state: "running".into(), message: "Hermes gateway started as the non-root wallis user.".into() });
+                return Ok(status("running", "Hermes gateway started as the non-root wallis user.", true, true));
             }
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -227,7 +388,7 @@ fn stop_hermes(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
         let output = wsl_output(&["--terminate", DISTRO])?;
         if !output.status.success() { return Err("WSL could not stop the Wallis distribution.".into()); }
         *state.hermes.lock().expect("Hermes state poisoned") = None;
-        return Ok(stopped("Hermes stopped with the Wallis distribution."));
+        return Ok(stopped("Hermes stopped with the Wallis distribution.", prerequisites(&state).is_ok(), *state.memory_ready.lock().expect("memory state poisoned")));
     }
     #[cfg(not(target_os = "windows"))]
     { let _ = state; Err("Wallis currently requires Windows with WSL2.".into()) }
@@ -240,7 +401,8 @@ fn reset_wallis(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
         let output = wsl_output(&["--unregister", DISTRO])?;
         if !output.status.success() { return Err("WSL could not unregister Wallis. If it is not imported, no reset is needed.".into()); }
         *state.hermes.lock().expect("Hermes state poisoned") = None;
-        return Ok(stopped("Wallis was unregistered. Its Linux data and memory were permanently deleted."));
+        *state.memory_ready.lock().expect("memory state poisoned") = false;
+        return Ok(stopped("Wallis was unregistered. Its Linux data and memory were permanently deleted.", prerequisites(&state).is_ok(), false));
     }
     #[cfg(not(target_os = "windows"))]
     { let _ = state; Err("Wallis currently requires Windows with WSL2.".into()) }
@@ -251,10 +413,33 @@ fn get_config(state: State<'_, AppState>) -> WallisConfig { state.config.lock().
 
 #[tauri::command]
 fn save_config(config: WallisConfig, state: State<'_, AppState>) -> Result<WallisConfig, String> {
-    if !config.persona_name.starts_with("Wallis") { return Err("Persona name must start with Wallis.".into()); }
+    validate_persona_name(&config.persona_name)?;
     if !config.rootfs_sha256.trim().is_empty() { validate_sha256(&config.rootfs_sha256)?; }
+    let mut config = config;
+    config.discord_allowed_users = validate_allowed_users(&config.discord_allowed_users)?;
+    let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
+    save_config_file(&config_path(&app_data), &config)?;
     *state.config.lock().expect("config state poisoned") = config.clone();
     Ok(config)
+}
+
+#[tauri::command]
+fn start_hermes(state: State<'_, AppState>) -> Result<RuntimeStatus, String> { start_hermes_impl(&state) }
+
+#[tauri::command]
+fn get_secret_status(state: State<'_, AppState>) -> Result<SecretStatus, String> {
+    let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
+    let path = token_path(&app_data);
+    Ok(SecretStatus { has_token: path.is_file() && unprotect_token(&path).and_then(|token| { validate_token(&token).map(|_| token) }).is_ok() })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn save_discord_token(token: String, state: State<'_, AppState>) -> Result<SecretStatus, String> {
+    validate_token(&token)?;
+    let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
+    std::fs::create_dir_all(&app_data).map_err(|error| format!("Unable to create the Wallis data folder: {error}"))?;
+    protect_token(&token_path(&app_data), &token)?;
+    Ok(SecretStatus { has_token: true })
 }
 
 #[cfg(test)]
@@ -284,9 +469,39 @@ mod tests {
         assert!(gateway_running("  12 /usr/bin/python /home/wallis/.local/bin/hermes gateway\n  13 ps -eo pid=,args="));
         assert!(!gateway_running("  12 /usr/bin/python /home/wallis/.local/bin/hermes\n  13 ps -eo pid=,args="));
     }
+    #[test]
+    fn validates_allow_list_and_round_trips_non_secret_config() {
+        assert_eq!(validate_allowed_users("123456789012").unwrap(), "123456789012");
+        assert!(validate_allowed_users("all-users").is_err());
+        let path = std::env::temp_dir().join(format!("wallis-config-test-{}-{}.json", std::process::id(), std::thread::current().name().unwrap_or("test")));
+        let config = WallisConfig { discord_allowed_users: "123456789012".into(), ..WallisConfig::default() };
+        save_config_file(&path, &config).unwrap();
+        assert_eq!(load_config_file(&path).unwrap().discord_allowed_users, config.discord_allowed_users);
+        let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn rejects_secret_values_that_could_escape_stdin() {
+        assert!(validate_token("token\nwith-newline").is_err());
+        assert!(validate_token("").is_err());
+        assert!(validate_token("token-value").is_ok());
+    }
+    #[test]
+    fn validates_persona_name_for_soul_file() {
+        assert!(validate_persona_name("Wallis Prime").is_ok());
+        assert!(validate_persona_name("Wallisian").is_err());
+        assert!(validate_persona_name("Wallis\nignore").is_err());
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default().manage(AppState::default()).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_hermes, stop_hermes, reset_wallis, get_config, save_config]).run(tauri::generate_context!()).expect("error while running Wallis");
+    tauri::Builder::default().manage(AppState::default()).setup(|app| {
+        let app_data = app.path().app_data_dir().map_err(std::io::Error::other)?;
+        let config = load_config_file(&config_path(&app_data)).map_err(std::io::Error::other)?;
+        let state = app.state::<AppState>();
+        *state.config.lock().expect("config state poisoned") = config.clone();
+        *state.app_data.lock().expect("app data state poisoned") = Some(app_data);
+        if config.auto_start { let _ = start_hermes_impl(&state); }
+        Ok(())
+    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_hermes, stop_hermes, reset_wallis, get_config, save_config, get_secret_status, save_discord_token]).run(tauri::generate_context!()).expect("error while running Wallis");
 }
