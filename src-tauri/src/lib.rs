@@ -409,6 +409,22 @@ fn reset_wallis(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
 }
 
 #[tauri::command]
+fn run_in_distro(command: String) -> Result<String, String> {
+    if command.trim().is_empty() { return Err("Type a command to run.".into()); }
+    let output = wsl_output(&["--distribution", DISTRO, "--user", USER, "--", "bash", "-lc", &command])?;
+    let text = format!("{}{}", decode_wsl_output(&output.stdout), decode_wsl_output(&output.stderr));
+    if text.trim().is_empty() { Ok(format!("(exited {})", output.status)) } else { Ok(text) }
+}
+
+#[tauri::command]
+fn open_terminal() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    { return Command::new("cmd").args(["/c", "start", "", "wsl.exe", "--distribution", DISTRO, "--user", USER]).spawn().map(|_| ()).map_err(|error| format!("Unable to open a terminal window: {error}")); }
+    #[cfg(not(target_os = "windows"))]
+    { Err("Wallis currently requires Windows with WSL2.".into()) }
+}
+
+#[tauri::command]
 fn get_config(state: State<'_, AppState>) -> WallisConfig { state.config.lock().expect("config state poisoned").clone() }
 
 #[tauri::command]
@@ -503,5 +519,5 @@ pub fn run() {
         *state.app_data.lock().expect("app data state poisoned") = Some(app_data);
         if config.auto_start { let _ = start_hermes_impl(&state); }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_hermes, stop_hermes, reset_wallis, get_config, save_config, get_secret_status, save_discord_token]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_hermes, stop_hermes, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal]).run(tauri::generate_context!()).expect("error while running Wallis");
 }

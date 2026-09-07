@@ -35,6 +35,8 @@ type Commands = {
   save_config: WallisConfig;
   get_secret_status: SecretStatus;
   save_discord_token: SecretStatus;
+  run_in_distro: string;
+  open_terminal: null;
 };
 
 declare global {

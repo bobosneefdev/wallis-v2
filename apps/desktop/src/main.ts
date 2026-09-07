@@ -10,14 +10,17 @@ let runtime: RuntimeStatus = { state: "unavailable", message: "Checking runtime�
 let secret: SecretStatus = { hasToken: false };
 
 app.innerHTML = `
-  <header><p class="eyebrow">LOCAL-FIRST DISCORD BOT</p><h1>Wallis</h1><p>One calm place to set up, inspect, and control your local agent.</p></header>
+  <header><div><p class="eyebrow">LOCAL-FIRST DISCORD BOT</p><h1>Wallis</h1><p>One calm place to set up, inspect, and control your local agent.</p></div><p id="state-pill" class="pill">Checking…</p></header>
   <section aria-labelledby="setup-title"><h2 id="setup-title">Setup</h2><p id="setup-message" role="status">${setup.message}</p><form id="install-form">
     <label for="rootfs-archive">Wallis rootfs archive</label><input id="rootfs-archive" name="rootfsArchive" placeholder="C:\\Downloads\\wallis-rootfs.tar" autocomplete="off" required />
     <label for="rootfs-sha256">Expected SHA-256</label><input id="rootfs-sha256" name="rootfsSha256" placeholder="64 hexadecimal characters" autocomplete="off" required />
     <label for="distro-root">Distro install root <span>(optional)</span></label><input id="distro-root" name="distroRoot" placeholder="Default: %LOCALAPPDATA%\\Wallis\\distro" autocomplete="off" />
     <button type="submit">Import verified Wallis distro</button><p id="install-message" role="status" aria-live="polite"></p>
   </form></section>
-  <section aria-labelledby="runtime-title"><h2 id="runtime-title">Runtime</h2><p id="runtime-message" role="status">${runtime.message}</p><p id="readiness" role="status"></p><div class="actions"><button id="start" type="button">Start Hermes</button><button id="stop" type="button" class="secondary">Stop Hermes</button><button id="reset" type="button" class="secondary">Reset Wallis</button></div></section>
+  <section aria-labelledby="runtime-title"><h2 id="runtime-title">Runtime</h2><p id="runtime-message" role="status">${runtime.message}</p><div id="readiness" class="pills"></div><div class="actions"><button id="start" type="button">Start Hermes</button><button id="stop" type="button" class="secondary">Stop Hermes</button><button id="reset" type="button" class="secondary">Reset Wallis</button></div></section>
+  <section aria-labelledby="terminal-title"><h2 id="terminal-title">Terminal</h2><p class="hint">Runs one command at a time inside the Wallis distro as the non-root <code>wallis</code> user.</p>
+    <pre id="terminal-output" role="log" aria-live="polite" tabindex="0">Ready.</pre>
+    <form id="terminal-form" class="prompt"><span aria-hidden="true">$</span><input id="terminal-command" name="command" placeholder="hermes --help" autocomplete="off" spellcheck="false" required aria-label="Command to run in the Wallis distro" /><button type="submit">Run</button><button id="open-terminal" type="button" class="secondary">Open shell window</button></form></section>
   <section aria-labelledby="config-title"><h2 id="config-title">Configuration</h2><form id="config-form">
     <label for="application-id">Discord application ID <span>(optional until bot setup)</span></label><input id="application-id" name="discordApplicationId" inputmode="numeric" autocomplete="off" />
     <label for="allowed-users">Allowed Discord user IDs</label><input id="allowed-users" name="discordAllowedUsers" inputmode="numeric" placeholder="123456789012345678,198765432109876543" autocomplete="off" required /><p class="hint">Only these users can interact with Wallis. Use numeric Discord user IDs separated by commas.</p>
@@ -32,6 +35,11 @@ const setupMessage = document.querySelector<HTMLElement>("#setup-message")!;
 const installMessage = document.querySelector<HTMLElement>("#install-message")!;
 const runtimeMessage = document.querySelector<HTMLElement>("#runtime-message")!;
 const readiness = document.querySelector<HTMLElement>("#readiness")!;
+const statePill = document.querySelector<HTMLElement>("#state-pill")!;
+const terminalOutput = document.querySelector<HTMLElement>("#terminal-output")!;
+const terminalForm = document.querySelector<HTMLFormElement>("#terminal-form")!;
+const terminalCommand = document.querySelector<HTMLInputElement>("#terminal-command")!;
+const openTerminalButton = document.querySelector<HTMLButtonElement>("#open-terminal")!;
 const configMessage = document.querySelector<HTMLElement>("#config-message")!;
 const tokenStatus = document.querySelector<HTMLElement>("#token-status")!;
 const startButton = document.querySelector<HTMLButtonElement>("#start")!;
@@ -51,7 +59,9 @@ const distroRoot = document.querySelector<HTMLInputElement>("#distro-root")!;
 function showRuntime(next: RuntimeStatus) {
   runtime = next;
   runtimeMessage.textContent = next.message;
-  readiness.textContent = `Discord: ${next.discordReady ? "ready" : "not ready"} · Mnemosyne: ${next.memoryReady ? "ready" : "not ready"}`;
+  statePill.textContent = next.state === "running" ? "Running" : next.state === "stopped" ? "Stopped" : "Unavailable";
+  statePill.className = `pill ${next.state === "running" ? "ok" : next.state === "unavailable" ? "bad" : ""}`;
+  readiness.innerHTML = `<span class="pill ${next.discordReady ? "ok" : "bad"}">Discord ${next.discordReady ? "ready" : "not ready"}</span><span class="pill ${next.memoryReady ? "ok" : "bad"}">Mnemosyne ${next.memoryReady ? "ready" : "not ready"}</span>`;
   startButton.disabled = next.state === "running";
   stopButton.disabled = next.state !== "running";
   resetButton.disabled = next.state === "unavailable";
@@ -112,6 +122,27 @@ form.addEventListener("submit", async (event) => {
     configMessage.textContent = "Configuration saved.";
   }
   catch (saveError) { configMessage.textContent = saveError instanceof Error ? saveError.message : "Unable to save configuration."; }
+});
+
+function appendTerminal(command: string, output: string) {
+  const line = document.createElement("div");
+  const prompt = document.createElement("b");
+  prompt.textContent = `$ ${command}`;
+  line.append(prompt, document.createTextNode(`\n${output.replace(/\s+$/, "")}\n\n`));
+  terminalOutput.append(line);
+  terminalOutput.scrollTop = terminalOutput.scrollHeight;
+}
+
+terminalForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const command = terminalCommand.value.trim();
+  if (!command) return;
+  terminalCommand.value = "";
+  try { appendTerminal(command, await invoke("run_in_distro", { command })); }
+  catch (error) { appendTerminal(command, error instanceof Error ? error.message : String(error)); }
+});
+openTerminalButton.addEventListener("click", async () => {
+  try { await invoke("open_terminal"); } catch (error) { appendTerminal("open shell window", error instanceof Error ? error.message : String(error)); }
 });
 
 void load();
