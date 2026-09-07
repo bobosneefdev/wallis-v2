@@ -1,0 +1,43 @@
+name: Wallis rootfs
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Wallis rootfs version
+        required: true
+        default: 0.1.0
+  push:
+    tags:
+      - rootfs-v*
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select rootfs version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/rootfs-v* ]]; then
+            echo "WALLIS_ROOTFS_VERSION=${GITHUB_REF_NAME#rootfs-v}" >> "$GITHUB_ENV"
+          else
+            echo "WALLIS_ROOTFS_VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
+          fi
+      - name: Build rootfs archive
+        run: sudo bash scripts/rootfs/build.sh
+      - name: Check rootfs archive
+        run: bash scripts/rootfs/check.sh "dist/rootfs/wallis-rootfs-${WALLIS_ROOTFS_VERSION}.tar"
+      - name: Upload rootfs artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallis-rootfs-${{ env.WALLIS_ROOTFS_VERSION }}
+          path: dist/rootfs/wallis-rootfs-${{ env.WALLIS_ROOTFS_VERSION }}.tar*
+          if-no-files-found: error
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/rootfs/wallis-rootfs-${WALLIS_ROOTFS_VERSION}.tar* --generate-notes
