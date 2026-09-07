@@ -14,5 +14,5 @@
     "windows": [{ "label": "main", "title": "Wallis", "width": 900, "height": 760, "minWidth": 560, "minHeight": 600 }],
     "security": { "capabilities": ["default"] }
   },
-  "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.ico"] }
+  "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.ico"], "windows": { "nsis": { "installerHooks": "./nsis-hooks.nsh" } } }
 }

@@ -74,3 +74,31 @@ pre#terminal-output b { color: var(--accent); font-weight: 600; }
 .prompt button { flex: none; }
 
 @media (max-width: 560px) { .prompt { flex-wrap: wrap; } .prompt input { flex: 1 1 100%; } }
+
+/* onboarding */
+.steps { display: flex; gap: 8px; margin: 0 0 4px; padding: 0; list-style: none; counter-reset: step; }
+.steps li { flex: 1; padding: 8px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; color: var(--faint); font-size: .82rem; font-weight: 600; counter-increment: step; }
+.steps li::before { content: counter(step) ". "; }
+.steps .now { color: var(--text); border-color: var(--accent); }
+.steps .done { color: var(--accent); }
+.centered { text-align: center; }
+.centered .actions { justify-content: center; }
+.loading { padding: 64px 22px; }
+.loading h2 { margin: 20px 0 6px; font-size: 1.5rem; }
+.spinner { width: 34px; height: 34px; margin: 0 auto; border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin 900ms linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+
+select { width: 100%; padding: 10px 12px; color: inherit; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; font: inherit; }
+.tabs { display: flex; justify-content: flex-end; margin-bottom: -6px; }
+
+/* profile */
+.profile-name { margin: 12px 0 2px; color: var(--text); font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em; }
+.tagline { margin: 0 0 14px; color: var(--accent); font-style: italic; }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; padding: 0; list-style: none; }
+.tags li { padding: 4px 10px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; font-size: .8rem; }
+#profile-body dl { display: grid; gap: 10px; margin: 16px 0 0; }
+.field dt { color: var(--faint); font-size: .72rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+.field dd { margin: 2px 0 0; color: var(--text); }
+.steps .done[data-view] { cursor: pointer; }
+.steps .done[data-view]:hover { border-color: var(--accent); }

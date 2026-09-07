@@ -13,20 +13,44 @@ export type RuntimeStatus = {
 
 export type SecretStatus = { hasToken: boolean };
 
+/** Which screen the app owes the user, decided in Rust from the distro and config. */
+export type Stage = "setup" | "inference" | "generate" | "ready";
+
+export type ModelOption = { id: string; efforts: string[] };
+
+export type ProviderOption = { id: string; label: string; models: ModelOption[] };
+
+export type Profile = {
+  name: string;
+  age: string;
+  pronouns: string;
+  location: string;
+  occupation: string;
+  tagline: string;
+  bio: string;
+  interests: string[];
+  lookingFor: string;
+  funFact: string;
+};
+
 export type WallisConfig = {
   discordApplicationId: string;
   discordAllowedUsers: string;
-  personaName: string;
   memoryProvider: "mnemosyne";
   autoStart: boolean;
   rootfsArchive: string;
   rootfsSha256: string;
   distroRoot: string;
+  provider: string;
+  model: string;
+  reasoningEffort: string;
+  onboarded: boolean;
 };
 
 type Commands = {
   get_setup_status: SetupStatus;
   get_runtime_status: RuntimeStatus;
+  get_stage: Stage;
   start_hermes: RuntimeStatus;
   stop_hermes: RuntimeStatus;
   reset_wallis: RuntimeStatus;
@@ -37,6 +61,10 @@ type Commands = {
   save_discord_token: SecretStatus;
   run_in_distro: string;
   open_terminal: null;
+  get_providers: ProviderOption[];
+  get_profile: Profile;
+  save_inference: WallisConfig;
+  generate_wallis: Profile;
 };
 
 declare global {
@@ -45,15 +73,23 @@ declare global {
   }
 }
 
+/** Full ladder, used when a model's supported levels are unknown. `none` turns thinking off. */
+export const EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+export const EFFORT_LABELS: Record<string, string> = { none: "Off — no thinking", minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max" };
+
 const fallback: WallisConfig = {
   discordApplicationId: "",
   discordAllowedUsers: "",
-  personaName: "Wallis",
   memoryProvider: "mnemosyne",
   autoStart: false,
   rootfsArchive: "",
   rootfsSha256: "",
   distroRoot: "",
+  provider: "",
+  model: "",
+  reasoningEffort: "medium",
+  onboarded: false,
 };
 
 export function invoke<K extends keyof Commands>(command: K, args?: unknown): Promise<Commands[K]> {

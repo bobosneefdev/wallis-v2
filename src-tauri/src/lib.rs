@@ -8,8 +8,19 @@ use tauri::{Manager, State};
 
 const DISTRO: &str = "Wallis";
 const USER: &str = "wallis";
+const FIRST_NAME: &str = "Wallis";
 const CONFIG_FILE: &str = "config.json";
 const TOKEN_FILE: &str = "discord-token.dpapi";
+const KEY_FILE: &str = "provider-key.dpapi";
+const PROFILE_PATH: &str = "/home/wallis/.hermes/wallis-profile.json";
+const SKILL_PATH: &str = "/home/wallis/.hermes/skills/wallis/profile/SKILL.md";
+const HERMES_BIN: &str = "/home/wallis/.local/bin/hermes";
+const RELEASE_PATH: &str = "/etc/wallis-rootfs-release";
+const CATALOG_URL: &str = "https://hermes-agent.nousresearch.com/docs/api/model-catalog.json";
+/// Providers Hermes publishes a curated model catalog for, with the credential each one reads.
+const PROVIDERS: [(&str, &str, &str); 2] = [("openrouter", "OpenRouter", "OPENROUTER_API_KEY"), ("nous-api", "Nous Portal", "NOUS_API_KEY")];
+const EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 const WSL_CONF: &str = "[automount]\nenabled=false\n\n[interop]\nenabled=false\nappendWindowsPath=false\n\n[user]\ndefault=wallis\n";
 
 struct AppState { config: Mutex<WallisConfig>, app_data: Mutex<Option<PathBuf>>, memory_ready: Mutex<bool>, hermes: Mutex<Option<Child>> }
@@ -24,19 +35,51 @@ struct WallisConfig {
     discord_application_id: String,
     #[serde(default)]
     discord_allowed_users: String,
-    persona_name: String,
     memory_provider: String,
     auto_start: bool,
     rootfs_archive: String,
     rootfs_sha256: String,
     distro_root: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    reasoning_effort: String,
+    #[serde(default)]
+    onboarded: bool,
 }
 
 impl Default for WallisConfig {
     fn default() -> Self {
-        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), persona_name: "Wallis".into(), memory_provider: "mnemosyne".into(), auto_start: false, rootfs_archive: String::new(), rootfs_sha256: String::new(), distro_root: String::new() }
+        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), memory_provider: "mnemosyne".into(), auto_start: false, rootfs_archive: String::new(), rootfs_sha256: String::new(), distro_root: String::new(), provider: String::new(), model: String::new(), reasoning_effort: "medium".into(), onboarded: false }
     }
 }
+
+/// Wallis' own dating-profile-style identity. Hermes may rewrite it in the distro, so the
+/// file there is the source of truth and every read goes through `sanitize_profile`.
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Profile {
+    #[serde(default)] name: String,
+    #[serde(default)] age: String,
+    #[serde(default)] pronouns: String,
+    #[serde(default)] location: String,
+    #[serde(default)] occupation: String,
+    #[serde(default)] tagline: String,
+    #[serde(default)] bio: String,
+    #[serde(default)] interests: Vec<String>,
+    #[serde(default)] looking_for: String,
+    #[serde(default)] fun_fact: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelOption { id: String, efforts: Vec<String> }
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderOption { id: String, label: String, models: Vec<ModelOption> }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,6 +147,7 @@ fn default_distro_root() -> PathBuf {
 
 fn config_path(app_data: &std::path::Path) -> PathBuf { app_data.join(CONFIG_FILE) }
 fn token_path(app_data: &std::path::Path) -> PathBuf { app_data.join(TOKEN_FILE) }
+fn key_path(app_data: &std::path::Path) -> PathBuf { app_data.join(KEY_FILE) }
 
 fn load_config_file(path: &std::path::Path) -> Result<WallisConfig, String> {
     if !path.is_file() { return Ok(WallisConfig::default()); }
@@ -134,22 +178,24 @@ fn validate_allowed_users(value: &str) -> Result<String, String> {
 fn protect_token(path: &std::path::Path, token: &str) -> Result<(), String> {
     use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN};
     use windows_sys::Win32::Foundation::LocalFree;
+    let parent = path.parent().ok_or("Unable to determine the Wallis secret folder.")?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("Unable to create the Wallis secret folder: {error}"))?;
     let mut input = CRYPT_INTEGER_BLOB { cbData: token.len() as u32, pbData: token.as_ptr() as *mut u8 };
     let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
     let ok = unsafe { CryptProtectData(&mut input, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output) };
-    if ok == 0 { return Err("Windows could not protect the Discord token.".into()); }
+    if ok == 0 { return Err("Windows could not protect the secret.".into()); }
     let temporary = path.with_extension("dpapi.tmp");
     let result = std::fs::write(&temporary, unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) })
-        .map_err(|error| format!("Unable to store the protected Discord token: {error}"))
+        .map_err(|error| format!("Unable to store the protected secret: {error}"))
         .and_then(|_| {
             let backup = path.with_extension("dpapi.bak");
             let _ = std::fs::remove_file(&backup);
-            if path.exists() { std::fs::rename(path, &backup).map_err(|error| format!("Unable to replace the protected Discord token: {error}"))?; }
+            if path.exists() { std::fs::rename(path, &backup).map_err(|error| format!("Unable to replace the protected secret: {error}"))?; }
             match std::fs::rename(&temporary, path) {
                 Ok(()) => { let _ = std::fs::remove_file(backup); Ok(()) }
                 Err(error) => {
                     let _ = std::fs::rename(&backup, path);
-                    Err(format!("Unable to replace the protected Discord token: {error}"))
+                    Err(format!("Unable to replace the protected secret: {error}"))
                 }
             }
         });
@@ -162,12 +208,12 @@ fn protect_token(path: &std::path::Path, token: &str) -> Result<(), String> {
 fn unprotect_token(path: &std::path::Path) -> Result<String, String> {
     use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
     use windows_sys::Win32::Foundation::LocalFree;
-    let bytes = std::fs::read(path).map_err(|error| format!("Unable to read the protected Discord token: {error}"))?;
+    let bytes = std::fs::read(path).map_err(|error| format!("Unable to read the protected secret: {error}"))?;
     let mut input = CRYPT_INTEGER_BLOB { cbData: bytes.len() as u32, pbData: bytes.as_ptr() as *mut u8 };
     let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
     let ok = unsafe { CryptUnprotectData(&mut input, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null(), 0, &mut output) };
-    if ok == 0 { return Err("Windows could not unlock the Discord token. Save it again.".into()); }
-    let result = String::from_utf8(unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec()).map_err(|_| "The stored Discord token is invalid UTF-8.".to_string());
+    if ok == 0 { return Err("Windows could not unlock the stored secret. Save it again.".into()); }
+    let result = String::from_utf8(unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec()).map_err(|_| "The stored secret is invalid UTF-8.".to_string());
     unsafe { LocalFree(output.pbData as *mut _); }
     result
 }
@@ -177,30 +223,58 @@ fn protect_token(_path: &std::path::Path, _token: &str) -> Result<(), String> { 
 #[cfg(not(target_os = "windows"))]
 fn unprotect_token(_path: &std::path::Path) -> Result<String, String> { Err("Wallis currently requires Windows DPAPI for token storage.".into()) }
 
-fn validate_token(token: &str) -> Result<(), String> {
-    if token.is_empty() || token.len() > 512 || token.bytes().any(|byte| byte == b'\r' || byte == b'\n' || byte == 0) { return Err("Discord token must be non-empty and cannot contain newlines.".into()); }
+fn validate_secret(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 512 || value.bytes().any(|byte| byte == b'\r' || byte == b'\n' || byte == 0) { return Err(format!("The {label} must be non-empty and cannot contain newlines.")); }
     Ok(())
 }
 
-fn validate_persona_name(value: &str) -> Result<String, String> {
-    let value = value.trim();
-    let valid_prefix = value == "Wallis" || value.strip_prefix("Wallis").and_then(|rest| rest.chars().next()).map_or(false, |first| !first.is_alphanumeric());
-    if !valid_prefix || value.len() > 80 || value.chars().any(char::is_control) { return Err("Persona name must start with Wallis and contain no control characters.".into()); }
-    Ok(value.to_string())
+/// The first name is never configurable: anything Wallis or a model writes is forced back to it.
+fn lock_first_name(value: &str) -> String {
+    let cleaned: String = value.chars().map(|character| if character.is_control() { ' ' } else { character }).collect();
+    let rest = cleaned.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+    let name = if rest.is_empty() { FIRST_NAME.to_string() } else { format!("{FIRST_NAME} {rest}") };
+    name.chars().take(80).collect()
 }
 
+fn sanitize_profile(mut profile: Profile) -> Profile {
+    profile.name = lock_first_name(&profile.name);
+    profile.interests.truncate(12);
+    profile
+}
+
+fn soul_document(profile: &Profile) -> String {
+    format!(
+        "# {name}\n\nYou are {name}. This is who you are, not a role you play.\n\n- Age: {age}\n- Pronouns: {pronouns}\n- Lives in: {location}\n- Does: {occupation}\n- In one line: {tagline}\n- Into: {interests}\n- Looking for: {looking_for}\n- Fun fact: {fun_fact}\n\n{bio}\n\nYour first name is always {first}. Keep your profile at {profile_path} current: rewrite that JSON file (same keys) whenever something about you genuinely changes, then remember the change.\n",
+        name = profile.name, age = profile.age, pronouns = profile.pronouns, location = profile.location,
+        occupation = profile.occupation, tagline = profile.tagline, interests = profile.interests.join(", "),
+        looking_for = profile.looking_for, fun_fact = profile.fun_fact, bio = profile.bio,
+        first = FIRST_NAME, profile_path = PROFILE_PATH,
+    )
+}
+
+const PROFILE_SKILL: &str = concat!(
+    "---\nname: profile\ndescription: Show Wallis' own profile — the dating-profile-style card describing who Wallis is.\nversion: 1.0.0\nmetadata:\n  hermes:\n    tags: [wallis, identity]\n    category: wallis\n---\n\n",
+    "# Wallis' profile\n\n## When to Use\nWhenever someone asks who you are, asks for your profile, or runs `/profile`.\n\n",
+    "## Procedure\n1. Read `/home/wallis/.hermes/wallis-profile.json`.\n2. Reply with that data only — never invent fields, never show raw JSON.\n3. Format it as a clean Discord embed-style card:\n\n",
+    "```\n**{name}** · {age} · {pronouns}\n_{tagline}_\n\n**Location** — {location}\n**Does** — {occupation}\n**Into** — {interests, comma separated}\n**Looking for** — {lookingFor}\n**Fun fact** — {funFact}\n\n{bio}\n```\n\n",
+    "Skip any field that is empty rather than printing a blank line.\n\n## Pitfalls\n- The file is the source of truth; do not answer from memory if it disagrees.\n- The first name is always Wallis, even if the file says otherwise.\n",
+);
+
+/// Writes a file inside the distro as the wallis user, keeping content off the command line.
 #[cfg(target_os = "windows")]
-fn apply_soul(persona_name: &str) -> Result<(), String> {
+fn write_in_distro(path: &str, content: &str) -> Result<(), String> {
     use std::io::Write;
-    let mut child = Command::new("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "tee", "/home/wallis/.hermes/SOUL.md"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|error| format!("Unable to configure the Wallis persona: {error}"))?;
-    let content = format!("# Wallis identity\nYou are {persona_name}, the Wallis assistant.\n");
-    child.stdin.take().ok_or("Unable to open the persona configuration input.")?.write_all(content.as_bytes()).map_err(|error| format!("Unable to write the Wallis persona: {error}"))?;
-    let result = child.wait_with_output().map_err(|error| format!("Unable to apply the Wallis persona: {error}"))?;
-    if result.status.success() { Ok(()) } else { Err("Hermes could not apply the Wallis persona in the distro.".into()) }
+    let script = format!("mkdir -p \"$(dirname '{path}')\" && cat > '{path}'");
+    let mut child = Command::new("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "bash", "-c", &script]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|error| format!("Unable to write {path}: {error}"))?;
+    child.stdin.take().ok_or("Unable to open the distro file input.")?.write_all(content.as_bytes()).map_err(|error| format!("Unable to write {path}: {error}"))?;
+    let result = child.wait_with_output().map_err(|error| format!("Unable to write {path}: {error}"))?;
+    if result.status.success() { Ok(()) } else { Err(format!("The Wallis distro rejected the write to {path}.")) }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn apply_soul(_persona_name: &str) -> Result<(), String> { Err("Wallis currently requires Windows with WSL2.".into()) }
+fn write_in_distro(_path: &str, _content: &str) -> Result<(), String> { Err("Wallis currently requires Windows with WSL2.".into()) }
+
+fn apply_soul(profile: &Profile) -> Result<(), String> { write_in_distro("/home/wallis/.hermes/SOUL.md", &soul_document(profile)) }
 
 fn validate_import_inputs(archive: &str, expected_sha256: &str, install_root: Option<&str>) -> Result<(PathBuf, String, PathBuf), String> {
     let archive = PathBuf::from(archive.trim());
@@ -219,7 +293,7 @@ fn wsl_output(args: &[&str]) -> Result<Output, String> { Command::new("wsl.exe")
 fn wsl_output(_args: &[&str]) -> Result<Output, String> { Err("Wallis currently requires Windows with WSL2.".into()) }
 
 fn hermes_command(args: &[&str]) -> Result<Output, String> {
-    let mut command = vec!["--distribution", DISTRO, "--user", USER, "--", "hermes"];
+    let mut command = vec!["--distribution", DISTRO, "--user", USER, "--", HERMES_BIN];
     command.extend_from_slice(args);
     wsl_output(&command)
 }
@@ -231,14 +305,153 @@ fn memory_ready() -> Result<bool, String> {
     Ok(text.contains("mnemosyne") && !text.contains("unavailable") && !text.contains("error"))
 }
 
-fn configure_hermes(persona_name: &str) -> Result<(), String> {
-    apply_soul(persona_name)?;
-    for args in [&["config", "set", "memory.provider", "mnemosyne"][..], &["config", "set", "memory.memory_enabled", "false"][..], &["config", "set", "user_profile_enabled", "false"][..]] {
-        let output = hermes_command(&args)?;
-        if !output.status.success() { return Err(format!("Hermes could not apply its Mnemosyne configuration ({}).", args.join(" "))); }
+fn hermes_config_set(pairs: &[(&str, &str)]) -> Result<(), String> {
+    for (key, value) in pairs {
+        let output = hermes_command(&["config", "set", key, value])?;
+        if !output.status.success() { return Err(format!("Hermes rejected the configuration value for {key}.")); }
     }
-    if !memory_ready()? { return Err("Mnemosyne is not ready. Install mnemosyne-hermes in the Wallis distro and try again.".into()); }
     Ok(())
+}
+
+fn release_value(key: &str) -> Result<String, String> {
+    let output = wsl_output(&["--distribution", DISTRO, "--user", USER, "--", "cat", RELEASE_PATH])?;
+    if !output.status.success() { return Err("The Wallis distro is missing its rootfs release file. Reset Wallis and import a current archive.".into()); }
+    let text = decode_wsl_output(&output.stdout);
+    let prefix = format!("{key}=");
+    let value = text.lines().find_map(|line| line.trim().strip_prefix(&prefix)).map(str::trim).unwrap_or_default();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) { return Err(format!("The Wallis rootfs release file has no usable {key}.")); }
+    Ok(value.to_string())
+}
+
+/// Installs and configures Mnemosyne only when it is not already live. Not user-facing.
+fn ensure_memory() -> Result<(), String> {
+    if memory_ready()? { return Ok(()); }
+    let version = release_value("MNEMOSYNE_HERMES_VERSION")?;
+    let output = wsl_output(&["--distribution", DISTRO, "--user", USER, "--", "/home/wallis/.hermes/bin/uv", "pip", "install", "--python", "/home/wallis/.hermes/hermes-agent/venv/bin/python", "--no-cache-dir", &format!("mnemosyne-hermes=={version}")])?;
+    if !output.status.success() { return Err("Wallis could not install the Mnemosyne memory system in the distro.".into()); }
+    hermes_config_set(&[("memory.provider", "mnemosyne"), ("memory.memory_enabled", "false"), ("user_profile_enabled", "false")])?;
+    if !memory_ready()? { return Err("Mnemosyne was installed but is still not reporting ready.".into()); }
+    Ok(())
+}
+
+fn provider_entry(id: &str) -> Result<(&'static str, &'static str, &'static str), String> {
+    PROVIDERS.iter().copied().find(|(provider, _, _)| *provider == id).ok_or_else(|| "Choose a supported inference provider.".to_string())
+}
+
+fn validate_model(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 120 || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._:-/".contains(&byte)) { return Err("Pick a model, or type a model id such as anthropic/claude-opus-5.".into()); }
+    Ok(value.to_string())
+}
+
+fn validate_effort(value: &str) -> Result<String, String> {
+    if EFFORTS.contains(&value) { Ok(value.to_string()) } else { Err("Pick a reasoning effort.".into()) }
+}
+
+/// Fetched with the distro's own curl so Wallis needs no HTTP client of its own.
+fn fetch_json(url: &str) -> serde_json::Value {
+    wsl_output(&["--distribution", DISTRO, "--user", USER, "--", "curl", "-fsSL", "--max-time", "20", url])
+        .ok().filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_str(&decode_wsl_output(&output.stdout)).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// OpenRouter model ids that publish no reasoning support. OpenRouter normalises every effort
+/// level onto whatever a thinking model's own wire wants, so the only per-model question is
+/// whether the model thinks at all. Only ids OpenRouter itself lists are judged: an id it does
+/// not publish (a routing variant, or a failed lookup) keeps the full ladder rather than
+/// being wrongly pinned to off.
+fn silent_models() -> Vec<String> {
+    fetch_json(OPENROUTER_MODELS_URL)["data"].as_array().map(|models| models.iter()
+        .filter(|model| !model["supported_parameters"].as_array().is_some_and(|parameters| parameters.iter().any(|parameter| parameter.as_str() == Some("reasoning"))))
+        .filter_map(|model| model["id"].as_str().map(str::to_string)).collect()).unwrap_or_default()
+}
+
+/// Curated provider/model list, with the effort levels each model can actually be asked for.
+fn model_catalog() -> Vec<ProviderOption> {
+    let catalog = fetch_json(CATALOG_URL);
+    let silent = silent_models();
+    let ladder: Vec<String> = EFFORTS.iter().map(|effort| (*effort).to_string()).collect();
+    PROVIDERS.iter().map(|(id, label, _)| ProviderOption {
+        id: (*id).to_string(),
+        label: (*label).to_string(),
+        models: catalog["providers"][catalog_key(id)]["models"].as_array().map(|models| models.iter().filter_map(|model| model["id"].as_str()).map(|model| ModelOption {
+            efforts: if *id == "openrouter" && silent.iter().any(|silent| silent == model) { vec!["none".to_string()] } else { ladder.clone() },
+            id: model.to_string(),
+        }).collect()).unwrap_or_default(),
+    }).collect()
+}
+
+/// Hermes' provider ids and its catalog keys differ for the Nous Portal entry.
+fn catalog_key(provider: &str) -> &str { if provider == "nous-api" { "nous" } else { provider } }
+
+fn extract_json(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (index, byte) in text.bytes().enumerate().skip(start) {
+        if in_string {
+            match byte { _ if escaped => escaped = false, b'\\' => escaped = true, b'"' => in_string = false, _ => {} }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => { depth -= 1; if depth == 0 { return text.get(start..=index); } }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn generation_seed() -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_nanos()).unwrap_or_default();
+    format!("{:x}", nanos ^ (u128::from(std::process::id())).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+fn generation_prompt() -> String {
+    format!(
+        "Invent yourself. You are a fictional person whose first name is always {FIRST_NAME}; pick your own surname, age, home, work and personality. Randomness seed {seed} — let it push you somewhere unexpected, not the safest choice.\n\nReply with one JSON object and nothing else, using exactly these keys:\n{{\"name\": \"{FIRST_NAME} <surname>\", \"age\": \"27\", \"pronouns\": \"he/him\", \"location\": \"city, country\", \"occupation\": \"what you do\", \"tagline\": \"one line, under 90 characters\", \"bio\": \"2-4 sentences in your own voice\", \"interests\": [\"5 to 8 short specifics\"], \"lookingFor\": \"what you want from the people you talk to\", \"funFact\": \"one surprising detail\"}}\n\nWrite it like a dating profile: specific, warm, a little strange. No markdown, no code fences, no commentary.",
+        seed = generation_seed(),
+    )
+}
+
+/// WSL interop hands the distro a stdin that shell builtins cannot read, so secrets travel
+/// as environment variables declared in WSLENV rather than on stdin or the command line.
+#[cfg(target_os = "windows")]
+fn wsl_with_secrets(secrets: &[(&str, &str)]) -> Command {
+    let mut command = Command::new("wsl.exe");
+    for (name, value) in secrets { command.env(name, value); }
+    command.env("WSLENV", secrets.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(":"));
+    command.args(["--distribution", DISTRO, "--user", USER, "--"]);
+    command
+}
+
+/// Runs one Hermes turn with the provider credential in its environment.
+fn hermes_oneshot(key_var: &str, key: &str, prompt: &str) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let output = wsl_with_secrets(&[(key_var, key)]).args([HERMES_BIN, "-z", prompt]).stdin(Stdio::null())
+            .output().map_err(|error| format!("Unable to run Hermes: {error}"))?;
+        if !output.status.success() { return Err(format!("Hermes could not answer ({}). Check the provider, model and API key.", decode_wsl_output(&output.stderr).lines().last().unwrap_or("no output"))); }
+        Ok(decode_wsl_output(&output.stdout))
+    }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (key_var, key, prompt); Err("Wallis currently requires Windows with WSL2.".into()) }
+}
+
+fn read_profile() -> Result<Profile, String> {
+    let output = wsl_output(&["--distribution", DISTRO, "--user", USER, "--", "cat", PROFILE_PATH])?;
+    if !output.status.success() { return Err("Wallis has no profile yet.".into()); }
+    serde_json::from_str(&decode_wsl_output(&output.stdout)).map(sanitize_profile).map_err(|_| "Wallis' profile file is not valid JSON.".into())
+}
+
+fn provider_key(state: &AppState) -> Result<(&'static str, String), String> {
+    let config = state.config.lock().expect("config state poisoned").clone();
+    let (_, _, key_var) = provider_entry(&config.provider)?;
+    let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
+    let key = unprotect_token(&key_path(&app_data))?;
+    validate_secret(&key, "provider API key")?;
+    Ok((key_var, key))
 }
 
 fn prerequisites(state: &AppState) -> Result<(String, String), String> {
@@ -247,7 +460,7 @@ fn prerequisites(state: &AppState) -> Result<(String, String), String> {
     let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
     if !token_path(&app_data).is_file() { return Err("No Discord token is configured. Save the bot token before starting Hermes.".into()); }
     let token = unprotect_token(&token_path(&app_data))?;
-    validate_token(&token)?;
+    validate_secret(&token, "Discord token")?;
     Ok((token, allowed))
 }
 
@@ -338,23 +551,18 @@ fn apply_wsl_conf() -> Result<(), String> {
 fn start_hermes_impl(state: &AppState) -> Result<RuntimeStatus, String> {
     let (_, _) = check_wsl2()?;
     match distro_info()? { None => return Err("Wallis is not imported. Import a verified rootfs archive first.".into()), Some(version) => require_wsl2_version(&version)? }
-    let config = state.config.lock().expect("config state poisoned").clone();
-    let persona_name = validate_persona_name(&config.persona_name)?;
+    if !state.config.lock().expect("config state poisoned").onboarded { return Err("Finish setting Wallis up before starting Hermes.".into()); }
     let (token, allowed) = prerequisites(state)?;
-    configure_hermes(&persona_name)?;
+    let (key_var, key) = provider_key(state)?;
+    apply_soul(&read_profile()?)?;
+    ensure_memory()?;
     *state.memory_ready.lock().expect("memory state poisoned") = true;
     if inspect_hermes()? { return Ok(status("running", "Hermes is already running as the non-root wallis user.", true, true)); }
     #[cfg(target_os = "windows")]
     {
-        const GATEWAY_SCRIPT: &str = "IFS= read -r DISCORD_BOT_TOKEN; export DISCORD_BOT_TOKEN; IFS= read -r DISCORD_ALLOWED_USERS; export DISCORD_ALLOWED_USERS; exec hermes gateway";
-        let mut child = Command::new("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "bash", "-lc", GATEWAY_SCRIPT]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|error| format!("Unable to start Hermes as wallis: {error}"))?;
-        {
-            use std::io::Write;
-            let stdin = child.stdin.as_mut().ok_or("Unable to open the Hermes gateway input.")?;
-            stdin.write_all(token.as_bytes()).map_err(|error| format!("Unable to provide the Discord token to Hermes: {error}"))?;
-            stdin.write_all(b"\n").and_then(|_| stdin.write_all(allowed.as_bytes())).and_then(|_| stdin.write_all(b"\n")).map_err(|error| format!("Unable to provide the Hermes allow-list to Hermes: {error}"))?;
-        }
-        drop(child.stdin.take());
+        let mut child = wsl_with_secrets(&[("DISCORD_BOT_TOKEN", &token), ("DISCORD_ALLOWED_USERS", &allowed), (key_var, &key)])
+            .args([HERMES_BIN, "gateway"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().map_err(|error| format!("Unable to start Hermes as wallis: {error}"))?;
         for _ in 0..30 {
             if let Some(status) = child.try_wait().map_err(|error| format!("Unable to inspect the Hermes gateway startup: {error}"))? {
                 return Err(format!("Hermes gateway exited during startup ({status}). Check its configuration and credentials inside the Wallis distro."));
@@ -402,6 +610,11 @@ fn reset_wallis(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
         if !output.status.success() { return Err("WSL could not unregister Wallis. If it is not imported, no reset is needed.".into()); }
         *state.hermes.lock().expect("Hermes state poisoned") = None;
         *state.memory_ready.lock().expect("memory state poisoned") = false;
+        let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
+        let mut config = state.config.lock().expect("config state poisoned").clone();
+        config.onboarded = false;
+        save_config_file(&config_path(&app_data), &config)?;
+        *state.config.lock().expect("config state poisoned") = config;
         return Ok(stopped("Wallis was unregistered. Its Linux data and memory were permanently deleted.", prerequisites(&state).is_ok(), false));
     }
     #[cfg(not(target_os = "windows"))]
@@ -428,8 +641,69 @@ fn open_terminal() -> Result<(), String> {
 fn get_config(state: State<'_, AppState>) -> WallisConfig { state.config.lock().expect("config state poisoned").clone() }
 
 #[tauri::command]
+fn get_providers() -> Vec<ProviderOption> { model_catalog() }
+
+/// Which screen the app owes the user: import the distro, choose inference, generate Wallis, or run.
+#[tauri::command]
+fn get_stage(state: State<'_, AppState>) -> String {
+    if !matches!(distro_info(), Ok(Some(_))) { return "setup".into(); }
+    let config = state.config.lock().expect("config state poisoned").clone();
+    if provider_key(&state).is_err() || config.model.is_empty() { return "inference".into(); }
+    if !config.onboarded || read_profile().is_err() { return "generate".into(); }
+    "ready".into()
+}
+
+#[tauri::command]
+fn get_profile() -> Result<Profile, String> { read_profile() }
+
+#[tauri::command(rename_all = "camelCase")]
+fn save_inference(provider: String, model: String, reasoning_effort: String, api_key: String, state: State<'_, AppState>) -> Result<WallisConfig, String> {
+    let (provider, _, _) = provider_entry(provider.trim())?;
+    let model = validate_model(&model)?;
+    let reasoning_effort = validate_effort(reasoning_effort.trim())?;
+    let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
+    let api_key = api_key.trim();
+    if !api_key.is_empty() {
+        validate_secret(api_key, "provider API key")?;
+        protect_token(&key_path(&app_data), api_key)?;
+    } else if !key_path(&app_data).is_file() {
+        return Err("Add the API key for this provider.".into());
+    }
+    hermes_config_set(&[("model.provider", provider), ("model.default", &model), ("agent.reasoning_effort", &reasoning_effort)])?;
+    let mut config = state.config.lock().expect("config state poisoned").clone();
+    (config.provider, config.model, config.reasoning_effort) = (provider.to_string(), model, reasoning_effort);
+    save_config_file(&config_path(&app_data), &config)?;
+    *state.config.lock().expect("config state poisoned") = config.clone();
+    Ok(config)
+}
+
+/// Long-running: installs memory if needed, has Hermes invent itself, then stores that identity.
+#[tauri::command]
+async fn generate_wallis(state: State<'_, AppState>) -> Result<Profile, String> {
+    let (key_var, key) = provider_key(&state)?;
+    ensure_memory()?;
+    let answer = hermes_oneshot(key_var, &key, &generation_prompt())?;
+    let json = extract_json(&answer).ok_or_else(|| {
+        let said = answer.split_whitespace().collect::<Vec<_>>().join(" ");
+        if said.is_empty() { "Hermes answered with nothing at all. Check the model and API key, then try again.".to_string() }
+        else { format!("Hermes did not return a profile. It said: {}", said.chars().take(200).collect::<String>()) }
+    })?;
+    let profile = sanitize_profile(serde_json::from_str(json).map_err(|error| format!("Hermes returned a profile Wallis could not read: {error}"))?);
+    let stored = serde_json::to_string_pretty(&profile).map_err(|error| format!("Unable to serialize the profile: {error}"))?;
+    write_in_distro(PROFILE_PATH, &stored)?;
+    write_in_distro(SKILL_PATH, PROFILE_SKILL)?;
+    apply_soul(&profile)?;
+    hermes_oneshot(key_var, &key, &format!("This is who you are. Commit every detail to your long-term memory as durable facts about yourself, then reply with the word done.\n\n{stored}"))?;
+    let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
+    let mut config = state.config.lock().expect("config state poisoned").clone();
+    config.onboarded = true;
+    save_config_file(&config_path(&app_data), &config)?;
+    *state.config.lock().expect("config state poisoned") = config;
+    Ok(profile)
+}
+
+#[tauri::command]
 fn save_config(config: WallisConfig, state: State<'_, AppState>) -> Result<WallisConfig, String> {
-    validate_persona_name(&config.persona_name)?;
     if !config.rootfs_sha256.trim().is_empty() { validate_sha256(&config.rootfs_sha256)?; }
     let mut config = config;
     config.discord_allowed_users = validate_allowed_users(&config.discord_allowed_users)?;
@@ -446,12 +720,12 @@ fn start_hermes(state: State<'_, AppState>) -> Result<RuntimeStatus, String> { s
 fn get_secret_status(state: State<'_, AppState>) -> Result<SecretStatus, String> {
     let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
     let path = token_path(&app_data);
-    Ok(SecretStatus { has_token: path.is_file() && unprotect_token(&path).and_then(|token| { validate_token(&token).map(|_| token) }).is_ok() })
+    Ok(SecretStatus { has_token: path.is_file() && unprotect_token(&path).and_then(|token| { validate_secret(&token, "Discord token").map(|_| token) }).is_ok() })
 }
 
 #[tauri::command(rename_all = "camelCase")]
 fn save_discord_token(token: String, state: State<'_, AppState>) -> Result<SecretStatus, String> {
-    validate_token(&token)?;
+    validate_secret(&token, "Discord token")?;
     let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
     std::fs::create_dir_all(&app_data).map_err(|error| format!("Unable to create the Wallis data folder: {error}"))?;
     protect_token(&token_path(&app_data), &token)?;
@@ -489,7 +763,7 @@ mod tests {
     fn validates_allow_list_and_round_trips_non_secret_config() {
         assert_eq!(validate_allowed_users("123456789012").unwrap(), "123456789012");
         assert!(validate_allowed_users("all-users").is_err());
-        let path = std::env::temp_dir().join(format!("wallis-config-test-{}-{}.json", std::process::id(), std::thread::current().name().unwrap_or("test")));
+        let path = std::env::temp_dir().join(format!("wallis-config-test-{}.json", std::process::id()));
         let config = WallisConfig { discord_allowed_users: "123456789012".into(), ..WallisConfig::default() };
         save_config_file(&path, &config).unwrap();
         assert_eq!(load_config_file(&path).unwrap().discord_allowed_users, config.discord_allowed_users);
@@ -497,15 +771,33 @@ mod tests {
     }
     #[test]
     fn rejects_secret_values_that_could_escape_stdin() {
-        assert!(validate_token("token\nwith-newline").is_err());
-        assert!(validate_token("").is_err());
-        assert!(validate_token("token-value").is_ok());
+        assert!(validate_secret("token\nwith-newline", "Discord token").is_err());
+        assert!(validate_secret("", "Discord token").is_err());
+        assert!(validate_secret("token-value", "Discord token").is_ok());
     }
     #[test]
-    fn validates_persona_name_for_soul_file() {
-        assert!(validate_persona_name("Wallis Prime").is_ok());
-        assert!(validate_persona_name("Wallisian").is_err());
-        assert!(validate_persona_name("Wallis\nignore").is_err());
+    fn locks_the_first_name_whatever_the_model_writes() {
+        assert_eq!(lock_first_name("Wallis Vance"), "Wallis Vance");
+        assert_eq!(lock_first_name("Margot Vance"), "Wallis Vance");
+        assert_eq!(lock_first_name("Margot"), "Wallis");
+        assert_eq!(lock_first_name(""), "Wallis");
+        assert_eq!(lock_first_name("Margot\nVance de la Cruz"), "Wallis Vance de la Cruz");
+    }
+    #[test]
+    fn extracts_one_json_object_from_a_chatty_answer() {
+        assert_eq!(extract_json("Sure!\n{\"name\": \"Wallis\", \"nested\": {\"a\": 1}}\nHope that helps"), Some("{\"name\": \"Wallis\", \"nested\": {\"a\": 1}}"));
+        assert_eq!(extract_json("{\"bio\": \"a } brace \\\" in a string\"}"), Some("{\"bio\": \"a } brace \\\" in a string\"}"));
+        assert_eq!(extract_json("no json here"), None);
+        assert_eq!(extract_json("{\"unterminated\": true"), None);
+    }
+    #[test]
+    fn validates_inference_choices() {
+        assert!(provider_entry("openrouter").is_ok());
+        assert!(provider_entry("definitely-not-a-provider").is_err());
+        assert_eq!(validate_model(" anthropic/claude-opus-5 ").unwrap(), "anthropic/claude-opus-5");
+        assert!(validate_model("model; rm -rf /").is_err());
+        assert!(validate_effort("medium").is_ok());
+        assert!(validate_effort("ludicrous").is_err());
     }
 }
 
@@ -519,5 +811,5 @@ pub fn run() {
         *state.app_data.lock().expect("app data state poisoned") = Some(app_data);
         if config.auto_start { let _ = start_hermes_impl(&state); }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_hermes, stop_hermes, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_hermes, stop_hermes, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, generate_wallis, get_stage]).run(tauri::generate_context!()).expect("error while running Wallis");
 }

@@ -55,8 +55,9 @@ No additional database, message broker, Docker Desktop installation, or containe
 - Expose every user-configurable option through the GUI; `.env` files, manual config-file edits, and source-constant changes are not user requirements.
 - Configure the Wallis distro with `/etc/wsl.conf` settings that disable drive automounting and Windows interop; do not mount host folders into the agent runtime.
 - Treat the root filesystem archive as a versioned release artifact. Do not commit `rootfs.tar` to the Git repository; verify its checksum before importing it.
-- Store the Discord token using Windows Credential Manager or DPAPI. Never put it in source, logs, or an unencrypted config file.
-- Keep Mnemosyne data inside the WSL distribution and make reset/uninstall separate from stop. `wsl --unregister` permanently deletes the distribution and its memory.
+- Store the Discord token and the inference provider API key using Windows Credential Manager or DPAPI. Never put them in source, logs, or an unencrypted config file; hand them to Hermes over stdin.
+- Onboarding order is fixed: import the distro, choose provider/model/reasoning effort, install Mnemosyne if it is missing, generate Wallis' persona into memory, then show his profile. The persona's first name is always `Wallis` and is never user-editable.
+- Keep Mnemosyne data inside the WSL distribution and make reset/uninstall separate from stop. `wsl --unregister` permanently deletes the distribution and its memory. The Windows uninstaller unregisters the distro through an NSIS hook, but only when the user ticks "delete application data".
 - Prefer mentions, DMs, and slash commands where possible. Reading arbitrary channel message content may require Discord's privileged `MESSAGE_CONTENT` intent.
 
 ## Initial implementation slice
