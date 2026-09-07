@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Mutex;
+#[cfg(target_os = "windows")]
+use std::time::Duration;
 use tauri::State;
 
 const DISTRO: &str = "Wallis";
@@ -60,6 +62,21 @@ fn parse_distros(output: &str) -> Vec<(String, String)> {
     }).collect()
 }
 
+fn require_wsl2_version(version: &str) -> Result<(), String> {
+    if version == "2" { Ok(()) } else { Err("The Wallis distro is WSL1, not WSL2. Use Reset Wallis and import it again with WSL2.".into()) }
+}
+
+fn gateway_running(output: &str) -> bool {
+    output.lines().any(|line| {
+        let mut args = line.split_whitespace();
+        args.next();
+        while let Some(arg) = args.next() {
+            if arg.rsplit('/').next() == Some("hermes") && args.next() == Some("gateway") { return true; }
+        }
+        false
+    })
+}
+
 fn validate_sha256(value: &str) -> Result<String, String> {
     let value = value.trim().to_ascii_lowercase();
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err("Expected a 64-character SHA-256 checksum.".into()); }
@@ -107,8 +124,9 @@ fn distro_info() -> Result<Option<String>, String> {
 }
 
 fn inspect_hermes() -> Result<bool, String> {
-    let output = wsl_output(&["--distribution", DISTRO, "--user", USER, "--", "pgrep", "-x", "hermes"])?;
-    if output.status.success() { Ok(true) } else if output.status.code() == Some(1) { Ok(false) } else { Err("WSL could not inspect Hermes. Confirm the Wallis distro contains the non-root wallis user and pgrep.".into()) }
+    let output = wsl_output(&["--distribution", DISTRO, "--user", USER, "--", "ps", "-eo", "pid=,args="])?;
+    if !output.status.success() { return Err("WSL could not inspect the Hermes gateway. Confirm the non-root wallis user and ps are available.".into()); }
+    Ok(gateway_running(&decode_wsl_output(&output.stdout)))
 }
 
 fn stopped(message: impl Into<String>) -> RuntimeStatus { RuntimeStatus { state: "stopped".into(), message: message.into() } }
@@ -123,7 +141,7 @@ fn get_runtime_status() -> RuntimeStatus {
     if let Err(message) = check_wsl2() { return RuntimeStatus { state: "unavailable".into(), message }; }
     match distro_info() {
         Ok(None) => stopped("Wallis is not imported. Import a verified rootfs archive to continue."),
-        Ok(Some(_)) => match inspect_hermes() {
+        Ok(Some(version)) => match require_wsl2_version(&version).and_then(|_| inspect_hermes()) {
             Ok(true) => RuntimeStatus { state: "running".into(), message: "Hermes is running as the non-root wallis user.".into() },
             Ok(false) => stopped("Wallis is imported; Hermes is stopped."),
             Err(message) => RuntimeStatus { state: "unavailable".into(), message },
@@ -136,7 +154,7 @@ fn get_runtime_status() -> RuntimeStatus {
 fn import_wallis(rootfs_archive: String, expected_sha256: String, install_root: Option<String>) -> Result<RuntimeStatus, String> {
     let (archive, expected_sha256, root) = validate_import_inputs(&rootfs_archive, &expected_sha256, install_root.as_deref())?;
     let (_, _) = check_wsl2()?;
-    if distro_info()?.is_some() { return Err("The Wallis distro is already imported. Use Reset Wallis first to remove it.".into()); }
+    if let Some(version) = distro_info()? { require_wsl2_version(&version)?; return Err("The Wallis distro is already imported. Use Reset Wallis first to remove it.".into()); }
     #[cfg(target_os = "windows")]
     {
         let path = archive.to_str().ok_or("The rootfs path is not valid Unicode.")?;
@@ -170,13 +188,33 @@ fn apply_wsl_conf() -> Result<(), String> {
 #[tauri::command]
 fn start_hermes(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
     let (_, _) = check_wsl2()?;
-    if distro_info()?.is_none() { return Err("Wallis is not imported. Import a verified rootfs archive first.".into()); }
+    match distro_info()? { None => return Err("Wallis is not imported. Import a verified rootfs archive first.".into()), Some(version) => require_wsl2_version(&version)? }
     if inspect_hermes()? { return Ok(RuntimeStatus { state: "running".into(), message: "Hermes is already running as the non-root wallis user.".into() }); }
     #[cfg(target_os = "windows")]
     {
         let child = Command::new("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "hermes", "gateway"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|error| format!("Unable to start Hermes as wallis: {error}"))?;
-        *state.hermes.lock().expect("Hermes state poisoned") = Some(child);
-        Ok(RuntimeStatus { state: "running".into(), message: "Hermes started as the non-root wallis user.".into() })
+        let mut child = child;
+        for _ in 0..30 {
+            if let Some(status) = child.try_wait().map_err(|error| format!("Unable to inspect the Hermes gateway startup: {error}"))? {
+                return Err(format!("Hermes gateway exited during startup ({status}). Check its configuration and credentials inside the Wallis distro."));
+            }
+            let running = match inspect_hermes() {
+                Ok(running) => running,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
+            if running {
+                *state.hermes.lock().expect("Hermes state poisoned") = Some(child);
+                return Ok(RuntimeStatus { state: "running".into(), message: "Hermes gateway started as the non-root wallis user.".into() });
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Err("Hermes gateway did not become active within 6 seconds. Check its configuration and credentials inside the Wallis distro.".into())
     }
     #[cfg(not(target_os = "windows"))]
     { let _ = state; Err("Wallis currently requires Windows with WSL2.".into()) }
@@ -238,6 +276,13 @@ mod tests {
     #[test]
     fn parses_wsl_distro_versions() {
         assert_eq!(parse_distros("  NAME      STATE           VERSION\n* Wallis    Running         2\n  Ubuntu    Stopped         1"), vec![("Wallis".into(), "2".into()), ("Ubuntu".into(), "1".into())]);
+        assert!(require_wsl2_version("1").is_err());
+        assert!(require_wsl2_version("2").is_ok());
+    }
+    #[test]
+    fn finds_only_the_hermes_gateway_process() {
+        assert!(gateway_running("  12 /usr/bin/python /home/wallis/.local/bin/hermes gateway\n  13 ps -eo pid=,args="));
+        assert!(!gateway_running("  12 /usr/bin/python /home/wallis/.local/bin/hermes\n  13 ps -eo pid=,args="));
     }
 }
 
