@@ -14,19 +14,40 @@ const TOKEN_FILE: &str = "discord-token.dpapi";
 const KEY_FILE: &str = "provider-key.dpapi";
 const PROFILE_PATH: &str = "/home/wallis/.hermes/wallis-profile.json";
 const HERMES_BIN: &str = "/home/wallis/.local/bin/hermes";
+const HERMES_PYTHON: &str = "/home/wallis/.hermes/hermes-agent/venv/bin/python";
 const WALLIS_HOME: &str = "/home/wallis/.wallis";
 const NODE_BIN: &str = "/home/wallis/.wallis/node/bin/node";
 const BOT_JS: &str = "/home/wallis/.wallis/bot/bot.mjs";
 const BOT_PACKAGE: &str = "/home/wallis/.wallis/bot/package.json";
+const BOT_STATUS: &str = "/home/wallis/.wallis/bot-status.json";
 /// The Discord bot is installed into the distro, so it ships inside this binary.
 const BOT_SOURCE: &str = include_str!("../bot/bot.mjs");
 const BOT_MANIFEST: &str = include_str!("../bot/package.json");
 const RELEASE_PATH: &str = "/etc/wallis-rootfs-release";
-const CATALOG_URL: &str = "https://hermes-agent.nousresearch.com/docs/api/model-catalog.json";
-/// Providers Hermes publishes a curated model catalog for, with the credential each one reads.
-const PROVIDERS: [(&str, &str, &str); 2] = [("openrouter", "OpenRouter", "OPENROUTER_API_KEY"), ("nous-api", "Nous Portal", "NOUS_API_KEY")];
+/// Providers whose keys Wallis can accept in its GUI. Other providers use credentials added
+/// through Hermes itself and need no key injected by Wallis.
+const GUI_PROVIDER_KEYS: [(&str, &str); 3] = [("openrouter", "OPENROUTER_API_KEY"), ("nous", "NOUS_API_KEY"), ("nous-api", "NOUS_API_KEY")];
 const EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+const HERMES_CATALOG_SCRIPT: &str = r#"
+import json, sys
+from hermes_cli.models import cached_provider_model_ids, list_available_providers
+
+refresh, current = sys.argv[1] == "1", sys.argv[2]
+always = {"openrouter", "nous", current}
+result, seen = [], set()
+for provider in list_available_providers():
+    provider_id = provider["id"]
+    if provider_id in seen or (not provider.get("authenticated") and provider_id not in always):
+        continue
+    seen.add(provider_id)
+    models = cached_provider_model_ids(provider_id, force_refresh=refresh)
+    result.append({"id": provider_id, "label": provider["label"], "models": [
+        {"id": model, "efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]}
+        for model in models
+    ]})
+print(json.dumps(result))
+"#;
 // Pinned prerequisites the app installs into the distro. Every one is checksummed on arrival.
 const NODE_URL: &str = "https://nodejs.org/dist/v24.20.0/node-v24.20.0-linux-x64.tar.xz";
 const NODE_SHA256: &str = "2f2c0da162318f0de47665410c7c8c2ed3d36c8f3105de4bbc61176c70a7cbf2";
@@ -53,6 +74,18 @@ const WSL_CONF: &str = "[automount]\nenabled=false\n\n[interop]\nenabled=false\n
 struct AppState { config: Mutex<WallisConfig>, app_data: Mutex<Option<PathBuf>>, memory_ready: Mutex<bool>, bot: Mutex<Option<Child>>, progress: Mutex<String> }
 
 /// What the app is doing during a long setup step, polled by the loading screen.
+/// Every child process of a GUI app gets its own console window on Windows unless it is asked
+/// not to; CREATE_NO_WINDOW keeps wsl.exe and certutil.exe out of the user's face.
+fn command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
 fn set_progress(state: &AppState, message: &str) { *state.progress.lock().expect("progress state poisoned") = message.to_string(); }
 
 impl Default for AppState {
@@ -119,11 +152,11 @@ struct Profile {
     #[serde(default)] fun_fact: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelOption { id: String, efforts: Vec<String> }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderOption { id: String, label: String, models: Vec<ModelOption> }
 
@@ -296,7 +329,7 @@ fn soul_document(profile: &Profile) -> String {
 fn write_in_distro(path: &str, content: &str) -> Result<(), String> {
     use std::io::Write;
     let script = format!("mkdir -p \"$(dirname '{path}')\" && cat > '{path}'");
-    let mut child = Command::new("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "bash", "-c", &script]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|error| format!("Unable to write {path}: {error}"))?;
+    let mut child = command("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "bash", "-c", &script]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|error| format!("Unable to write {path}: {error}"))?;
     child.stdin.take().ok_or("Unable to open the distro file input.")?.write_all(content.as_bytes()).map_err(|error| format!("Unable to write {path}: {error}"))?;
     let result = child.wait_with_output().map_err(|error| format!("Unable to write {path}: {error}"))?;
     if result.status.success() { Ok(()) } else { Err(format!("The Wallis distro rejected the write to {path}.")) }
@@ -318,7 +351,7 @@ fn validate_import_inputs(archive: &str, expected_sha256: &str, install_root: Op
 }
 
 #[cfg(target_os = "windows")]
-fn wsl_output(args: &[&str]) -> Result<Output, String> { Command::new("wsl.exe").args(args).output().map_err(|error| format!("Unable to run WSL: {error}")) }
+fn wsl_output(args: &[&str]) -> Result<Output, String> { command("wsl.exe").args(args).output().map_err(|error| format!("Unable to run WSL: {error}")) }
 
 #[cfg(not(target_os = "windows"))]
 fn wsl_output(_args: &[&str]) -> Result<Output, String> { Err("Wallis currently requires Windows with WSL2.".into()) }
@@ -360,7 +393,7 @@ fn run_script(what: &str, script: &str) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
         use std::io::Write;
-        let mut child = Command::new("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "bash", "-s"])
+        let mut child = command("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "bash", "-s"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
             .spawn().map_err(|error| format!("Unable to {what}: {error}"))?;
         child.stdin.take().ok_or("Unable to open the setup input.")?.write_all(script.as_bytes()).map_err(|error| format!("Unable to {what}: {error}"))?;
@@ -461,8 +494,12 @@ fn get_voice_options() -> (Vec<VoiceOption>, Vec<VoiceOption>) {
     (map(&STT_MODELS), map(&TTS_VOICES))
 }
 
-fn provider_entry(id: &str) -> Result<(&'static str, &'static str, &'static str), String> {
-    PROVIDERS.iter().copied().find(|(provider, _, _)| *provider == id).ok_or_else(|| "Choose a supported inference provider.".to_string())
+fn provider_key_var(id: &str) -> Option<&'static str> { GUI_PROVIDER_KEYS.iter().find(|(provider, _)| *provider == id).map(|(_, key)| *key) }
+
+fn validate_provider(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 80 || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) { return Err("Choose a provider reported by Hermes.".into()); }
+    Ok(value.to_string())
 }
 
 fn validate_model(value: &str) -> Result<String, String> {
@@ -494,23 +531,31 @@ fn silent_models() -> Vec<String> {
         .filter_map(|model| model["id"].as_str().map(str::to_string)).collect()).unwrap_or_default()
 }
 
-/// Curated provider/model list, with the effort levels each model can actually be asked for.
-fn model_catalog() -> Vec<ProviderOption> {
-    let catalog = fetch_json(CATALOG_URL);
+/// Ask the installed Hermes for the same authenticated providers and model catalogs its picker uses.
+fn model_catalog(state: &AppState, refresh: bool) -> Result<Vec<ProviderOption>, String> {
+    let current = state.config.lock().expect("config state poisoned").provider.clone();
+    #[cfg(target_os = "windows")]
+    let output = {
+        let secret = provider_key(state).ok().flatten();
+        let mut command = match secret.as_ref() {
+            Some((key_var, key)) => wsl_with_secrets(&[(key_var, key)]),
+            None => wsl_with_secrets(&[]),
+        };
+        command.args([HERMES_PYTHON, "-c", HERMES_CATALOG_SCRIPT, if refresh { "1" } else { "0" }, if current == "nous-api" { "nous" } else { &current }])
+            .output().map_err(|error| format!("Unable to ask Hermes for providers: {error}"))?
+    };
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (state, refresh, current); return Err("Wallis currently requires Windows with WSL2.".into()); }
+    if !output.status.success() { return Err(format!("Hermes could not refresh providers: {}", decode_wsl_output(&output.stderr).lines().last().unwrap_or("no output"))); }
+    let mut providers: Vec<ProviderOption> = serde_json::from_str(&decode_wsl_output(&output.stdout)).map_err(|_| "Hermes returned an invalid provider catalog.".to_string())?;
     let silent = silent_models();
-    let ladder: Vec<String> = EFFORTS.iter().map(|effort| (*effort).to_string()).collect();
-    PROVIDERS.iter().map(|(id, label, _)| ProviderOption {
-        id: (*id).to_string(),
-        label: (*label).to_string(),
-        models: catalog["providers"][catalog_key(id)]["models"].as_array().map(|models| models.iter().filter_map(|model| model["id"].as_str()).map(|model| ModelOption {
-            efforts: if *id == "openrouter" && silent.iter().any(|silent| silent == model) { vec!["none".to_string()] } else { ladder.clone() },
-            id: model.to_string(),
-        }).collect()).unwrap_or_default(),
-    }).collect()
+    if let Some(openrouter) = providers.iter_mut().find(|provider| provider.id == "openrouter") {
+        for model in &mut openrouter.models {
+            if silent.iter().any(|silent| silent == &model.id) { model.efforts = vec!["none".into()]; }
+        }
+    }
+    Ok(providers)
 }
-
-/// Hermes' provider ids and its catalog keys differ for the Nous Portal entry.
-fn catalog_key(provider: &str) -> &str { if provider == "nous-api" { "nous" } else { provider } }
 
 fn extract_json(text: &str) -> Option<&str> {
     let start = text.find('{')?;
@@ -546,24 +591,25 @@ fn generation_prompt() -> String {
 /// as environment variables declared in WSLENV rather than on stdin or the command line.
 #[cfg(target_os = "windows")]
 fn wsl_with_secrets(secrets: &[(&str, &str)]) -> Command {
-    let mut command = Command::new("wsl.exe");
+    let mut command = command("wsl.exe");
     for (name, value) in secrets { command.env(name, value); }
     command.env("WSLENV", secrets.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(":"));
     command.args(["--distribution", DISTRO, "--user", USER, "--"]);
     command
 }
 
-/// Runs one Hermes turn with the provider credential in its environment.
-fn hermes_oneshot(key_var: &str, key: &str, prompt: &str) -> Result<String, String> {
+/// Runs one Hermes turn, injecting a GUI-managed key when this provider uses one.
+fn hermes_oneshot(provider_key: Option<(&str, &str)>, prompt: &str) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
-        let output = wsl_with_secrets(&[(key_var, key)]).args([HERMES_BIN, "-z", prompt]).stdin(Stdio::null())
+        let mut command = match provider_key { Some((key_var, key)) => wsl_with_secrets(&[(key_var, key)]), None => wsl_with_secrets(&[]) };
+        let output = command.args([HERMES_BIN, "-z", prompt]).stdin(Stdio::null())
             .output().map_err(|error| format!("Unable to run Hermes: {error}"))?;
         if !output.status.success() { return Err(format!("Hermes could not answer ({}). Check the provider, model and API key.", decode_wsl_output(&output.stderr).lines().last().unwrap_or("no output"))); }
         Ok(decode_wsl_output(&output.stdout))
     }
     #[cfg(not(target_os = "windows"))]
-    { let _ = (key_var, key, prompt); Err("Wallis currently requires Windows with WSL2.".into()) }
+    { let _ = (provider_key, prompt); Err("Wallis currently requires Windows with WSL2.".into()) }
 }
 
 fn read_profile() -> Result<Profile, String> {
@@ -572,13 +618,13 @@ fn read_profile() -> Result<Profile, String> {
     serde_json::from_str(&decode_wsl_output(&output.stdout)).map(sanitize_profile).map_err(|_| "Wallis' profile file is not valid JSON.".into())
 }
 
-fn provider_key(state: &AppState) -> Result<(&'static str, String), String> {
+fn provider_key(state: &AppState) -> Result<Option<(&'static str, String)>, String> {
     let config = state.config.lock().expect("config state poisoned").clone();
-    let (_, _, key_var) = provider_entry(&config.provider)?;
+    let Some(key_var) = provider_key_var(&config.provider) else { return Ok(None); };
     let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
     let key = unprotect_token(&key_path(&app_data))?;
     validate_secret(&key, "provider API key")?;
-    Ok((key_var, key))
+    Ok(Some((key_var, key)))
 }
 
 fn prerequisites(state: &AppState) -> Result<(String, String), String> {
@@ -613,6 +659,21 @@ fn inspect_bot() -> Result<bool, String> {
     Ok(bot_running(&decode_wsl_output(&output.stdout)))
 }
 
+fn bot_diagnostic() -> Option<String> {
+    let output = wsl_output(&["--distribution", DISTRO, "--user", USER, "--", "cat", BOT_STATUS]).ok()?;
+    if !output.status.success() { return None; }
+    let value: serde_json::Value = serde_json::from_str(&decode_wsl_output(&output.stdout)).ok()?;
+    if let Some(error) = value.get("lastError").filter(|error| !error.is_null()) {
+        return Some(format!("Last voice error ({}): {}", error.get("where")?.as_str()?, error.get("message")?.as_str()?));
+    }
+    let latency = value.get("lastLatency")?.as_object()?;
+    Some(format!(
+        "Last voice latency: {} ms total (speech recognition {}, first response {}, speech {}).",
+        latency.get("totalMs")?.as_u64()?, latency.get("stopToTranscriptMs")?.as_u64()?,
+        latency.get("transcriptToFirstTextMs")?.as_u64()?, latency.get("firstTextToAudioMs")?.as_u64()?,
+    ))
+}
+
 fn status(state: &str, message: impl Into<String>, discord_ready: bool, memory_ready: bool) -> RuntimeStatus { RuntimeStatus { state: state.into(), message: message.into(), discord_ready, memory_ready } }
 fn stopped(message: impl Into<String>, discord_ready: bool, memory_ready: bool) -> RuntimeStatus { status("stopped", message, discord_ready, memory_ready) }
 
@@ -631,7 +692,10 @@ fn get_runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
                 let discord_ready = prerequisites(&state).is_ok();
                 let memory = memory_ready().unwrap_or_else(|_| *state.memory_ready.lock().expect("memory state poisoned"));
                 *state.memory_ready.lock().expect("memory state poisoned") = memory;
-                if running { status("running", "Wallis is online as the non-root wallis user.", discord_ready, memory) }
+                if running {
+                    let detail = bot_diagnostic().map(|detail| format!(" {detail}")).unwrap_or_default();
+                    status("running", format!("Wallis is online as the non-root wallis user.{detail}"), discord_ready, memory)
+                }
                 else { stopped("Wallis is imported and set up; he is not running.", discord_ready, memory) }
             }
             Err(message) => status("unavailable", message, false, false),
@@ -648,13 +712,13 @@ fn import_wallis(rootfs_archive: String, expected_sha256: String, install_root: 
     #[cfg(target_os = "windows")]
     {
         let path = archive.to_str().ok_or("The rootfs path is not valid Unicode.")?;
-        let digest = Command::new("certutil.exe").args(["-hashfile", path, "SHA256"]).output().map_err(|error| format!("Unable to verify the rootfs checksum: {error}"))?;
+        let digest = command("certutil.exe").args(["-hashfile", path, "SHA256"]).output().map_err(|error| format!("Unable to verify the rootfs checksum: {error}"))?;
         if !digest.status.success() { return Err("Windows could not calculate the rootfs SHA-256 checksum.".into()); }
         let actual = extract_sha256(&decode_wsl_output(&digest.stdout)).ok_or("Windows returned no SHA-256 checksum.")?;
         if actual != expected_sha256 { return Err(format!("Rootfs checksum mismatch. Expected {expected_sha256}, got {actual}.")); }
         std::fs::create_dir_all(&root).map_err(|error| format!("Unable to create the distro install root: {error}"))?;
         let root = root.to_str().ok_or("The distro install root is not valid Unicode.")?;
-        let imported = Command::new("wsl.exe").args(["--import", DISTRO, root, path, "--version", "2"]).output().map_err(|error| format!("Unable to import the Wallis distro: {error}"))?;
+        let imported = command("wsl.exe").args(["--import", DISTRO, root, path, "--version", "2"]).output().map_err(|error| format!("Unable to import the Wallis distro: {error}"))?;
         if !imported.status.success() { return Err("WSL rejected the Wallis rootfs import. Verify the archive is a Linux rootfs tar and WSL2 is supported.".into()); }
         apply_wsl_conf()?;
         Ok(stopped("Wallis imported as WSL2 and configured for the non-root wallis user.", false, false))
@@ -665,7 +729,7 @@ fn import_wallis(rootfs_archive: String, expected_sha256: String, install_root: 
 
 #[cfg(target_os = "windows")]
 fn apply_wsl_conf() -> Result<(), String> {
-    let mut child = Command::new("wsl.exe").args(["--distribution", DISTRO, "--user", "root", "--", "tee", "/etc/wsl.conf"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|error| format!("Unable to configure /etc/wsl.conf: {error}"))?;
+    let mut child = command("wsl.exe").args(["--distribution", DISTRO, "--user", "root", "--", "tee", "/etc/wsl.conf"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|error| format!("Unable to configure /etc/wsl.conf: {error}"))?;
     use std::io::Write;
     child.stdin.take().ok_or("Unable to open WSL configuration input.")?.write_all(WSL_CONF.as_bytes()).map_err(|error| format!("Unable to write /etc/wsl.conf: {error}"))?;
     let result = child.wait_with_output().map_err(|error| format!("Unable to apply /etc/wsl.conf: {error}"))?;
@@ -683,7 +747,7 @@ fn start_wallis_impl(state: &AppState) -> Result<RuntimeStatus, String> {
     if !state.config.lock().expect("config state poisoned").onboarded { return Err("Finish setting Wallis up before starting him.".into()); }
     let application_id = state.config.lock().expect("config state poisoned").discord_application_id.clone();
     let (token, allowed) = prerequisites(state)?;
-    let (key_var, key) = provider_key(state)?;
+    let provider_key = provider_key(state)?;
     apply_soul(&read_profile()?)?;
     ensure_memory()?;
     ensure_voice(state)?;
@@ -693,8 +757,10 @@ fn start_wallis_impl(state: &AppState) -> Result<RuntimeStatus, String> {
     {
         let voice = state.config.lock().expect("config state poisoned").clone();
         let (threads, speed, silence) = (voice.stt_threads.to_string(), voice.tts_speed.to_string(), voice.silence_ms.to_string());
-        let mut child = wsl_with_secrets(&[("DISCORD_BOT_TOKEN", &token), ("DISCORD_ALLOWED_USERS", &allowed), ("DISCORD_APPLICATION_ID", &application_id), (key_var, &key),
-            ("WALLIS_STT_MODEL", &voice.stt_model), ("WALLIS_STT_THREADS", &threads), ("WALLIS_TTS_VOICE", &voice.tts_voice), ("WALLIS_TTS_SPEED", &speed), ("WALLIS_SILENCE_MS", &silence)])
+        let mut secrets = vec![("DISCORD_BOT_TOKEN", token.as_str()), ("DISCORD_ALLOWED_USERS", allowed.as_str()), ("DISCORD_APPLICATION_ID", application_id.as_str()),
+            ("WALLIS_STT_MODEL", voice.stt_model.as_str()), ("WALLIS_STT_THREADS", threads.as_str()), ("WALLIS_TTS_VOICE", voice.tts_voice.as_str()), ("WALLIS_TTS_SPEED", speed.as_str()), ("WALLIS_SILENCE_MS", silence.as_str())];
+        if let Some((key_var, key)) = provider_key.as_ref() { secrets.push((key_var, key.as_str())); }
+        let mut child = wsl_with_secrets(&secrets)
             .args([NODE_BIN, BOT_JS]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
             .spawn().map_err(|error| format!("Unable to start the Wallis bot: {error}"))?;
         for _ in 0..30 {
@@ -720,7 +786,7 @@ fn start_wallis_impl(state: &AppState) -> Result<RuntimeStatus, String> {
         Err("The Wallis bot did not come up within 6 seconds. Check the Discord token and allow-list.".into())
     }
     #[cfg(not(target_os = "windows"))]
-    { let _ = (state, application_id, token, allowed, key_var, key); Err("Wallis currently requires Windows with WSL2.".into()) }
+    { let _ = (state, application_id, token, allowed, provider_key); Err("Wallis currently requires Windows with WSL2.".into()) }
 }
 
 #[tauri::command]
@@ -777,8 +843,8 @@ fn get_config(state: State<'_, AppState>) -> WallisConfig { state.config.lock().
 #[tauri::command]
 fn get_progress(state: State<'_, AppState>) -> String { state.progress.lock().expect("progress state poisoned").clone() }
 
-#[tauri::command]
-fn get_providers() -> Vec<ProviderOption> { model_catalog() }
+#[tauri::command(rename_all = "camelCase")]
+fn get_providers(refresh: Option<bool>, state: State<'_, AppState>) -> Result<Vec<ProviderOption>, String> { model_catalog(&state, refresh.unwrap_or(false)) }
 
 /// Which screen the app owes the user: import the distro, choose inference, generate Wallis, or run.
 #[tauri::command]
@@ -795,20 +861,21 @@ fn get_profile() -> Result<Profile, String> { read_profile() }
 
 #[tauri::command(rename_all = "camelCase")]
 fn save_inference(provider: String, model: String, reasoning_effort: String, api_key: String, state: State<'_, AppState>) -> Result<WallisConfig, String> {
-    let (provider, _, _) = provider_entry(provider.trim())?;
+    let provider = validate_provider(&provider)?;
     let model = validate_model(&model)?;
     let reasoning_effort = validate_effort(reasoning_effort.trim())?;
     let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
     let api_key = api_key.trim();
     if !api_key.is_empty() {
+        if provider_key_var(&provider).is_none() { return Err("Add this provider's credentials through the Hermes CLI, then refresh providers here.".into()); }
         validate_secret(api_key, "provider API key")?;
         protect_token(&key_path(&app_data), api_key)?;
-    } else if !key_path(&app_data).is_file() {
+    } else if provider_key_var(&provider).is_some() && !key_path(&app_data).is_file() {
         return Err("Add the API key for this provider.".into());
     }
-    hermes_config_set(&[("model.provider", provider), ("model.default", &model), ("agent.reasoning_effort", &reasoning_effort)])?;
+    hermes_config_set(&[("model.provider", &provider), ("model.default", &model), ("agent.reasoning_effort", &reasoning_effort)])?;
     let mut config = state.config.lock().expect("config state poisoned").clone();
-    (config.provider, config.model, config.reasoning_effort) = (provider.to_string(), model, reasoning_effort);
+    (config.provider, config.model, config.reasoning_effort) = (provider, model, reasoning_effort);
     save_config_file(&config_path(&app_data), &config)?;
     *state.config.lock().expect("config state poisoned") = config.clone();
     Ok(config)
@@ -817,12 +884,12 @@ fn save_inference(provider: String, model: String, reasoning_effort: String, api
 /// Long-running: installs memory if needed, has Hermes invent itself, then stores that identity.
 #[tauri::command]
 async fn generate_wallis(state: State<'_, AppState>) -> Result<Profile, String> {
-    let (key_var, key) = provider_key(&state)?;
+    let provider_key = provider_key(&state)?;
     set_progress(&state, "Setting up memory…");
     ensure_memory()?;
     ensure_voice(&state)?;
     set_progress(&state, "Generating Wallis…");
-    let answer = hermes_oneshot(key_var, &key, &generation_prompt())?;
+    let answer = hermes_oneshot(provider_key.as_ref().map(|(key, value)| (*key, value.as_str())), &generation_prompt())?;
     let json = extract_json(&answer).ok_or_else(|| {
         let said = answer.split_whitespace().collect::<Vec<_>>().join(" ");
         if said.is_empty() { "Hermes answered with nothing at all. Check the model and API key, then try again.".to_string() }
@@ -832,7 +899,7 @@ async fn generate_wallis(state: State<'_, AppState>) -> Result<Profile, String> 
     let stored = serde_json::to_string_pretty(&profile).map_err(|error| format!("Unable to serialize the profile: {error}"))?;
     write_in_distro(PROFILE_PATH, &stored)?;
     apply_soul(&profile)?;
-    hermes_oneshot(key_var, &key, &format!("This is who you are. Commit every detail to your long-term memory as durable facts about yourself, then reply with the word done.\n\n{stored}"))?;
+    hermes_oneshot(provider_key.as_ref().map(|(key, value)| (*key, value.as_str())), &format!("This is who you are. Commit every detail to your long-term memory as durable facts about yourself, then reply with the word done.\n\n{stored}"))?;
     let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
     let mut config = state.config.lock().expect("config state poisoned").clone();
     config.onboarded = true;
@@ -946,8 +1013,8 @@ mod tests {
     }
     #[test]
     fn validates_inference_choices() {
-        assert!(provider_entry("openrouter").is_ok());
-        assert!(provider_entry("definitely-not-a-provider").is_err());
+        assert_eq!(validate_provider(" commandcode ").unwrap(), "commandcode");
+        assert!(validate_provider("provider; rm -rf /").is_err());
         assert_eq!(validate_model(" anthropic/claude-opus-5 ").unwrap(), "anthropic/claude-opus-5");
         assert!(validate_model("model; rm -rf /").is_err());
         assert!(validate_effort("medium").is_ok());
@@ -963,7 +1030,11 @@ pub fn run() {
         let state = app.state::<AppState>();
         *state.config.lock().expect("config state poisoned") = config.clone();
         *state.app_data.lock().expect("app data state poisoned") = Some(app_data);
-        if config.auto_start { let _ = start_wallis_impl(&state); }
+        // Off the main thread: starting the bot walks WSL, and the window should paint first.
+        if config.auto_start {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || { let _ = start_wallis_impl(&handle.state::<AppState>()); });
+        }
         Ok(())
     }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_wallis, stop_wallis, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, generate_wallis, get_stage, get_progress, get_voice_options]).run(tauri::generate_context!()).expect("error while running Wallis");
 }

@@ -6,12 +6,18 @@ const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("Wallis mount is missing");
 
 let setup: SetupStatus = { wsl2Available: false, wslVersion: "unknown", message: "Checking WSL2…" };
-let runtime: RuntimeStatus = { state: "unavailable", message: "Checking runtime…", discordReady: false, memoryReady: false };
 let secret: SecretStatus = { hasToken: false };
 let providers: ProviderOption[] = [];
 
 app.innerHTML = `
-  <header><div><p class="eyebrow">LOCAL-FIRST DISCORD BOT</p><h1>Wallis</h1><p>One calm place to set up, inspect, and control your local agent.</p></div><p id="state-pill" class="pill">Checking…</p></header>
+  <header><h1>Wallis</h1><p id="state-pill" class="pill">Checking…</p></header>
+
+  <div id="view-boot">
+    <section class="centered loading" aria-live="polite"><h2>Starting Wallis</h2>
+      <progress id="boot-progress" max="6" value="0"></progress>
+      <p class="hint" id="boot-step">Checking WSL2…</p>
+    </section>
+  </div>
 
   <div id="view-setup" hidden>
     <ol class="steps"><li class="now">Import distro</li><li>Choose a model</li><li>Generate Wallis</li></ol>
@@ -19,27 +25,19 @@ app.innerHTML = `
       <label for="rootfs-archive">Wallis rootfs archive</label><input id="rootfs-archive" name="rootfsArchive" placeholder="C:\\Downloads\\wallis-rootfs.tar" autocomplete="off" required />
       <label for="rootfs-sha256">Expected SHA-256</label><input id="rootfs-sha256" name="rootfsSha256" placeholder="64 hexadecimal characters" autocomplete="off" required />
       <label for="distro-root">Distro install root <span>(optional)</span></label><input id="distro-root" name="distroRoot" placeholder="Default: %LOCALAPPDATA%\\Wallis\\distro" autocomplete="off" />
-      <button type="submit">Import verified Wallis distro</button><button id="setup-reset" type="button" class="secondary" hidden>Reset Wallis</button><p id="install-message" role="status" aria-live="polite"></p>
+      <button type="submit">Import distro</button><button id="setup-reset" type="button" class="secondary" hidden>Reset Wallis</button><p id="install-message" role="status" aria-live="polite"></p>
     </form></section>
   </div>
 
   <div id="view-inference" hidden>
     <ol class="steps"><li class="done" data-view="setup">Import distro</li><li class="now">Choose a model</li><li>Generate Wallis</li></ol>
-    <section aria-labelledby="inference-title"><h2 id="inference-title">How Wallis thinks</h2><p>Pick the inference Wallis runs on. You can change it later.</p><form id="inference-form">
-      <label for="provider">Provider</label><select id="provider" name="provider"></select>
-      <label for="model">Model</label><input id="model" name="model" list="model-options" autocomplete="off" placeholder="anthropic/claude-opus-5" required /><datalist id="model-options"></datalist>
-      <label for="effort">Reasoning effort</label><select id="effort" name="reasoningEffort"></select><p class="hint" id="effort-hint"></p>
-      <label for="api-key">Provider API key</label><input id="api-key" name="apiKey" type="password" autocomplete="new-password" placeholder="Stored with Windows DPAPI" />
-      <p class="hint">The key never leaves this machine and is handed to Hermes over stdin, never written to a file in the distro.</p>
-      <button type="submit">Continue</button><p id="inference-message" role="status" aria-live="polite"></p>
-    </form></section>
+    <div id="inference-host"></div>
   </div>
 
   <div id="view-generate" hidden>
     <ol class="steps"><li class="done" data-view="setup">Import distro</li><li class="done" data-view="inference">Choose a model</li><li class="now">Generate Wallis</li></ol>
-    <section class="centered" aria-labelledby="generate-title"><h2 id="generate-title">Meet Wallis</h2>
-      <p>Wallis invents himself once: a name, a home, a life, a set of opinions — then commits it all to his own memory.</p>
-      <p class="hint">This first run also installs his voice: about 400 MB of local speech models and the Discord bot, downloaded into the distro.</p>
+    <section class="centered" aria-labelledby="generate-title"><h2 id="generate-title">Generate Wallis</h2>
+      <p>Wallis writes his own profile, then downloads his voice models and Discord bot — about 400 MB into the distro.</p>
       <div class="actions"><button id="generate" type="button">Generate Wallis</button></div>
       <p id="generate-message" role="status" aria-live="polite"></p>
     </section>
@@ -47,39 +45,56 @@ app.innerHTML = `
 
   <div id="view-loading" hidden>
     <section class="centered loading" aria-live="polite"><div class="spinner" aria-hidden="true"></div>
-      <h2>Generating Wallis…</h2><p>This could take a while.</p><p class="hint" id="loading-step">Setting up memory, voice, and the Discord bot.</p>
+      <h2>Generating Wallis</h2><p class="hint" id="loading-step">Setting up memory, voice, and the Discord bot.</p>
     </section>
   </div>
 
   <div id="view-profile" hidden>
     <section id="profile-card" aria-labelledby="profile-title"><h2 id="profile-title">Profile</h2><div id="profile-body"></div>
-      <p class="hint">Wallis keeps this current himself, and anyone on the allow-list can pull it up in Discord with <code>/profile</code>.</p>
-      <div class="actions"><button id="profile-done" type="button">Continue to dashboard</button><button id="profile-refresh" type="button" class="secondary">Refresh</button></div>
+      <div class="actions"><button id="profile-done" type="button">Continue</button><button id="profile-refresh" type="button" class="secondary">Refresh</button></div>
     </section>
   </div>
 
   <div id="view-dashboard" hidden>
-    <nav class="tabs"><button id="change-model" type="button" class="secondary">Change model</button><button id="open-profile" type="button" class="secondary">View Wallis' profile</button></nav>
-    <section aria-labelledby="runtime-title"><h2 id="runtime-title">Runtime</h2><p id="runtime-message" role="status">${runtime.message}</p><p class="hint">Wallis runs his own Discord bot in the distro: <code>/join</code> brings him into a voice channel, where he listens, thinks with Hermes, and answers out loud.</p><div id="readiness" class="pills"></div><div class="actions"><button id="start" type="button">Start Wallis</button><button id="stop" type="button" class="secondary">Stop Wallis</button><button id="reset" type="button" class="secondary">Reset Wallis</button></div></section>
-    <section aria-labelledby="terminal-title"><h2 id="terminal-title">Terminal</h2><p class="hint">Runs one command at a time inside the Wallis distro as the non-root <code>wallis</code> user.</p>
-      <pre id="terminal-output" role="log" aria-live="polite" tabindex="0">Ready.</pre>
-      <form id="terminal-form" class="prompt"><span aria-hidden="true">$</span><input id="terminal-command" name="command" placeholder="hermes --help" autocomplete="off" spellcheck="false" required aria-label="Command to run in the Wallis distro" /><button type="submit">Run</button><button id="open-terminal" type="button" class="secondary">Open shell window</button></form></section>
-    <section aria-labelledby="voice-title"><h2 id="voice-title">Voice</h2><p class="hint">Speech runs locally in the distro. Bigger models hear better; smaller ones answer sooner.</p><form id="voice-form">
-      <label for="stt-model">Speech recognition model</label><select id="stt-model" name="sttModel"></select>
-      <label for="stt-threads">Speech recognition threads</label><input id="stt-threads" name="sttThreads" type="number" min="1" max="64" step="1" /><p class="hint">CPU threads whisper.cpp may use. More threads transcribe faster until you run out of cores.</p>
-      <label for="tts-voice">Voice quality</label><select id="tts-voice" name="ttsVoice"></select>
-      <label for="tts-speed">Speaking speed</label><input id="tts-speed" name="ttsSpeed" type="number" min="0.5" max="2" step="0.05" /><p class="hint">Piper length scale: below 1 is faster and clipped, above 1 is slower and more deliberate.</p>
-      <label for="silence-ms">Silence before Wallis answers (ms)</label><input id="silence-ms" name="silenceMs" type="number" min="100" max="2000" step="50" /><p class="hint">How long you have to stop talking before he takes his turn.</p>
-      <button type="submit">Save voice settings</button><p id="voice-message" role="status" aria-live="polite"></p>
-    </form></section>
-    <section aria-labelledby="config-title"><h2 id="config-title">Configuration</h2><form id="config-form">
-      <label for="application-id">Discord application ID <span>(optional until bot setup)</span></label><input id="application-id" name="discordApplicationId" inputmode="numeric" autocomplete="off" />
-      <label for="allowed-users">Allowed Discord user IDs</label><input id="allowed-users" name="discordAllowedUsers" inputmode="numeric" placeholder="123456789012345678,198765432109876543" autocomplete="off" required /><p class="hint">Only these users can interact with Wallis. Use numeric Discord user IDs separated by commas.</p>
-      <label for="discord-token">Discord bot token</label><input id="discord-token" name="discordToken" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved token" /><p id="token-status" class="hint" role="status"></p>
-      <label class="check"><input id="auto-start" name="autoStart" type="checkbox" /> Start Hermes when Wallis opens</label>
-      <p id="inference-summary" class="hint"></p><p class="hint">Memory provider: <strong>Mnemosyne</strong>. Bot tokens are protected with Windows DPAPI and never returned to the UI.</p>
-      <button type="submit">Save configuration</button><p id="config-message" role="status" aria-live="polite"></p>
-    </form></section>
+    <nav class="tabs" role="tablist">
+      <button id="tab-home" type="button" role="tab" aria-selected="true">Home</button>
+      <button id="tab-profile" type="button" role="tab" aria-selected="false">Profile</button>
+      <button id="tab-settings" type="button" role="tab" aria-selected="false">Settings</button>
+    </nav>
+
+    <div id="pane-home" role="tabpanel" aria-labelledby="tab-home">
+      <section aria-labelledby="runtime-title"><h2 id="runtime-title">Runtime</h2><p id="runtime-message" role="status"></p><div id="readiness" class="pills"></div><div class="actions"><button id="start" type="button">Start Wallis</button><button id="stop" type="button" class="secondary">Stop Wallis</button><button id="reset" type="button" class="secondary">Reset Wallis</button></div></section>
+      <section aria-labelledby="terminal-title"><h2 id="terminal-title">Terminal</h2>
+        <pre id="terminal-output" role="log" aria-live="polite" tabindex="0">Ready.</pre>
+        <form id="terminal-form" class="prompt"><span aria-hidden="true">$</span><input id="terminal-command" name="command" placeholder="hermes --help" autocomplete="off" spellcheck="false" required aria-label="Command to run in the Wallis distro" /><button type="submit">Run</button><button id="open-terminal" type="button" class="secondary">Open shell window</button></form></section>
+    </div>
+
+    <div id="pane-profile" role="tabpanel" aria-labelledby="tab-profile" hidden><div id="profile-host"></div></div>
+
+    <div id="pane-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <div id="inference-home"><section aria-labelledby="inference-title"><h2 id="inference-title">AI model</h2><form id="inference-form">
+        <label for="provider">Provider</label><div class="input-action"><select id="provider" name="provider"></select><button id="refresh-providers" type="button" class="secondary">Refresh</button></div>
+        <label for="model">Model</label><input id="model" name="model" list="model-options" autocomplete="off" placeholder="anthropic/claude-opus-5" required /><datalist id="model-options"></datalist>
+        <label for="effort">Reasoning effort</label><select id="effort" name="reasoningEffort"></select><p class="hint" id="effort-hint"></p>
+        <label for="api-key">Provider API key</label><input id="api-key" name="apiKey" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved key" />
+        <button type="submit">Save model</button><p id="inference-message" role="status" aria-live="polite"></p>
+      </form></section></div>
+      <section aria-labelledby="voice-title"><h2 id="voice-title">Voice</h2><form id="voice-form">
+        <label for="stt-model">Speech recognition model</label><select id="stt-model" name="sttModel"></select>
+        <label for="stt-threads">Speech recognition threads</label><input id="stt-threads" name="sttThreads" type="number" min="1" max="64" step="1" />
+        <label for="tts-voice">Voice quality</label><select id="tts-voice" name="ttsVoice"></select>
+        <label for="tts-speed">Speaking speed</label><input id="tts-speed" name="ttsSpeed" type="number" min="0.5" max="2" step="0.05" />
+        <label for="silence-ms">Silence before Wallis answers (ms)</label><input id="silence-ms" name="silenceMs" type="number" min="100" max="2000" step="50" />
+        <button type="submit">Save voice</button><p id="voice-message" role="status" aria-live="polite"></p>
+      </form></section>
+      <section aria-labelledby="config-title"><h2 id="config-title">Discord</h2><form id="config-form">
+        <label for="application-id">Application ID</label><input id="application-id" name="discordApplicationId" inputmode="numeric" autocomplete="off" />
+        <label for="allowed-users">Allowed user IDs</label><input id="allowed-users" name="discordAllowedUsers" inputmode="numeric" placeholder="123456789012345678,198765432109876543" autocomplete="off" required />
+        <label for="discord-token">Bot token</label><input id="discord-token" name="discordToken" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved token" /><p id="token-status" class="hint" role="status"></p>
+        <label class="check"><input id="auto-start" name="autoStart" type="checkbox" /> Start Wallis when the app opens</label>
+        <button type="submit">Save Discord settings</button><p id="config-message" role="status" aria-live="polite"></p>
+      </form></section>
+    </div>
   </div>`;
 
 const pick = <T extends HTMLElement>(id: string) => document.querySelector<T>(id)!;
@@ -90,7 +105,6 @@ const readiness = pick("#readiness");
 const statePill = pick("#state-pill");
 const configMessage = pick("#config-message");
 const tokenStatus = pick("#token-status");
-const inferenceSummary = pick("#inference-summary");
 const startButton = pick<HTMLButtonElement>("#start");
 const stopButton = pick<HTMLButtonElement>("#stop");
 const resetButton = pick<HTMLButtonElement>("#reset");
@@ -108,8 +122,11 @@ const terminalForm = pick<HTMLFormElement>("#terminal-form");
 const terminalCommand = pick<HTMLInputElement>("#terminal-command");
 const openTerminalButton = pick<HTMLButtonElement>("#open-terminal");
 const inferenceForm = pick<HTMLFormElement>("#inference-form");
+const inferenceSection = inferenceForm.closest("section")!;
+const inferenceSubmit = pick<HTMLButtonElement>('#inference-form button[type="submit"]');
 const inferenceMessage = pick("#inference-message");
 const providerSelect = pick<HTMLSelectElement>("#provider");
+const refreshProvidersButton = pick<HTMLButtonElement>("#refresh-providers");
 const modelInput = pick<HTMLInputElement>("#model");
 const modelOptions = pick("#model-options");
 const effortSelect = pick<HTMLSelectElement>("#effort");
@@ -126,17 +143,26 @@ const sttThreads = pick<HTMLInputElement>("#stt-threads");
 const ttsVoice = pick<HTMLSelectElement>("#tts-voice");
 const ttsSpeed = pick<HTMLInputElement>("#tts-speed");
 const silenceMs = pick<HTMLInputElement>("#silence-ms");
+const profileCard = pick("#profile-card");
+const profileDone = pick<HTMLButtonElement>("#profile-done");
+const bootProgress = pick<HTMLProgressElement>("#boot-progress");
+const bootStep = pick("#boot-step");
 
-const views = ["setup", "inference", "generate", "loading", "profile", "dashboard"] as const;
+const views = ["boot", "setup", "inference", "generate", "loading", "profile", "dashboard"] as const;
 type View = (typeof views)[number];
-
-/** Where the inference form returns to: onboarding continues to generation, a later edit goes back. */
-let afterInference: View = "generate";
 
 let progressTimer: ReturnType<typeof setInterval> | undefined;
 
+const tabs = ["home", "profile", "settings"] as const;
+type Tab = (typeof tabs)[number];
+
+/** The model form and the profile card exist once and move between the wizard and the tabs. */
 function showView(view: View) {
+  pick(view === "inference" ? "#inference-host" : "#inference-home").append(inferenceSection);
+  inferenceSubmit.textContent = view === "inference" ? "Continue" : "Save model";
+  if (view === "profile") { pick("#view-profile").append(profileCard); profileDone.hidden = false; }
   for (const name of views) pick(`#view-${name}`).hidden = name !== view;
+  if (view === "dashboard") showTab("home");
   clearInterval(progressTimer);
   if (view !== "loading") return;
   progressTimer = setInterval(async () => {
@@ -145,8 +171,18 @@ function showView(view: View) {
   }, 1500);
 }
 
+function showTab(tab: Tab) {
+  for (const name of tabs) {
+    pick(`#pane-${name}`).hidden = name !== tab;
+    pick(`#tab-${name}`).setAttribute("aria-selected", String(name === tab));
+  }
+  if (tab !== "profile") return;
+  pick("#profile-host").append(profileCard);
+  profileDone.hidden = true;
+  void loadProfile();
+}
+
 function showRuntime(next: RuntimeStatus) {
-  runtime = next;
   runtimeMessage.textContent = next.message;
   statePill.textContent = next.state === "running" ? "Running" : next.state === "stopped" ? "Stopped" : "Unavailable";
   statePill.className = `pill ${next.state === "running" ? "ok" : next.state === "unavailable" ? "bad" : ""}`;
@@ -171,7 +207,6 @@ function showConfig(next: WallisConfig) {
   ttsVoice.value = next.ttsVoice;
   ttsSpeed.value = String(next.ttsSpeed);
   silenceMs.value = String(next.silenceMs);
-  inferenceSummary.textContent = next.model ? `Thinking with ${next.model} on ${next.provider} at ${next.reasoningEffort} reasoning effort.` : "";
 }
 
 function showModels(keepChoice = false, preferred?: string) {
@@ -206,14 +241,9 @@ function showProfile(profile: Profile) {
     <dl>${field("Location", profile.location)}${field("Does", profile.occupation)}${field("Looking for", profile.lookingFor)}${field("Fun fact", profile.funFact)}</dl>`;
 }
 
-async function openProfile(next: View) {
-  try {
-    showProfile(await invoke("get_profile"));
-    showView("profile");
-  } catch (error) {
-    generateMessage.textContent = error instanceof Error ? error.message : String(error);
-    showView(next);
-  }
+async function loadProfile() {
+  try { showProfile(await invoke("get_profile")); }
+  catch (error) { profileBody.textContent = error instanceof Error ? error.message : String(error); }
 }
 
 function voiceOptions(select: HTMLSelectElement, options: VoiceOption[]) {
@@ -230,44 +260,66 @@ voiceForm.addEventListener("submit", async (event) => {
   } catch (error) { voiceMessage.textContent = error instanceof Error ? error.message : String(error); }
 });
 
+async function step<T>(label: string, work: Promise<T>): Promise<T> {
+  bootStep.textContent = label;
+  const result = await work;
+  bootProgress.value += 1;
+  return result;
+}
+
 async function load() {
+  showView("boot");
+  bootProgress.value = 0;
   try {
-    setup = await invoke("get_setup_status");
+    setup = await step("Checking WSL2…", invoke("get_setup_status"));
     setupMessage.textContent = setup.message;
-    secret = await invoke("get_secret_status");
+    secret = await step("Checking stored secrets…", invoke("get_secret_status"));
     tokenStatus.textContent = secret.hasToken ? "Discord token is stored securely." : "No Discord token is configured.";
-    showRuntime(await invoke("get_runtime_status"));
-    const [sttOptions, ttsOptions] = await invoke("get_voice_options");
+    showRuntime(await step("Checking the runtime…", invoke("get_runtime_status")));
+    const [sttOptions, ttsOptions] = await step("Loading voice options…", invoke("get_voice_options"));
     voiceOptions(sttModel, sttOptions);
     voiceOptions(ttsVoice, ttsOptions);
-    const stage = await invoke("get_stage");
-    if (stage === "inference") await loadProviders();
-    showConfig(await invoke("get_config"));
-    showView(stage === "ready" ? "dashboard" : stage);
+    const stage = await step("Working out where you left off…", invoke("get_stage"));
+    if (stage !== "setup") await step("Asking Hermes for providers and models…", loadProviders().catch(() => {}));
+    showConfig(await step("Loading your configuration…", invoke("get_config")));
+    showModels(true);
+    showView(stage === "ready" ? "dashboard" : (stage as View));
   } catch (error) {
     setupMessage.textContent = error instanceof Error ? error.message : "Tauri is not available.";
     showView("setup");
   }
 }
 
-async function loadProviders() {
-  providers = await invoke("get_providers");
+async function loadProviders(refresh = false) {
+  const [selectedProvider, selectedModel] = [providerSelect.value, modelInput.value];
+  providers = await invoke("get_providers", { refresh });
   providerSelect.innerHTML = providers.map((option) => `<option value="${safe(option.id)}">${safe(option.label)}</option>`).join("");
-  showModels();
+  if (providers.some((option) => option.id === selectedProvider)) providerSelect.value = selectedProvider;
+  showModels(true);
+  if (selectedModel) { modelInput.value = selectedModel; showEfforts(); }
 }
+
+refreshProvidersButton.addEventListener("click", async () => {
+  refreshProvidersButton.disabled = true;
+  inferenceMessage.textContent = "Refreshing providers and models from Hermes…";
+  try {
+    await loadProviders(true);
+    inferenceMessage.textContent = `Synced ${providers.length} providers from Hermes.`;
+  } catch (error) { inferenceMessage.textContent = error instanceof Error ? error.message : String(error); }
+  finally { refreshProvidersButton.disabled = false; }
+});
 
 providerSelect.addEventListener("change", () => showModels());
 modelInput.addEventListener("change", () => showEfforts());
 modelInput.addEventListener("input", () => showEfforts());
 
 /** A finished wizard step stays reachable: click it to go back and change that answer. */
-async function goToStep(view: View, back: View) {
+async function goToStep(view: View) {
   if (view === "setup") {
     pick<HTMLButtonElement>("#setup-reset").hidden = false;
     installMessage.textContent = "Wallis is already imported. Reset it first if you need a different rootfs archive.";
   }
   if (view === "inference") {
-    afterInference = back;
     const current = await invoke("get_config");
     await loadProviders();
     showConfig(current);
@@ -277,11 +329,9 @@ async function goToStep(view: View, back: View) {
 }
 
 app.addEventListener("click", (event) => {
-  const step = (event.target as HTMLElement).closest<HTMLElement>(".steps .done[data-view]");
-  if (step) void goToStep(step.dataset.view as View, "generate");
+  const crumb = (event.target as HTMLElement).closest<HTMLElement>(".steps .done[data-view]");
+  if (crumb) void goToStep(crumb.dataset.view as View);
 });
-
-pick("#change-model").addEventListener("click", () => void goToStep("inference", "dashboard"));
 
 inferenceForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -289,8 +339,8 @@ inferenceForm.addEventListener("submit", async (event) => {
   try {
     showConfig(await invoke("save_inference", { provider: providerSelect.value, model: modelInput.value, reasoningEffort: effortSelect.value, apiKey: apiKey.value }));
     apiKey.value = "";
-    inferenceMessage.textContent = "";
-    showView(afterInference);
+    inferenceMessage.textContent = "Saved.";
+    if (!pick("#view-inference").hidden) showView("generate");
   } catch (error) { inferenceMessage.textContent = error instanceof Error ? error.message : String(error); }
 });
 
@@ -305,9 +355,9 @@ generateButton.addEventListener("click", async () => {
   }
 });
 
-pick("#profile-done").addEventListener("click", async () => { showView("dashboard"); showRuntime(await invoke("get_runtime_status")); });
-pick("#profile-refresh").addEventListener("click", () => void openProfile("profile"));
-pick("#open-profile").addEventListener("click", () => void openProfile("dashboard"));
+profileDone.addEventListener("click", async () => { showView("dashboard"); showRuntime(await invoke("get_runtime_status")); });
+pick("#profile-refresh").addEventListener("click", () => void loadProfile());
+for (const tab of tabs) pick(`#tab-${tab}`).addEventListener("click", () => showTab(tab));
 
 startButton.addEventListener("click", async () => {
   try { showRuntime(await invoke("start_wallis")); } catch (error) { showRuntime({ state: "unavailable", message: String(error), discordReady: false, memoryReady: false }); }

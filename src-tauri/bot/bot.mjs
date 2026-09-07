@@ -4,12 +4,12 @@
 // the desktop app can embed this file verbatim and write it into the distro.
 //
 // Voice loop: Discord opus -> whisper.cpp -> Hermes -> Piper -> Discord. Every stage is a warm
-// long-lived process, and a reply is spoken sentence by sentence as the agent streams it, so
+// long-lived process, and a reply is spoken in natural chunks as the agent streams it, so
 // the first audio leaves before the last word is written.
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, unlink, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { tmpdir } from "node:os";
+import { Readable } from "node:stream";
 import { join } from "node:path";
 import {
   AudioPlayerStatus,
@@ -17,6 +17,7 @@ import {
   createAudioResource,
   EndBehaviorType,
   joinVoiceChannel,
+  StreamType,
 } from "@discordjs/voice";
 import { Client, EmbedBuilder, Events, GatewayIntentBits, MessageFlags, REST, Routes, SlashCommandBuilder } from "discord.js";
 import ffmpegPath from "ffmpeg-static";
@@ -33,8 +34,10 @@ const STT_THREADS = process.env.WALLIS_STT_THREADS ?? "4";
 const TTS_MODEL = join(HOME, "models", `en_US-ryan-${process.env.WALLIS_TTS_VOICE ?? "medium"}.onnx`);
 const TTS_SPEED = Number(process.env.WALLIS_TTS_SPEED ?? 1);
 const SILENCE_MS = Number(process.env.WALLIS_SILENCE_MS ?? 250);
+const PARTIAL_MS = 750;
 const STT_URL = "http://127.0.0.1:8085";
 const TTS_URL = "http://127.0.0.1:8086";
+const STATUS_FILE = join(HOME, "bot-status.json");
 const GREETING = "Sup boys";
 /** Wallis only speaks when spoken to, the way V1 did — his name is the trigger. */
 const NAME = /\bwall(?:is|ace|y|ie)\b/i;
@@ -43,12 +46,27 @@ const VOICE_BRIEF = "You are in a Discord voice call with friends. Answer out lo
 
 process.env.FFMPEG_PATH = ffmpegPath;
 
+const diagnostics = { lastError: null, lastLatency: null };
 const log = (...parts) => console.log("[wallis]", ...parts);
+const saveDiagnostics = () => { try { writeFileSync(STATUS_FILE, JSON.stringify(diagnostics)); } catch {} };
+function diagnose(kind, value) {
+  diagnostics[kind] = { at: new Date().toISOString(), ...value };
+  saveDiagnostics();
+}
+function recovered(where) {
+  if (diagnostics.lastError?.where === where) { diagnostics.lastError = null; saveDiagnostics(); }
+}
+const failed = (where, error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  log(`${where}:`, message);
+  diagnose("lastError", { where, message });
+};
+saveDiagnostics();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let connection = null;
 let listening = null;
 const player = createAudioPlayer();
-player.on("error", (error) => log("player error:", error.message));
+player.on("error", (error) => failed("player", error));
 
 /** Waits for a local service to answer, so we never fire a request into a half-started server. */
 async function waitFor(url, what) {
@@ -62,21 +80,63 @@ async function waitFor(url, what) {
 
 let whisper = null;
 let piper = null;
+let speechStarting = null;
+
+const PIPER_SERVER = String.raw`
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from piper import PiperVoice, SynthesisConfig
+
+voice = PiperVoice.load(sys.argv[1])
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def do_POST(self):
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            audio = voice.synthesize(body["text"], SynthesisConfig(length_scale=body.get("length_scale")))
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/L16;rate=22050;channels=1")
+            self.end_headers()
+            for chunk in audio:
+                self.wfile.write(chunk.audio_int16_bytes)
+                self.wfile.flush()
+        except Exception as error:
+            print(error, file=sys.stderr, flush=True)
+
+    def log_message(self, *_):
+        pass
+
+HTTPServer(("127.0.0.1", int(sys.argv[2])), Handler).serve_forever()
+`;
 
 async function startSpeech() {
-  if (!whisper) {
-    whisper = spawn(join(HOME, "whisper", "whisper-server"), ["-m", STT_MODEL, "--port", "8085", "-t", STT_THREADS], { stdio: "ignore" });
-    whisper.on("exit", (code) => { log("whisper-server exited", code); whisper = null; });
-    await waitFor(`${STT_URL}/`, "whisper-server");
-    log("speech recognition ready");
-  }
-  if (!piper) {
-    // Piper's own HTTP server keeps the voice model loaded: ~0.4s a sentence instead of ~5s.
-    piper = spawn(join(HOME, "piper", "bin", "python"), ["-m", "piper.http_server", "-m", TTS_MODEL, "--host", "127.0.0.1", "--port", "8086"], { stdio: "ignore" });
-    piper.on("exit", (code) => { log("piper exited", code); piper = null; });
-    await waitFor(`${TTS_URL}/`, "piper");
-    log("voice ready");
-  }
+  speechStarting ??= (async () => {
+    if (!whisper) {
+      const child = spawn(join(HOME, "whisper", "whisper-server"), ["-m", STT_MODEL, "--port", "8085", "-t", STT_THREADS], { stdio: ["ignore", "ignore", "pipe"] });
+      whisper = child;
+      child.stderr.resume();
+      child.on("exit", (code) => { if (whisper === child) { whisper = null; diagnose("lastError", { where: "whisper-server", message: `exited ${code}` }); } });
+      await waitFor(`${STT_URL}/`, "whisper-server");
+      recovered("whisper-server");
+      log("speech recognition ready");
+    }
+    if (!piper) {
+      const child = spawn(join(HOME, "piper", "bin", "python"), ["-u", "-c", PIPER_SERVER, TTS_MODEL, "8086"], { stdio: ["ignore", "ignore", "pipe"] });
+      piper = child;
+      child.stderr.on("data", (data) => diagnose("lastError", { where: "piper", message: data.toString().trim().slice(-500) }));
+      child.on("exit", (code) => { if (piper === child) { piper = null; diagnose("lastError", { where: "piper", message: `exited ${code}` }); } });
+      await waitFor(`${TTS_URL}/`, "piper");
+      recovered("piper");
+      log("voice ready");
+    }
+  })();
+  try { await speechStarting; } finally { speechStarting = null; }
 }
 
 async function transcribe(wav) {
@@ -124,39 +184,78 @@ export function toWav(samples) {
 
 // ---------------------------------------------------------------- speaking
 
-/** One sentence at a time, in order: the queue is what lets us start talking early. */
+/** One spoken chunk at a time, in order: the queue is what lets us start talking early. */
 const speech = { queue: [], current: null };
+let synthesis = Promise.resolve();
 
 function playNext() {
   if (speech.current) return;
-  const file = speech.queue.shift();
-  if (!file) return;
-  speech.current = file;
-  player.play(createAudioResource(file));
+  const item = speech.queue.shift();
+  if (!item) return;
+  speech.current = item;
+  player.play(item.resource);
 }
 
 player.on(AudioPlayerStatus.Idle, () => {
-  const finished = speech.current;
   speech.current = null;
-  if (finished) unlink(finished, () => {});
   playNext();
 });
 
-async function say(text) {
-  const spoken = text.trim();
-  if (!spoken) return;
+player.on(AudioPlayerStatus.Playing, () => {
+  const timing = speech.current?.timing;
+  if (!timing || timing.playingAt) return;
+  timing.playingAt = performance.now();
+  diagnostics.lastError = null;
+  diagnose("lastLatency", {
+    stopToTranscriptMs: Math.round(timing.transcribedAt - timing.stoppedAt),
+    transcriptToFirstTextMs: Math.round(timing.firstTextAt - timing.transcribedAt),
+    firstTextToAudioMs: Math.round(timing.playingAt - timing.firstTextAt),
+    totalMs: Math.round(timing.playingAt - timing.stoppedAt),
+  });
+});
+
+async function synthesize(text, timing) {
+  await startSpeech();
+  let response;
   try {
-    const response = await fetch(`${TTS_URL}/synthesize`, {
+    response = await fetch(`${TTS_URL}/synthesize`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: spoken, length_scale: TTS_SPEED }),
+      body: JSON.stringify({ text, length_scale: TTS_SPEED }),
     });
-    if (!response.ok) return log("piper refused:", response.status);
-    const file = join(tmpdir(), `wallis-${Date.now()}-${speech.queue.length}.wav`);
-    writeFileSync(file, Buffer.from(await response.arrayBuffer()));
-    speech.queue.push(file);
-    playNext();
-  } catch (error) { log("synthesis failed:", error.message); }
+  } catch (error) {
+    const child = piper;
+    piper = null;
+    child?.kill();
+    throw error;
+  }
+  if (!response.ok || !response.body) {
+    const child = piper;
+    piper = null;
+    child?.kill();
+    throw new Error(`piper refused: ${response.status}`);
+  }
+
+  const encoder = spawn(ffmpegPath, [
+    "-loglevel", "error", "-f", "s16le", "-ar", "22050", "-ac", "1", "-i", "pipe:0",
+    "-ar", "48000", "-ac", "2", "-c:a", "libopus", "-f", "ogg", "pipe:1",
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+  encoder.stderr.on("data", (data) => diagnose("lastError", { where: "ffmpeg", message: data.toString().trim().slice(-500) }));
+  encoder.on("error", (error) => failed("ffmpeg", error));
+
+  speech.queue.push({ resource: createAudioResource(encoder.stdout, { inputType: StreamType.OggOpus }), timing });
+  playNext();
+  const audio = Readable.fromWeb(response.body);
+  audio.on("error", (error) => { encoder.stdin.destroy(); failed("piper stream", error); });
+  encoder.stdin.on("error", (error) => failed("ffmpeg input", error));
+  audio.pipe(encoder.stdin);
+}
+
+function say(text, timing = null) {
+  const spoken = text.trim();
+  if (!spoken) return Promise.resolve();
+  synthesis = synthesis.then(() => synthesize(spoken, timing)).catch((error) => failed("synthesis failed", error));
+  return synthesis;
 }
 
 /** Strip anything that would be read aloud as punctuation soup. Applied to a finished sentence,
@@ -165,16 +264,36 @@ export function speakable(text) {
   return text.replace(/```[\s\S]*?```/g, " ").replace(/[*_`#>]/g, "").replace(/\s+/g, " ").trim();
 }
 
-/** Pull off complete sentences, leaving any half-written tail in the buffer. */
-export function takeSentences(buffer) {
+/** Pull off complete sentences, or one substantial first clause, leaving the tail buffered. */
+export function takeSentences(buffer, allowClause = false) {
   const sentences = [];
   const boundary = /[.!?…]["')\]]*\s+/g;
   let start = 0;
+  if (allowClause) {
+    const clause = /[,;:—–]\s+/.exec(buffer);
+    const sentence = boundary.exec(buffer);
+    boundary.lastIndex = 0;
+    if (clause && (!sentence || clause.index < sentence.index) && buffer.slice(0, clause.index).trim().split(/\s+/).length >= 6) {
+      sentences.push(buffer.slice(0, clause.index + clause[0].trim().length).trim());
+      start = clause.index + clause[0].length;
+      boundary.lastIndex = start;
+    }
+  }
   for (let match = boundary.exec(buffer); match; match = boundary.exec(buffer)) {
     sentences.push(buffer.slice(start, match.index + match[0].trim().length).trim());
     start = boundary.lastIndex;
   }
   return { sentences, rest: buffer.slice(start) };
+}
+
+/** Joins a rolling transcript to the final overlapping tail without repeating words. */
+export function mergeTranscript(prefix, suffix) {
+  const left = prefix.trim().split(/\s+/).filter(Boolean);
+  const right = suffix.trim().split(/\s+/).filter(Boolean);
+  const word = (value) => value.toLowerCase().replace(/[^a-z0-9']/g, "");
+  let overlap = Math.min(left.length, right.length);
+  while (overlap && !left.slice(-overlap).every((value, index) => word(value) === word(right[index]))) overlap -= 1;
+  return [...left, ...right.slice(overlap)].join(" ").trim();
 }
 
 // ---------------------------------------------------------------- the agent
@@ -254,13 +373,14 @@ class Agent {
   async ask(text, onSentence) {
     await this.ready();
     let buffer = "";
+    let first = true;
     this.onChunk = (chunk) => {
       buffer += chunk;
-      const { sentences, rest } = takeSentences(buffer);
+      const { sentences, rest } = takeSentences(buffer, first);
       buffer = rest;
       for (const sentence of sentences) {
         const spoken = speakable(sentence);
-        if (spoken) onSentence(spoken);
+        if (spoken) { first = false; onSentence(spoken); }
       }
     };
     try {
@@ -275,12 +395,17 @@ class Agent {
 
 const agent = new Agent();
 
-async function respond(speaker, said) {
+async function respond(speaker, said, timing) {
   if (!NAME.test(said)) return;
   const prompt = `${VOICE_BRIEF}\n\n${speaker} just said out loud: ${said}`;
   try {
-    await agent.ask(prompt, (sentence) => { log("wallis:", sentence); void say(sentence); });
-  } catch (error) { log("agent failed:", error.message); }
+    await agent.ask(prompt, (sentence) => {
+      log("wallis:", sentence);
+      const first = !timing.firstTextAt;
+      timing.firstTextAt ??= performance.now();
+      void say(sentence, first ? timing : null);
+    });
+  } catch (error) { failed("agent failed", error); }
 }
 
 // ---------------------------------------------------------------- voice capture
@@ -295,25 +420,47 @@ function listen(receiver, guild) {
     const stream = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_MS } });
     const decoder = new opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
     const chunks = [];
+    // ponytail: rolling batch snapshots reuse today's Whisper server; use native streaming STT
+    // only if concurrent speakers or long utterances make repeated snapshots measurably expensive.
+    const rolling = { text: "", samples: 0, pending: null };
+    const transcribePartial = () => {
+      if (rolling.pending || chunks.length === 0) return;
+      const samples = downsample(Buffer.concat(chunks));
+      if (samples.length < 16000) return;
+      rolling.pending = transcribe(toWav(samples)).then((text) => {
+        if (text) { rolling.text = text; rolling.samples = samples.length; }
+      }).catch((error) => failed("partial transcription", error)).finally(() => { rolling.pending = null; });
+    };
+    const partialTimer = setInterval(transcribePartial, PARTIAL_MS);
     decoder.on("error", () => {});
     decoder.on("data", (pcm) => chunks.push(pcm));
     stream.on("data", (chunk) => { if (chunk.length >= 50 && !decoder.destroyed) decoder.write(chunk); });
     stream.on("error", (error) => log("voice stream error:", error.message));
     stream.on("end", async () => {
+      const stoppedAt = performance.now();
+      clearInterval(partialTimer);
       active.delete(userId);
-      decoder.end();
+      await new Promise((resolve) => { decoder.once("end", resolve); decoder.end(); });
       if (chunks.length === 0) return;
       try {
+        await rolling.pending;
         const samples = downsample(Buffer.concat(chunks));
         let peak = 0;
         for (const sample of samples) peak = Math.max(peak, Math.abs(sample));
         if (peak < MIN_AMPLITUDE) return;
-        const said = await transcribe(toWav(samples));
+        let said;
+        if (rolling.text) {
+          const overlapStart = Math.max(0, rolling.samples - 16000);
+          said = mergeTranscript(rolling.text, await transcribe(toWav(samples.subarray(overlapStart))));
+        } else {
+          said = await transcribe(toWav(samples));
+        }
         if (!said) return;
+        const timing = { stoppedAt, transcribedAt: performance.now(), firstTextAt: null, playingAt: null };
         const speaker = guild.members.cache.get(userId)?.displayName ?? userId;
         log(`${speaker}: ${said}`);
-        await respond(speaker, said);
-      } catch (error) { log("capture failed:", error.message); }
+        await respond(speaker, said, timing);
+      } catch (error) { failed("capture failed", error); }
     });
   });
 }

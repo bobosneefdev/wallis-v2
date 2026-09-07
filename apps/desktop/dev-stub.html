@@ -1,0 +1,20 @@
+<!doctype html>
+<html><head><meta charset="utf-8" /><title>stub</title></head>
+<body><main id="app"></main>
+<script>
+const profile = { name: "Wallis Okonkwo", age: "31", pronouns: "he/him", location: "Lisbon, Portugal", occupation: "Sound engineer", tagline: "Records rain for a living", bio: "Short bio.", interests: ["field recording", "chess"], lookingFor: "Odd conversations", funFact: "Owns 40 microphones" };
+const config = { discordApplicationId: "1", discordAllowedUsers: "123456789012345678", memoryProvider: "mnemosyne", autoStart: false, rootfsArchive: "C:\\x.tar", rootfsSha256: "a".repeat(64), distroRoot: "", provider: "openrouter", model: "anthropic/claude-opus-5", reasoningEffort: "medium", onboarded: true, sttModel: "base.en", sttThreads: 4, ttsVoice: "medium", ttsSpeed: 1, silenceMs: 250 };
+const replies = {
+  get_setup_status: { wsl2Available: true, wslVersion: "2.3.24", message: "WSL2 is available." },
+  get_runtime_status: { state: "running", message: "Wallis is online.", discordReady: true, memoryReady: true },
+  get_secret_status: { hasToken: true },
+  get_voice_options: [[{ id: "base.en", label: "Base", megabytes: 142 }], [{ id: "medium", label: "Medium", megabytes: 63 }]],
+  get_stage: new URLSearchParams(location.search).get("stage") || "ready",
+  get_config: config, save_config: config, save_inference: config,
+  get_providers: [{ id: "openrouter", label: "OpenRouter", models: [{ id: "anthropic/claude-opus-5", efforts: ["none", "medium", "high"] }] }],
+  get_profile: profile, generate_wallis: profile, get_progress: "",
+};
+window.__TAURI__ = { core: { invoke: (command) => new Promise((resolve) => setTimeout(() => resolve(replies[command] ?? null), 150)) } };
+</script>
+<script type="module" src="/src/main.ts"></script>
+</body></html>
