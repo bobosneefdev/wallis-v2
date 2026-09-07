@@ -1,0 +1,19 @@
+:root { color: #e9ecf2; background: #12151a; font: 16px/1.5 system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 760px; margin: 0 auto; padding: 48px 24px 64px; }
+header { margin-bottom: 32px; }
+h1 { margin: 0; font-size: 3rem; letter-spacing: -.06em; }
+h2 { margin: 0 0 8px; font-size: 1.15rem; }
+p { color: #aeb8c6; }
+section { padding: 24px 0; border-top: 1px solid #2a313d; }
+.eyebrow, .hint, label span { color: #7f8da1; font-size: .78rem; letter-spacing: .08em; }
+.eyebrow { margin: 0 0 4px; color: #92d3b4; font-weight: 700; }
+label { display: block; margin: 18px 0 6px; font-weight: 600; }
+input { width: 100%; padding: 10px 12px; color: inherit; background: #1b2028; border: 1px solid #3b4655; border-radius: 6px; font: inherit; }
+.check { display: flex; gap: 10px; align-items: center; font-weight: 400; }
+.check input { width: auto; }
+button { padding: 10px 16px; color: #102019; background: #92d3b4; border: 0; border-radius: 6px; cursor: pointer; font: inherit; font-weight: 700; }
+button:disabled { cursor: not-allowed; opacity: .45; }
+button.secondary { color: #e9ecf2; background: #2b3440; }
+.actions { display: flex; gap: 10px; margin-top: 16px; }
