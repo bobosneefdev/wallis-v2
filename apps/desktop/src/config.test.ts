@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { validateConfig } from "./config";
 
-const base = { discordApplicationId: "", personaName: "Wallis", memoryProvider: "mnemosyne" as const, autoStart: false };
+const base = { discordApplicationId: "", personaName: "Wallis", memoryProvider: "mnemosyne" as const, autoStart: false, rootfsArchive: "", rootfsSha256: "", distroRoot: "" };
 
 describe("validateConfig", () => {
   test("requires a Wallis persona and valid Discord ID", () => {

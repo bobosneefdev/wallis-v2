@@ -1,5 +1,6 @@
 export type SetupStatus = {
   wsl2Available: boolean;
+  wslVersion: string;
   message: string;
 };
 
@@ -13,6 +14,9 @@ export type WallisConfig = {
   personaName: string;
   memoryProvider: "mnemosyne";
   autoStart: boolean;
+  rootfsArchive: string;
+  rootfsSha256: string;
+  distroRoot: string;
 };
 
 type Commands = {
@@ -20,6 +24,8 @@ type Commands = {
   get_runtime_status: RuntimeStatus;
   start_hermes: RuntimeStatus;
   stop_hermes: RuntimeStatus;
+  reset_wallis: RuntimeStatus;
+  import_wallis: RuntimeStatus;
   get_config: WallisConfig;
   save_config: WallisConfig;
 };
@@ -35,6 +41,9 @@ const fallback: WallisConfig = {
   personaName: "Wallis",
   memoryProvider: "mnemosyne",
   autoStart: false,
+  rootfsArchive: "",
+  rootfsSha256: "",
+  distroRoot: "",
 };
 
 export function invoke<K extends keyof Commands>(command: K, args?: unknown): Promise<Commands[K]> {
