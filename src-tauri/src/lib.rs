@@ -13,20 +13,40 @@ const CONFIG_FILE: &str = "config.json";
 const TOKEN_FILE: &str = "discord-token.dpapi";
 const KEY_FILE: &str = "provider-key.dpapi";
 const PROFILE_PATH: &str = "/home/wallis/.hermes/wallis-profile.json";
-const SKILL_PATH: &str = "/home/wallis/.hermes/skills/wallis/profile/SKILL.md";
 const HERMES_BIN: &str = "/home/wallis/.local/bin/hermes";
+const WALLIS_HOME: &str = "/home/wallis/.wallis";
+const NODE_BIN: &str = "/home/wallis/.wallis/node/bin/node";
+const BOT_JS: &str = "/home/wallis/.wallis/bot/bot.mjs";
+const BOT_PACKAGE: &str = "/home/wallis/.wallis/bot/package.json";
+/// The Discord bot is installed into the distro, so it ships inside this binary.
+const BOT_SOURCE: &str = include_str!("../bot/bot.mjs");
+const BOT_MANIFEST: &str = include_str!("../bot/package.json");
 const RELEASE_PATH: &str = "/etc/wallis-rootfs-release";
 const CATALOG_URL: &str = "https://hermes-agent.nousresearch.com/docs/api/model-catalog.json";
 /// Providers Hermes publishes a curated model catalog for, with the credential each one reads.
 const PROVIDERS: [(&str, &str, &str); 2] = [("openrouter", "OpenRouter", "OPENROUTER_API_KEY"), ("nous-api", "Nous Portal", "NOUS_API_KEY")];
 const EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+// Pinned prerequisites the app installs into the distro. Every one is checksummed on arrival.
+const NODE_URL: &str = "https://nodejs.org/dist/v24.20.0/node-v24.20.0-linux-x64.tar.xz";
+const NODE_SHA256: &str = "2f2c0da162318f0de47665410c7c8c2ed3d36c8f3105de4bbc61176c70a7cbf2";
+const WHISPER_URL: &str = "https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-ubuntu-x64.tar.gz";
+const WHISPER_SHA256: &str = "f4cfc1f969a13805908fb72043ce7cc896eb42e0b8afbe841dc8e7298923b061";
+const PIPER_VERSION: &str = "1.8.0";
+/// The same two local models Wallis V1 used: whisper.cpp base.en for speech, Piper ryan-high for voice.
+const STT_MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+const STT_MODEL_SHA256: &str = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
+const VOICE_MODEL_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx";
+const VOICE_MODEL_SHA256: &str = "b3990d7606e183ec8dbfba70a4607074f162de1a0c412e0180d1ff60bb154eca";
 const WSL_CONF: &str = "[automount]\nenabled=false\n\n[interop]\nenabled=false\nappendWindowsPath=false\n\n[user]\ndefault=wallis\n";
 
-struct AppState { config: Mutex<WallisConfig>, app_data: Mutex<Option<PathBuf>>, memory_ready: Mutex<bool>, hermes: Mutex<Option<Child>> }
+struct AppState { config: Mutex<WallisConfig>, app_data: Mutex<Option<PathBuf>>, memory_ready: Mutex<bool>, bot: Mutex<Option<Child>>, progress: Mutex<String> }
+
+/// What the app is doing during a long setup step, polled by the loading screen.
+fn set_progress(state: &AppState, message: &str) { *state.progress.lock().expect("progress state poisoned") = message.to_string(); }
 
 impl Default for AppState {
-    fn default() -> Self { Self { config: Mutex::new(WallisConfig::default()), app_data: Mutex::new(None), memory_ready: Mutex::new(false), hermes: Mutex::new(None) } }
+    fn default() -> Self { Self { config: Mutex::new(WallisConfig::default()), app_data: Mutex::new(None), memory_ready: Mutex::new(false), bot: Mutex::new(None), progress: Mutex::new(String::new()) } }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -120,15 +140,8 @@ fn require_wsl2_version(version: &str) -> Result<(), String> {
     if version == "2" { Ok(()) } else { Err("The Wallis distro is WSL1, not WSL2. Use Reset Wallis and import it again with WSL2.".into()) }
 }
 
-fn gateway_running(output: &str) -> bool {
-    output.lines().any(|line| {
-        let mut args = line.split_whitespace();
-        args.next();
-        while let Some(arg) = args.next() {
-            if arg.rsplit('/').next() == Some("hermes") && args.next() == Some("gateway") { return true; }
-        }
-        false
-    })
+fn bot_running(output: &str) -> bool {
+    output.lines().any(|line| line.split_whitespace().any(|argument| argument == BOT_JS))
 }
 
 fn validate_sha256(value: &str) -> Result<String, String> {
@@ -252,14 +265,6 @@ fn soul_document(profile: &Profile) -> String {
     )
 }
 
-const PROFILE_SKILL: &str = concat!(
-    "---\nname: profile\ndescription: Show Wallis' own profile — the dating-profile-style card describing who Wallis is.\nversion: 1.0.0\nmetadata:\n  hermes:\n    tags: [wallis, identity]\n    category: wallis\n---\n\n",
-    "# Wallis' profile\n\n## When to Use\nWhenever someone asks who you are, asks for your profile, or runs `/profile`.\n\n",
-    "## Procedure\n1. Read `/home/wallis/.hermes/wallis-profile.json`.\n2. Reply with that data only — never invent fields, never show raw JSON.\n3. Format it as a clean Discord embed-style card:\n\n",
-    "```\n**{name}** · {age} · {pronouns}\n_{tagline}_\n\n**Location** — {location}\n**Does** — {occupation}\n**Into** — {interests, comma separated}\n**Looking for** — {lookingFor}\n**Fun fact** — {funFact}\n\n{bio}\n```\n\n",
-    "Skip any field that is empty rather than printing a blank line.\n\n## Pitfalls\n- The file is the source of truth; do not answer from memory if it disagrees.\n- The first name is always Wallis, even if the file says otherwise.\n",
-);
-
 /// Writes a file inside the distro as the wallis user, keeping content off the command line.
 #[cfg(target_os = "windows")]
 fn write_in_distro(path: &str, content: &str) -> Result<(), String> {
@@ -321,6 +326,63 @@ fn release_value(key: &str) -> Result<String, String> {
     let value = text.lines().find_map(|line| line.trim().strip_prefix(&prefix)).map(str::trim).unwrap_or_default();
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) { return Err(format!("The Wallis rootfs release file has no usable {key}.")); }
     Ok(value.to_string())
+}
+
+/// Runs a provisioning script inside the distro. The script arrives on stdin, which bash reads
+/// as its own program — the one stdin shape WSL interop does hand through intact.
+fn run_script(what: &str, script: &str) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::Write;
+        let mut child = Command::new("wsl.exe").args(["--distribution", DISTRO, "--user", USER, "--", "bash", "-s"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().map_err(|error| format!("Unable to {what}: {error}"))?;
+        child.stdin.take().ok_or("Unable to open the setup input.")?.write_all(script.as_bytes()).map_err(|error| format!("Unable to {what}: {error}"))?;
+        let output = child.wait_with_output().map_err(|error| format!("Unable to {what}: {error}"))?;
+        if !output.status.success() {
+            let reason = decode_wsl_output(&output.stderr);
+            return Err(format!("Wallis could not {what}: {}", reason.lines().filter(|line| !line.trim().is_empty()).next_back().unwrap_or("no output")));
+        }
+        Ok(decode_wsl_output(&output.stdout))
+    }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (what, script); Err("Wallis currently requires Windows with WSL2.".into()) }
+}
+
+/// Downloads a pinned artifact, checks it, and unpacks it — skipped entirely once it is there.
+fn fetch_script(marker: &str, url: &str, sha256: &str, unpack: &str) -> String {
+    format!(
+        "set -e\nW={WALLIS_HOME}\n[ -e \"{marker}\" ] && exit 0\nmkdir -p \"$W\" /tmp/wallis-setup\ncd /tmp/wallis-setup\ncurl -fsSL '{url}' -o artifact\necho '{sha256}  artifact' | sha256sum -c - >/dev/null\n{unpack}\nrm -f artifact\n"
+    )
+}
+
+fn voice_steps() -> [(&'static str, String); 4] {
+    [
+        ("Installing the bot runtime…", fetch_script(NODE_BIN, NODE_URL, NODE_SHA256, "rm -rf \"$W/node\"; mkdir -p \"$W/node\"; tar -xJf artifact -C \"$W/node\" --strip-components=1")),
+        ("Installing speech recognition…", fetch_script(&format!("{WALLIS_HOME}/whisper/whisper-server"), WHISPER_URL, WHISPER_SHA256, "rm -rf \"$W/whisper\"; mkdir -p \"$W/whisper\"; tar -xzf artifact -C \"$W/whisper\" --strip-components=1")),
+        ("Installing Wallis' voice…", format!("set -e\nW={WALLIS_HOME}\n[ -x \"$W/piper/bin/piper\" ] && exit 0\npython3 -m venv \"$W/piper\"\n\"$W/piper/bin/pip\" install --quiet --no-cache-dir 'piper-tts=={PIPER_VERSION}'\n")),
+        ("Downloading the local voice models…", format!(
+            "set -e\nW={WALLIS_HOME}\nmkdir -p \"$W/models\"\nget() {{\n  [ -f \"$3\" ] && return 0\n  curl -fsSL \"$1\" -o \"$3.part\"\n  [ -z \"$2\" ] || echo \"$2  $3.part\" | sha256sum -c - >/dev/null\n  mv \"$3.part\" \"$3\"\n}}\nget '{stt}' '{stt_sha}' \"$W/models/ggml-base.en.bin\"\nget '{tts}' '{tts_sha}' \"$W/models/en_US-ryan-high.onnx\"\nget '{tts}.json' '' \"$W/models/en_US-ryan-high.onnx.json\"\n",
+            stt = STT_MODEL_URL, stt_sha = STT_MODEL_SHA256, tts = VOICE_MODEL_URL, tts_sha = VOICE_MODEL_SHA256,
+        )),
+    ]
+}
+
+/// Installs everything the Discord bot needs inside the distro. Idempotent, and not user-facing
+/// beyond the progress line: the first run downloads roughly 400 MB and takes a few minutes.
+fn ensure_voice(state: &AppState) -> Result<(), String> {
+    for (label, script) in voice_steps() {
+        set_progress(state, label);
+        run_script("install the voice runtime", &script)?;
+    }
+    set_progress(state, "Installing the Discord bot…");
+    write_in_distro(BOT_PACKAGE, BOT_MANIFEST)?;
+    write_in_distro(BOT_JS, BOT_SOURCE)?;
+    run_script("install the Discord bot", &format!(
+        "set -e\nW={WALLIS_HOME}\ncd \"$W/bot\"\nexport PATH=\"$W/node/bin:$PATH\"\n[ -d node_modules/discord.js ] || npm install --no-audit --no-fund --silent\n"
+    ))?;
+    set_progress(state, "");
+    Ok(())
 }
 
 /// Installs and configures Mnemosyne only when it is not already live. Not user-facing.
@@ -458,7 +520,7 @@ fn prerequisites(state: &AppState) -> Result<(String, String), String> {
     let config = state.config.lock().expect("config state poisoned").clone();
     let allowed = validate_allowed_users(&config.discord_allowed_users)?;
     let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
-    if !token_path(&app_data).is_file() { return Err("No Discord token is configured. Save the bot token before starting Hermes.".into()); }
+    if !token_path(&app_data).is_file() { return Err("No Discord token is configured. Save the bot token before starting Wallis.".into()); }
     let token = unprotect_token(&token_path(&app_data))?;
     validate_secret(&token, "Discord token")?;
     Ok((token, allowed))
@@ -480,10 +542,10 @@ fn distro_info() -> Result<Option<String>, String> {
     Ok(parse_distros(&decode_wsl_output(&output.stdout)).into_iter().find(|(name, _)| name.eq_ignore_ascii_case(DISTRO)).map(|(_, version)| version))
 }
 
-fn inspect_hermes() -> Result<bool, String> {
+fn inspect_bot() -> Result<bool, String> {
     let output = wsl_output(&["--distribution", DISTRO, "--user", USER, "--", "ps", "-eo", "pid=,args="])?;
-    if !output.status.success() { return Err("WSL could not inspect the Hermes gateway. Confirm the non-root wallis user and ps are available.".into()); }
-    Ok(gateway_running(&decode_wsl_output(&output.stdout)))
+    if !output.status.success() { return Err("WSL could not inspect the Wallis bot. Confirm the non-root wallis user and ps are available.".into()); }
+    Ok(bot_running(&decode_wsl_output(&output.stdout)))
 }
 
 fn status(state: &str, message: impl Into<String>, discord_ready: bool, memory_ready: bool) -> RuntimeStatus { RuntimeStatus { state: state.into(), message: message.into(), discord_ready, memory_ready } }
@@ -499,13 +561,13 @@ fn get_runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
     if let Err(message) = check_wsl2() { return status("unavailable", message, false, false); }
     match distro_info() {
         Ok(None) => stopped("Wallis is not imported. Import a verified rootfs archive to continue.", false, false),
-        Ok(Some(version)) => match require_wsl2_version(&version).and_then(|_| inspect_hermes()) {
+        Ok(Some(version)) => match require_wsl2_version(&version).and_then(|_| inspect_bot()) {
             Ok(running) => {
                 let discord_ready = prerequisites(&state).is_ok();
                 let memory = memory_ready().unwrap_or_else(|_| *state.memory_ready.lock().expect("memory state poisoned"));
                 *state.memory_ready.lock().expect("memory state poisoned") = memory;
-                if running { status("running", "Hermes is running as the non-root wallis user.", discord_ready, memory) }
-                else { stopped("Wallis is imported; Hermes is stopped.", discord_ready, memory) }
+                if running { status("running", "Wallis is online as the non-root wallis user.", discord_ready, memory) }
+                else { stopped("Wallis is imported and set up; he is not running.", discord_ready, memory) }
             }
             Err(message) => status("unavailable", message, false, false),
         },
@@ -548,26 +610,30 @@ fn apply_wsl_conf() -> Result<(), String> {
     Ok(())
 }
 
-fn start_hermes_impl(state: &AppState) -> Result<RuntimeStatus, String> {
+/// Starts Wallis' own Discord bot inside the distro. Hermes stays headless: the bot calls it
+/// per utterance, so only one process ever holds the Discord token.
+fn start_wallis_impl(state: &AppState) -> Result<RuntimeStatus, String> {
     let (_, _) = check_wsl2()?;
     match distro_info()? { None => return Err("Wallis is not imported. Import a verified rootfs archive first.".into()), Some(version) => require_wsl2_version(&version)? }
-    if !state.config.lock().expect("config state poisoned").onboarded { return Err("Finish setting Wallis up before starting Hermes.".into()); }
+    if !state.config.lock().expect("config state poisoned").onboarded { return Err("Finish setting Wallis up before starting him.".into()); }
+    let application_id = state.config.lock().expect("config state poisoned").discord_application_id.clone();
     let (token, allowed) = prerequisites(state)?;
     let (key_var, key) = provider_key(state)?;
     apply_soul(&read_profile()?)?;
     ensure_memory()?;
+    ensure_voice(state)?;
     *state.memory_ready.lock().expect("memory state poisoned") = true;
-    if inspect_hermes()? { return Ok(status("running", "Hermes is already running as the non-root wallis user.", true, true)); }
+    if inspect_bot()? { return Ok(status("running", "Wallis is already running as the non-root wallis user.", true, true)); }
     #[cfg(target_os = "windows")]
     {
-        let mut child = wsl_with_secrets(&[("DISCORD_BOT_TOKEN", &token), ("DISCORD_ALLOWED_USERS", &allowed), (key_var, &key)])
-            .args([HERMES_BIN, "gateway"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().map_err(|error| format!("Unable to start Hermes as wallis: {error}"))?;
+        let mut child = wsl_with_secrets(&[("DISCORD_BOT_TOKEN", &token), ("DISCORD_ALLOWED_USERS", &allowed), ("DISCORD_APPLICATION_ID", &application_id), (key_var, &key)])
+            .args([NODE_BIN, BOT_JS]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().map_err(|error| format!("Unable to start the Wallis bot: {error}"))?;
         for _ in 0..30 {
-            if let Some(status) = child.try_wait().map_err(|error| format!("Unable to inspect the Hermes gateway startup: {error}"))? {
-                return Err(format!("Hermes gateway exited during startup ({status}). Check its configuration and credentials inside the Wallis distro."));
+            if let Some(status) = child.try_wait().map_err(|error| format!("Unable to inspect the Wallis bot startup: {error}"))? {
+                return Err(format!("The Wallis bot exited during startup ({status}). Check the Discord token and allow-list."));
             }
-            let running = match inspect_hermes() {
+            let running = match inspect_bot() {
                 Ok(running) => running,
                 Err(error) => {
                     let _ = child.kill();
@@ -576,27 +642,27 @@ fn start_hermes_impl(state: &AppState) -> Result<RuntimeStatus, String> {
                 }
             };
             if running {
-                *state.hermes.lock().expect("Hermes state poisoned") = Some(child);
-                return Ok(status("running", "Hermes gateway started as the non-root wallis user.", true, true));
+                *state.bot.lock().expect("bot state poisoned") = Some(child);
+                return Ok(status("running", "Wallis is online. Use /join in Discord to bring him into a voice channel.", true, true));
             }
             std::thread::sleep(Duration::from_millis(200));
         }
         let _ = child.kill();
         let _ = child.wait();
-        Err("Hermes gateway did not become active within 6 seconds. Check its configuration and credentials inside the Wallis distro.".into())
+        Err("The Wallis bot did not come up within 6 seconds. Check the Discord token and allow-list.".into())
     }
     #[cfg(not(target_os = "windows"))]
-    { let _ = state; Err("Wallis currently requires Windows with WSL2.".into()) }
+    { let _ = (state, application_id, token, allowed, key_var, key); Err("Wallis currently requires Windows with WSL2.".into()) }
 }
 
 #[tauri::command]
-fn stop_hermes(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
+fn stop_wallis(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
     #[cfg(target_os = "windows")]
     {
         let output = wsl_output(&["--terminate", DISTRO])?;
         if !output.status.success() { return Err("WSL could not stop the Wallis distribution.".into()); }
-        *state.hermes.lock().expect("Hermes state poisoned") = None;
-        return Ok(stopped("Hermes stopped with the Wallis distribution.", prerequisites(&state).is_ok(), *state.memory_ready.lock().expect("memory state poisoned")));
+        *state.bot.lock().expect("bot state poisoned") = None;
+        return Ok(stopped("Wallis stopped with his distribution.", prerequisites(&state).is_ok(), *state.memory_ready.lock().expect("memory state poisoned")));
     }
     #[cfg(not(target_os = "windows"))]
     { let _ = state; Err("Wallis currently requires Windows with WSL2.".into()) }
@@ -608,7 +674,7 @@ fn reset_wallis(state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
     {
         let output = wsl_output(&["--unregister", DISTRO])?;
         if !output.status.success() { return Err("WSL could not unregister Wallis. If it is not imported, no reset is needed.".into()); }
-        *state.hermes.lock().expect("Hermes state poisoned") = None;
+        *state.bot.lock().expect("bot state poisoned") = None;
         *state.memory_ready.lock().expect("memory state poisoned") = false;
         let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
         let mut config = state.config.lock().expect("config state poisoned").clone();
@@ -639,6 +705,9 @@ fn open_terminal() -> Result<(), String> {
 
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> WallisConfig { state.config.lock().expect("config state poisoned").clone() }
+
+#[tauri::command]
+fn get_progress(state: State<'_, AppState>) -> String { state.progress.lock().expect("progress state poisoned").clone() }
 
 #[tauri::command]
 fn get_providers() -> Vec<ProviderOption> { model_catalog() }
@@ -681,7 +750,10 @@ fn save_inference(provider: String, model: String, reasoning_effort: String, api
 #[tauri::command]
 async fn generate_wallis(state: State<'_, AppState>) -> Result<Profile, String> {
     let (key_var, key) = provider_key(&state)?;
+    set_progress(&state, "Setting up memory…");
     ensure_memory()?;
+    ensure_voice(&state)?;
+    set_progress(&state, "Generating Wallis…");
     let answer = hermes_oneshot(key_var, &key, &generation_prompt())?;
     let json = extract_json(&answer).ok_or_else(|| {
         let said = answer.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -691,7 +763,6 @@ async fn generate_wallis(state: State<'_, AppState>) -> Result<Profile, String> 
     let profile = sanitize_profile(serde_json::from_str(json).map_err(|error| format!("Hermes returned a profile Wallis could not read: {error}"))?);
     let stored = serde_json::to_string_pretty(&profile).map_err(|error| format!("Unable to serialize the profile: {error}"))?;
     write_in_distro(PROFILE_PATH, &stored)?;
-    write_in_distro(SKILL_PATH, PROFILE_SKILL)?;
     apply_soul(&profile)?;
     hermes_oneshot(key_var, &key, &format!("This is who you are. Commit every detail to your long-term memory as durable facts about yourself, then reply with the word done.\n\n{stored}"))?;
     let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
@@ -714,7 +785,7 @@ fn save_config(config: WallisConfig, state: State<'_, AppState>) -> Result<Walli
 }
 
 #[tauri::command]
-fn start_hermes(state: State<'_, AppState>) -> Result<RuntimeStatus, String> { start_hermes_impl(&state) }
+fn start_wallis(state: State<'_, AppState>) -> Result<RuntimeStatus, String> { start_wallis_impl(&state) }
 
 #[tauri::command]
 fn get_secret_status(state: State<'_, AppState>) -> Result<SecretStatus, String> {
@@ -755,9 +826,10 @@ mod tests {
         assert!(require_wsl2_version("2").is_ok());
     }
     #[test]
-    fn finds_only_the_hermes_gateway_process() {
-        assert!(gateway_running("  12 /usr/bin/python /home/wallis/.local/bin/hermes gateway\n  13 ps -eo pid=,args="));
-        assert!(!gateway_running("  12 /usr/bin/python /home/wallis/.local/bin/hermes\n  13 ps -eo pid=,args="));
+    fn finds_only_the_wallis_bot_process() {
+        assert!(bot_running("  12 /home/wallis/.wallis/node/bin/node /home/wallis/.wallis/bot/bot.mjs\n  13 ps -eo pid=,args="));
+        assert!(!bot_running("  12 /home/wallis/.wallis/node/bin/node /home/wallis/.wallis/bot/other.mjs\n  13 ps"));
+        assert!(!bot_running("  12 /usr/bin/python /home/wallis/.local/bin/hermes gateway"));
     }
     #[test]
     fn validates_allow_list_and_round_trips_non_secret_config() {
@@ -774,6 +846,15 @@ mod tests {
         assert!(validate_secret("token\nwith-newline", "Discord token").is_err());
         assert!(validate_secret("", "Discord token").is_err());
         assert!(validate_secret("token-value", "Discord token").is_ok());
+    }
+    #[test]
+    fn provisioning_skips_what_is_installed_and_checks_what_it_downloads() {
+        let steps = voice_steps();
+        let node = &steps[0].1;
+        assert!(node.contains(&format!("[ -e \"{NODE_BIN}\" ] && exit 0")), "node step must be idempotent");
+        assert!(node.contains(NODE_SHA256) && node.contains("sha256sum -c"), "downloads must be verified");
+        assert!(steps[3].1.contains(STT_MODEL_SHA256) && steps[3].1.contains(VOICE_MODEL_SHA256));
+        assert!(steps.iter().all(|(label, script)| !label.is_empty() && script.starts_with("set -e")));
     }
     #[test]
     fn locks_the_first_name_whatever_the_model_writes() {
@@ -809,7 +890,7 @@ pub fn run() {
         let state = app.state::<AppState>();
         *state.config.lock().expect("config state poisoned") = config.clone();
         *state.app_data.lock().expect("app data state poisoned") = Some(app_data);
-        if config.auto_start { let _ = start_hermes_impl(&state); }
+        if config.auto_start { let _ = start_wallis_impl(&state); }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_hermes, stop_hermes, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, generate_wallis, get_stage]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_wallis, stop_wallis, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, generate_wallis, get_stage, get_progress]).run(tauri::generate_context!()).expect("error while running Wallis");
 }

@@ -39,6 +39,7 @@ app.innerHTML = `
     <ol class="steps"><li class="done" data-view="setup">Import distro</li><li class="done" data-view="inference">Choose a model</li><li class="now">Generate Wallis</li></ol>
     <section class="centered" aria-labelledby="generate-title"><h2 id="generate-title">Meet Wallis</h2>
       <p>Wallis invents himself once: a name, a home, a life, a set of opinions — then commits it all to his own memory.</p>
+      <p class="hint">This first run also installs his voice: about 400 MB of local speech models and the Discord bot, downloaded into the distro.</p>
       <div class="actions"><button id="generate" type="button">Generate Wallis</button></div>
       <p id="generate-message" role="status" aria-live="polite"></p>
     </section>
@@ -46,20 +47,20 @@ app.innerHTML = `
 
   <div id="view-loading" hidden>
     <section class="centered loading" aria-live="polite"><div class="spinner" aria-hidden="true"></div>
-      <h2>Generating Wallis…</h2><p>This could take a while.</p><p class="hint" id="loading-step">Setting up memory and waking Hermes.</p>
+      <h2>Generating Wallis…</h2><p>This could take a while.</p><p class="hint" id="loading-step">Setting up memory, voice, and the Discord bot.</p>
     </section>
   </div>
 
   <div id="view-profile" hidden>
     <section id="profile-card" aria-labelledby="profile-title"><h2 id="profile-title">Profile</h2><div id="profile-body"></div>
-      <p class="hint">Wallis keeps this current himself, and anyone in Discord can pull it up with <code>/profile</code>.</p>
+      <p class="hint">Wallis keeps this current himself, and anyone on the allow-list can pull it up in Discord with <code>/profile</code>.</p>
       <div class="actions"><button id="profile-done" type="button">Continue to dashboard</button><button id="profile-refresh" type="button" class="secondary">Refresh</button></div>
     </section>
   </div>
 
   <div id="view-dashboard" hidden>
     <nav class="tabs"><button id="change-model" type="button" class="secondary">Change model</button><button id="open-profile" type="button" class="secondary">View Wallis' profile</button></nav>
-    <section aria-labelledby="runtime-title"><h2 id="runtime-title">Runtime</h2><p id="runtime-message" role="status">${runtime.message}</p><div id="readiness" class="pills"></div><div class="actions"><button id="start" type="button">Start Hermes</button><button id="stop" type="button" class="secondary">Stop Hermes</button><button id="reset" type="button" class="secondary">Reset Wallis</button></div></section>
+    <section aria-labelledby="runtime-title"><h2 id="runtime-title">Runtime</h2><p id="runtime-message" role="status">${runtime.message}</p><p class="hint">Wallis runs his own Discord bot in the distro: <code>/join</code> brings him into a voice channel, where he listens, thinks with Hermes, and answers out loud.</p><div id="readiness" class="pills"></div><div class="actions"><button id="start" type="button">Start Wallis</button><button id="stop" type="button" class="secondary">Stop Wallis</button><button id="reset" type="button" class="secondary">Reset Wallis</button></div></section>
     <section aria-labelledby="terminal-title"><h2 id="terminal-title">Terminal</h2><p class="hint">Runs one command at a time inside the Wallis distro as the non-root <code>wallis</code> user.</p>
       <pre id="terminal-output" role="log" aria-live="polite" tabindex="0">Ready.</pre>
       <form id="terminal-form" class="prompt"><span aria-hidden="true">$</span><input id="terminal-command" name="command" placeholder="hermes --help" autocomplete="off" spellcheck="false" required aria-label="Command to run in the Wallis distro" /><button type="submit">Run</button><button id="open-terminal" type="button" class="secondary">Open shell window</button></form></section>
@@ -109,6 +110,7 @@ const apiKey = pick<HTMLInputElement>("#api-key");
 const generateButton = pick<HTMLButtonElement>("#generate");
 const generateMessage = pick("#generate-message");
 const profileBody = pick("#profile-body");
+const loadingStep = pick("#loading-step");
 
 const views = ["setup", "inference", "generate", "loading", "profile", "dashboard"] as const;
 type View = (typeof views)[number];
@@ -116,8 +118,16 @@ type View = (typeof views)[number];
 /** Where the inference form returns to: onboarding continues to generation, a later edit goes back. */
 let afterInference: View = "generate";
 
+let progressTimer: ReturnType<typeof setInterval> | undefined;
+
 function showView(view: View) {
   for (const name of views) pick(`#view-${name}`).hidden = name !== view;
+  clearInterval(progressTimer);
+  if (view !== "loading") return;
+  progressTimer = setInterval(async () => {
+    const step = await invoke("get_progress").catch(() => "");
+    if (step) loadingStep.textContent = step;
+  }, 1500);
 }
 
 function showRuntime(next: RuntimeStatus) {
@@ -263,10 +273,10 @@ pick("#profile-refresh").addEventListener("click", () => void openProfile("profi
 pick("#open-profile").addEventListener("click", () => void openProfile("dashboard"));
 
 startButton.addEventListener("click", async () => {
-  try { showRuntime(await invoke("start_hermes")); } catch (error) { showRuntime({ state: "unavailable", message: String(error), discordReady: false, memoryReady: false }); }
+  try { showRuntime(await invoke("start_wallis")); } catch (error) { showRuntime({ state: "unavailable", message: String(error), discordReady: false, memoryReady: false }); }
 });
 stopButton.addEventListener("click", async () => {
-  try { showRuntime(await invoke("stop_hermes")); } catch (error) { showRuntime({ state: "unavailable", message: String(error), discordReady: false, memoryReady: false }); }
+  try { showRuntime(await invoke("stop_wallis")); } catch (error) { showRuntime({ state: "unavailable", message: String(error), discordReady: false, memoryReady: false }); }
 });
 async function reset() {
   if (!window.confirm("Reset Wallis? This permanently deletes the distro, its memory, and the profile Wallis wrote for himself.")) return;

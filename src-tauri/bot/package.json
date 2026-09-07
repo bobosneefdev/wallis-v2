@@ -1,0 +1,14 @@
+{
+  "name": "@wallis/voice-bot",
+  "private": true,
+  "type": "module",
+  "description": "Runs inside the Wallis WSL2 distro. Installed there by the desktop app, not by the host workspace.",
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "@snazzah/davey": "^0.1.12",
+    "discord.js": "^14.27.0",
+    "ffmpeg-static": "^5.3.0",
+    "opusscript": "^0.0.8",
+    "prism-media": "^1.3.5"
+  }
+}

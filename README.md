@@ -22,6 +22,7 @@ Tauri desktop app
         │
         ▼
   WSL2 distribution
+  ├── Wallis Discord bot (voice: whisper.cpp -> Hermes -> Piper)
   ├── Hermes Agent
   └── Mnemosyne + SQLite memory
         │
@@ -31,7 +32,8 @@ Tauri desktop app
 
 - **Tauri 2 + Rust** — desktop shell, Windows integration, and WSL lifecycle management.
 - **WSL2 runtime** — runs the Linux agent environment from a custom imported distro image. Wallis disables Windows-drive automounting and Windows-process interop, runs Hermes as a non-root user, keeps data in the Linux filesystem, and exposes no inbound service ports. WSL2 is the default contained runtime, not a hostile-code security boundary.
-- **Hermes Agent** — agent runtime, tool use, sessions, scheduling, and Discord integration.
+- **Wallis Discord bot** — owns the Discord connection and the voice loop, carried over from V1: `/join` puts Wallis in a voice channel, whisper.cpp transcribes locally, Hermes decides what to say, Piper speaks it. Hermes' own Discord gateway stays off; only one process may hold the bot token.
+- **Hermes Agent** — agent runtime, tool use, sessions, and scheduling, called headlessly by the bot.
 - **Mnemosyne** — local-first memory provider backed by SQLite. Keep Hermes' built-in memory disabled when Mnemosyne is the active provider to avoid duplicate memory systems.
 - **Discord** — official bot account using the Gateway/API with the smallest practical permission set.
 
@@ -56,6 +58,7 @@ No additional database, message broker, Docker Desktop installation, or containe
 - Configure the Wallis distro with `/etc/wsl.conf` settings that disable drive automounting and Windows interop; do not mount host folders into the agent runtime.
 - Treat the root filesystem archive as a versioned release artifact. Do not commit `rootfs.tar` to the Git repository; verify its checksum before importing it.
 - Store the Discord token and the inference provider API key using Windows Credential Manager or DPAPI. Never put them in source, logs, or an unencrypted config file; hand them to Hermes over stdin.
+- The bot's prerequisites (Node, whisper.cpp, Piper, and the two local models) are downloaded into the distro during setup, checksum-verified against pinned versions. The Windows installer cannot do this: the distro does not exist until the app imports it.
 - Onboarding order is fixed: import the distro, choose provider/model/reasoning effort, install Mnemosyne if it is missing, generate Wallis' persona into memory, then show his profile. The persona's first name is always `Wallis` and is never user-editable.
 - Keep Mnemosyne data inside the WSL distribution and make reset/uninstall separate from stop. `wsl --unregister` permanently deletes the distribution and its memory. The Windows uninstaller unregisters the distro through an NSIS hook, but only when the user ticks "delete application data".
 - Prefer mentions, DMs, and slash commands where possible. Reading arbitrary channel message content may require Discord's privileged `MESSAGE_CONTENT` intent.

@@ -51,8 +51,9 @@ type Commands = {
   get_setup_status: SetupStatus;
   get_runtime_status: RuntimeStatus;
   get_stage: Stage;
-  start_hermes: RuntimeStatus;
-  stop_hermes: RuntimeStatus;
+  get_progress: string;
+  start_wallis: RuntimeStatus;
+  stop_wallis: RuntimeStatus;
   reset_wallis: RuntimeStatus;
   import_wallis: RuntimeStatus;
   get_config: WallisConfig;
