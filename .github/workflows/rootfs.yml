@@ -10,22 +10,42 @@ on:
   push:
     tags:
       - rootfs-v*
+  pull_request:
+    paths:
+      - scripts/rootfs/**
+      - .github/workflows/rootfs.yml
 
 permissions:
   contents: write
 
 jobs:
+  smoke:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check rootfs scripts
+        run: bash -n scripts/rootfs/build.sh scripts/rootfs/check.sh
+
   build:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Select rootfs version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           if [[ "$GITHUB_REF" == refs/tags/rootfs-v* ]]; then
-            echo "WALLIS_ROOTFS_VERSION=${GITHUB_REF_NAME#rootfs-v}" >> "$GITHUB_ENV"
+            version="${GITHUB_REF_NAME#rootfs-v}"
           else
-            echo "WALLIS_ROOTFS_VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
+            version="$INPUT_VERSION"
           fi
+          if [[ ! "$version" =~ ^[0-9A-Za-z._-]+$ ]]; then
+            echo "Invalid rootfs version: $version" >&2
+            exit 1
+          fi
+          printf 'WALLIS_ROOTFS_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
       - name: Build rootfs archive
         run: sudo bash scripts/rootfs/build.sh
       - name: Check rootfs archive

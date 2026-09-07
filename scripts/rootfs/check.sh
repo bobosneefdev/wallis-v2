@@ -22,11 +22,21 @@ printf '%s\n' "$wsl_conf" | grep -Fx 'appendWindowsPath=false' >/dev/null
 printf '%s\n' "$wsl_conf" | grep -Fx 'default=wallis' >/dev/null
 
 passwd="$(tar -xOf "$archive" ./etc/passwd)"
-printf '%s\n' "$passwd" | grep -Eq '^wallis:x:[0-9]+:[0-9]+:'
+wallis_uid="$(printf '%s\n' "$passwd" | awk -F: '$1 == "wallis" { print $3; exit }')"
+wallis_gid="$(printf '%s\n' "$passwd" | awk -F: '$1 == "wallis" { print $4; exit }')"
+test -n "$wallis_uid" && test -n "$wallis_gid"
+
+for path in \
+  './home/wallis/' \
+  './home/wallis/.hermes/' \
+  './home/wallis/.hermes/config.yaml' \
+  './home/wallis/.local/bin/hermes'; do
+  tar --numeric-owner -tvf "$archive" "$path" | awk -v owner="$wallis_uid/$wallis_gid" -v path="$path" '$3 == owner && $NF == path { found = 1 } END { exit !found }'
+done
 
 config="$(tar -xOf "$archive" ./home/wallis/.hermes/config.yaml)"
 printf '%s\n' "$config" | grep -Eq '^[[:space:]]*provider:[[:space:]]*mnemosyne[[:space:]]*$'
 printf '%s\n' "$config" | grep -Eq '^[[:space:]]*memory_enabled:[[:space:]]*(false|0)[[:space:]]*$'
-printf '%s\n' "$config" | grep -Eq '^[[:space:]]*user_profile_enabled:[[:space:]]*(false|0)[[:space:]]*$'
+printf '%s\n' "$config" | grep -Eq '^user_profile_enabled:[[:space:]]*(false|0)[[:space:]]*$'
 
 echo "rootfs archive checks passed: $archive"

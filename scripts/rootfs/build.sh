@@ -96,16 +96,21 @@ hermes_python=/home/wallis/.hermes/hermes-agent/venv/bin/python
 chroot "$rootfs" test -x "$hermes_bin"
 chroot "$rootfs" test -x "$hermes_python"
 chroot "$rootfs" su -s /bin/bash - wallis -c \
-  "PATH=/home/wallis/.hermes/hermes-agent/venv/bin:/home/wallis/.local/bin:\$PATH \"$hermes_python\" -m pip install --no-cache-dir \"mnemosyne-hermes==$MNEMOSYNE_HERMES_VERSION\" && \"$hermes_bin\" config set memory.provider mnemosyne && \"$hermes_bin\" config set memory.memory_enabled false && \"$hermes_bin\" config set memory.user_profile_enabled false"
+  "PATH=/home/wallis/.hermes/hermes-agent/venv/bin:/home/wallis/.local/bin:\$PATH \"$hermes_python\" -m pip install --no-cache-dir \"mnemosyne-hermes==$MNEMOSYNE_HERMES_VERSION\" && \"$hermes_bin\" config set memory.provider mnemosyne && \"$hermes_bin\" config set memory.memory_enabled false && \"$hermes_bin\" config set user_profile_enabled false"
 chroot "$rootfs" su -s /bin/bash - wallis -c \
-  "PATH=/home/wallis/.hermes/hermes-agent/venv/bin:/home/wallis/.local/bin:\$PATH \"$hermes_bin\" --version >/dev/null && \"$hermes_bin\" config get memory.provider | grep -Fx mnemosyne && \"$hermes_bin\" config get memory.memory_enabled | grep -Eiq '^(false|0)$' && \"$hermes_bin\" config get memory.user_profile_enabled | grep -Eiq '^(false|0)$' && \"$hermes_bin\" memory status"
+  "PATH=/home/wallis/.hermes/hermes-agent/venv/bin:/home/wallis/.local/bin:\$PATH \"$hermes_bin\" --version >/dev/null && \"$hermes_bin\" config get memory.provider | grep -Fx mnemosyne && \"$hermes_bin\" config get memory.memory_enabled | grep -Eiq '^(false|0)$' && \"$hermes_bin\" config get user_profile_enabled | grep -Eiq '^(false|0)$' && \"$hermes_bin\" memory status"
 
 chroot "$rootfs" chown -R wallis:wallis /home/wallis
 rm -rf "$rootfs/var/lib/apt/lists/"* "$rootfs/tmp/"*
 
+for ((i=${#mounted[@]}-1; i>=0; i--)); do
+  umount "${mounted[i]}" || { echo "Unable to unmount ${mounted[i]} before archiving" >&2; exit 1; }
+done
+mounted=()
+
 archive="$output_dir/wallis-rootfs-$WALLIS_ROOTFS_VERSION.tar"
 checksum="$archive.sha256"
-tar --numeric-owner --sort=name --mtime=@0 --owner=0 --group=0 -C "$rootfs" -cf "$archive" .
+tar --numeric-owner --sort=name --mtime=@0 -C "$rootfs" -cf "$archive" .
 sha256sum "$archive" > "$checksum"
 echo "$archive"
 echo "$checksum"
