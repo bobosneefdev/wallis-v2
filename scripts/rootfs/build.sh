@@ -38,7 +38,7 @@ trap cleanup EXIT
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends debootstrap
 command -v debootstrap >/dev/null || { echo "debootstrap installation failed" >&2; exit 1; }
-debootstrap --variant=minbase "$UBUNTU_CODENAME" "$rootfs" "$UBUNTU_MIRROR"
+debootstrap --variant=minbase --components=main,universe "$UBUNTU_CODENAME" "$rootfs" "$UBUNTU_MIRROR"
 
 mount --bind /dev "$rootfs/dev"
 mounted+=("$rootfs/dev")
