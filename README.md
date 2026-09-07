@@ -33,6 +33,7 @@ Tauri desktop app
 - **Tauri 2 + Rust** — desktop shell, Windows integration, and WSL lifecycle management.
 - **WSL2 runtime** — runs the Linux agent environment from a custom imported distro image. Wallis disables Windows-drive automounting and Windows-process interop, runs Hermes as a non-root user, keeps data in the Linux filesystem, and exposes no inbound service ports. WSL2 is the default contained runtime, not a hostile-code security boundary.
 - **Wallis Discord bot** — owns the Discord connection and the voice loop, carried over from V1: `/join` puts Wallis in a voice channel, whisper.cpp transcribes locally, Hermes decides what to say, Piper speaks it. Hermes' own Discord gateway stays off; only one process may hold the bot token.
+  Every stage stays warm and the reply is spoken sentence by sentence as the agent streams it. Cold-starting `hermes -z` per utterance cost about eleven seconds a turn before the model thought at all; a warm ACP session answers in about a third of a second. Speech settings (model, threads, voice, speed, silence window) are GUI options, as every user-configurable option must be.
 - **Hermes Agent** — agent runtime, tool use, sessions, and scheduling, called headlessly by the bot.
 - **Mnemosyne** — local-first memory provider backed by SQLite. Keep Hermes' built-in memory disabled when Mnemosyne is the active provider to avoid duplicate memory systems.
 - **Discord** — official bot account using the Gateway/API with the smallest practical permission set.

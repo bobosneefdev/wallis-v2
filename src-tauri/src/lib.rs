@@ -33,11 +33,21 @@ const NODE_SHA256: &str = "2f2c0da162318f0de47665410c7c8c2ed3d36c8f3105de4bbc611
 const WHISPER_URL: &str = "https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-ubuntu-x64.tar.gz";
 const WHISPER_SHA256: &str = "f4cfc1f969a13805908fb72043ce7cc896eb42e0b8afbe841dc8e7298923b061";
 const PIPER_VERSION: &str = "1.8.0";
-/// The same two local models Wallis V1 used: whisper.cpp base.en for speech, Piper ryan-high for voice.
-const STT_MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
-const STT_MODEL_SHA256: &str = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
-const VOICE_MODEL_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx";
-const VOICE_MODEL_SHA256: &str = "b3990d7606e183ec8dbfba70a4607074f162de1a0c412e0180d1ff60bb154eca";
+const FLASK_VERSION: &str = "3.1.0";
+/// Speech models the GUI can choose between: (id, label, sha256, megabytes).
+const STT_MODELS: [(&str, &str, &str, u32); 3] = [
+    ("tiny.en", "Tiny — fastest, least accurate", "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f", 74),
+    ("base.en", "Base — the Wallis V1 default", "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002", 141),
+    ("small.en", "Small — most accurate, slowest", "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d", 465),
+];
+/// Piper voices, same speaker as V1 at two quality levels. Medium synthesises about twice as fast.
+const TTS_VOICES: [(&str, &str, &str, u32); 2] = [
+    ("medium", "Medium — about twice as fast", "abf4c274862564ed647ba0d2c47f8ee7c9b717d27bdad9219100eb310db4047a", 60),
+    ("high", "High — richer, slower", "b3990d7606e183ec8dbfba70a4607074f162de1a0c412e0180d1ff60bb154eca", 115),
+];
+const STT_MODEL_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-";
+const TTS_VOICE_BASE: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/";
+
 const WSL_CONF: &str = "[automount]\nenabled=false\n\n[interop]\nenabled=false\nappendWindowsPath=false\n\n[user]\ndefault=wallis\n";
 
 struct AppState { config: Mutex<WallisConfig>, app_data: Mutex<Option<PathBuf>>, memory_ready: Mutex<bool>, bot: Mutex<Option<Child>>, progress: Mutex<String> }
@@ -68,11 +78,27 @@ struct WallisConfig {
     reasoning_effort: String,
     #[serde(default)]
     onboarded: bool,
+    #[serde(default = "default_stt_model")]
+    stt_model: String,
+    #[serde(default = "default_threads")]
+    stt_threads: u32,
+    #[serde(default = "default_tts_voice")]
+    tts_voice: String,
+    #[serde(default = "default_tts_speed")]
+    tts_speed: f32,
+    #[serde(default = "default_silence_ms")]
+    silence_ms: u32,
 }
+
+fn default_stt_model() -> String { "base.en".into() }
+fn default_threads() -> u32 { 4 }
+fn default_tts_voice() -> String { "medium".into() }
+fn default_tts_speed() -> f32 { 1.0 }
+fn default_silence_ms() -> u32 { 250 }
 
 impl Default for WallisConfig {
     fn default() -> Self {
-        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), memory_provider: "mnemosyne".into(), auto_start: false, rootfs_archive: String::new(), rootfs_sha256: String::new(), distro_root: String::new(), provider: String::new(), model: String::new(), reasoning_effort: "medium".into(), onboarded: false }
+        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), memory_provider: "mnemosyne".into(), auto_start: false, rootfs_archive: String::new(), rootfs_sha256: String::new(), distro_root: String::new(), provider: String::new(), model: String::new(), reasoning_effort: "medium".into(), onboarded: false, stt_model: default_stt_model(), stt_threads: default_threads(), tts_voice: default_tts_voice(), tts_speed: default_tts_speed(), silence_ms: default_silence_ms() }
     }
 }
 
@@ -356,14 +382,32 @@ fn fetch_script(marker: &str, url: &str, sha256: &str, unpack: &str) -> String {
     )
 }
 
-fn voice_steps() -> [(&'static str, String); 4] {
-    [
+fn voice_steps(config: &WallisConfig) -> Vec<(&'static str, String)> {
+    let (stt, stt_sha) = STT_MODELS.iter().find(|(id, ..)| *id == config.stt_model).map(|(id, _, sha, _)| (*id, *sha)).unwrap_or(("base.en", STT_MODELS[1].2));
+    let (tts, tts_sha) = TTS_VOICES.iter().find(|(id, ..)| *id == config.tts_voice).map(|(id, _, sha, _)| (*id, *sha)).unwrap_or(("medium", TTS_VOICES[0].2));
+    vec![
         ("Installing the bot runtime…", fetch_script(NODE_BIN, NODE_URL, NODE_SHA256, "rm -rf \"$W/node\"; mkdir -p \"$W/node\"; tar -xJf artifact -C \"$W/node\" --strip-components=1")),
         ("Installing speech recognition…", fetch_script(&format!("{WALLIS_HOME}/whisper/whisper-server"), WHISPER_URL, WHISPER_SHA256, "rm -rf \"$W/whisper\"; mkdir -p \"$W/whisper\"; tar -xzf artifact -C \"$W/whisper\" --strip-components=1")),
-        ("Installing Wallis' voice…", format!("set -e\nW={WALLIS_HOME}\n[ -x \"$W/piper/bin/piper\" ] && exit 0\npython3 -m venv \"$W/piper\"\n\"$W/piper/bin/pip\" install --quiet --no-cache-dir 'piper-tts=={PIPER_VERSION}'\n")),
+        ("Installing Wallis' voice…", format!("set -e
+W={WALLIS_HOME}
+[ -x \"$W/piper/bin/flask\" ] && exit 0
+[ -x \"$W/piper/bin/piper\" ] || python3 -m venv \"$W/piper\"
+\"$W/piper/bin/pip\" install --quiet --no-cache-dir 'piper-tts=={PIPER_VERSION}' 'flask=={FLASK_VERSION}'
+")),
         ("Downloading the local voice models…", format!(
-            "set -e\nW={WALLIS_HOME}\nmkdir -p \"$W/models\"\nget() {{\n  [ -f \"$3\" ] && return 0\n  curl -fsSL \"$1\" -o \"$3.part\"\n  [ -z \"$2\" ] || echo \"$2  $3.part\" | sha256sum -c - >/dev/null\n  mv \"$3.part\" \"$3\"\n}}\nget '{stt}' '{stt_sha}' \"$W/models/ggml-base.en.bin\"\nget '{tts}' '{tts_sha}' \"$W/models/en_US-ryan-high.onnx\"\nget '{tts}.json' '' \"$W/models/en_US-ryan-high.onnx.json\"\n",
-            stt = STT_MODEL_URL, stt_sha = STT_MODEL_SHA256, tts = VOICE_MODEL_URL, tts_sha = VOICE_MODEL_SHA256,
+            "set -e
+W={WALLIS_HOME}
+mkdir -p \"$W/models\"
+get() {{
+  [ -f \"$3\" ] && return 0
+  curl -fsSL \"$1\" -o \"$3.part\"
+  [ -z \"$2\" ] || echo \"$2  $3.part\" | sha256sum -c - >/dev/null
+  mv \"$3.part\" \"$3\"
+}}
+get '{STT_MODEL_BASE}ggml-{stt}.bin' '{stt_sha}' \"$W/models/ggml-{stt}.bin\"
+get '{TTS_VOICE_BASE}{tts}/en_US-ryan-{tts}.onnx' '{tts_sha}' \"$W/models/en_US-ryan-{tts}.onnx\"
+get '{TTS_VOICE_BASE}{tts}/en_US-ryan-{tts}.onnx.json' '' \"$W/models/en_US-ryan-{tts}.onnx.json\"
+"
         )),
     ]
 }
@@ -371,7 +415,8 @@ fn voice_steps() -> [(&'static str, String); 4] {
 /// Installs everything the Discord bot needs inside the distro. Idempotent, and not user-facing
 /// beyond the progress line: the first run downloads roughly 400 MB and takes a few minutes.
 fn ensure_voice(state: &AppState) -> Result<(), String> {
-    for (label, script) in voice_steps() {
+    let config = state.config.lock().expect("config state poisoned").clone();
+    for (label, script) in voice_steps(&config) {
         set_progress(state, label);
         run_script("install the voice runtime", &script)?;
     }
@@ -394,6 +439,26 @@ fn ensure_memory() -> Result<(), String> {
     hermes_config_set(&[("memory.provider", "mnemosyne"), ("memory.memory_enabled", "false"), ("user_profile_enabled", "false")])?;
     if !memory_ready()? { return Err("Mnemosyne was installed but is still not reporting ready.".into()); }
     Ok(())
+}
+
+/// Voice knobs come from the GUI, so clamp them to what the runtimes actually accept.
+fn validate_voice(config: &mut WallisConfig) -> Result<(), String> {
+    if !STT_MODELS.iter().any(|(id, ..)| *id == config.stt_model) { return Err("Choose a supported speech recognition model.".into()); }
+    if !TTS_VOICES.iter().any(|(id, ..)| *id == config.tts_voice) { return Err("Choose a supported voice.".into()); }
+    if !(1..=64).contains(&config.stt_threads) { return Err("Use between 1 and 64 speech recognition threads.".into()); }
+    if !(0.5..=2.0).contains(&config.tts_speed) { return Err("Voice speed must be between 0.5 and 2.0.".into()); }
+    if !(100..=2000).contains(&config.silence_ms) { return Err("The silence window must be between 100 and 2000 milliseconds.".into()); }
+    Ok(())
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceOption { id: String, label: String, megabytes: u32 }
+
+#[tauri::command]
+fn get_voice_options() -> (Vec<VoiceOption>, Vec<VoiceOption>) {
+    let map = |list: &[(&str, &str, &str, u32)]| list.iter().map(|(id, label, _, megabytes)| VoiceOption { id: (*id).to_string(), label: (*label).to_string(), megabytes: *megabytes }).collect();
+    (map(&STT_MODELS), map(&TTS_VOICES))
 }
 
 fn provider_entry(id: &str) -> Result<(&'static str, &'static str, &'static str), String> {
@@ -626,7 +691,10 @@ fn start_wallis_impl(state: &AppState) -> Result<RuntimeStatus, String> {
     if inspect_bot()? { return Ok(status("running", "Wallis is already running as the non-root wallis user.", true, true)); }
     #[cfg(target_os = "windows")]
     {
-        let mut child = wsl_with_secrets(&[("DISCORD_BOT_TOKEN", &token), ("DISCORD_ALLOWED_USERS", &allowed), ("DISCORD_APPLICATION_ID", &application_id), (key_var, &key)])
+        let voice = state.config.lock().expect("config state poisoned").clone();
+        let (threads, speed, silence) = (voice.stt_threads.to_string(), voice.tts_speed.to_string(), voice.silence_ms.to_string());
+        let mut child = wsl_with_secrets(&[("DISCORD_BOT_TOKEN", &token), ("DISCORD_ALLOWED_USERS", &allowed), ("DISCORD_APPLICATION_ID", &application_id), (key_var, &key),
+            ("WALLIS_STT_MODEL", &voice.stt_model), ("WALLIS_STT_THREADS", &threads), ("WALLIS_TTS_VOICE", &voice.tts_voice), ("WALLIS_TTS_SPEED", &speed), ("WALLIS_SILENCE_MS", &silence)])
             .args([NODE_BIN, BOT_JS]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
             .spawn().map_err(|error| format!("Unable to start the Wallis bot: {error}"))?;
         for _ in 0..30 {
@@ -777,6 +845,7 @@ async fn generate_wallis(state: State<'_, AppState>) -> Result<Profile, String> 
 fn save_config(config: WallisConfig, state: State<'_, AppState>) -> Result<WallisConfig, String> {
     if !config.rootfs_sha256.trim().is_empty() { validate_sha256(&config.rootfs_sha256)?; }
     let mut config = config;
+    validate_voice(&mut config)?;
     config.discord_allowed_users = validate_allowed_users(&config.discord_allowed_users)?;
     let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
     save_config_file(&config_path(&app_data), &config)?;
@@ -849,11 +918,15 @@ mod tests {
     }
     #[test]
     fn provisioning_skips_what_is_installed_and_checks_what_it_downloads() {
-        let steps = voice_steps();
+        let steps = voice_steps(&WallisConfig::default());
         let node = &steps[0].1;
         assert!(node.contains(&format!("[ -e \"{NODE_BIN}\" ] && exit 0")), "node step must be idempotent");
         assert!(node.contains(NODE_SHA256) && node.contains("sha256sum -c"), "downloads must be verified");
-        assert!(steps[3].1.contains(STT_MODEL_SHA256) && steps[3].1.contains(VOICE_MODEL_SHA256));
+        assert!(steps[3].1.contains(STT_MODELS[1].2) && steps[3].1.contains(TTS_VOICES[0].2), "the configured models must be the ones fetched");
+        let mut small = WallisConfig { stt_model: "small.en".into(), tts_voice: "high".into(), ..WallisConfig::default() };
+        assert!(voice_steps(&small)[3].1.contains(STT_MODELS[2].2));
+        small.stt_threads = 0;
+        assert!(validate_voice(&mut small).is_err());
         assert!(steps.iter().all(|(label, script)| !label.is_empty() && script.starts_with("set -e")));
     }
     #[test]
@@ -892,5 +965,5 @@ pub fn run() {
         *state.app_data.lock().expect("app data state poisoned") = Some(app_data);
         if config.auto_start { let _ = start_wallis_impl(&state); }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_wallis, stop_wallis, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, generate_wallis, get_stage, get_progress]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_wallis, stop_wallis, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, generate_wallis, get_stage, get_progress, get_voice_options]).run(tauri::generate_context!()).expect("error while running Wallis");
 }

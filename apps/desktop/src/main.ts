@@ -1,6 +1,6 @@
 import "./styles.css";
 import { validateConfig } from "./config";
-import { EFFORTS, EFFORT_LABELS, invoke, type Profile, type ProviderOption, type RuntimeStatus, type SecretStatus, type SetupStatus, type WallisConfig } from "./invoke";
+import { EFFORTS, EFFORT_LABELS, invoke, type VoiceOption, type Profile, type ProviderOption, type RuntimeStatus, type SecretStatus, type SetupStatus, type WallisConfig } from "./invoke";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("Wallis mount is missing");
@@ -64,6 +64,14 @@ app.innerHTML = `
     <section aria-labelledby="terminal-title"><h2 id="terminal-title">Terminal</h2><p class="hint">Runs one command at a time inside the Wallis distro as the non-root <code>wallis</code> user.</p>
       <pre id="terminal-output" role="log" aria-live="polite" tabindex="0">Ready.</pre>
       <form id="terminal-form" class="prompt"><span aria-hidden="true">$</span><input id="terminal-command" name="command" placeholder="hermes --help" autocomplete="off" spellcheck="false" required aria-label="Command to run in the Wallis distro" /><button type="submit">Run</button><button id="open-terminal" type="button" class="secondary">Open shell window</button></form></section>
+    <section aria-labelledby="voice-title"><h2 id="voice-title">Voice</h2><p class="hint">Speech runs locally in the distro. Bigger models hear better; smaller ones answer sooner.</p><form id="voice-form">
+      <label for="stt-model">Speech recognition model</label><select id="stt-model" name="sttModel"></select>
+      <label for="stt-threads">Speech recognition threads</label><input id="stt-threads" name="sttThreads" type="number" min="1" max="64" step="1" /><p class="hint">CPU threads whisper.cpp may use. More threads transcribe faster until you run out of cores.</p>
+      <label for="tts-voice">Voice quality</label><select id="tts-voice" name="ttsVoice"></select>
+      <label for="tts-speed">Speaking speed</label><input id="tts-speed" name="ttsSpeed" type="number" min="0.5" max="2" step="0.05" /><p class="hint">Piper length scale: below 1 is faster and clipped, above 1 is slower and more deliberate.</p>
+      <label for="silence-ms">Silence before Wallis answers (ms)</label><input id="silence-ms" name="silenceMs" type="number" min="100" max="2000" step="50" /><p class="hint">How long you have to stop talking before he takes his turn.</p>
+      <button type="submit">Save voice settings</button><p id="voice-message" role="status" aria-live="polite"></p>
+    </form></section>
     <section aria-labelledby="config-title"><h2 id="config-title">Configuration</h2><form id="config-form">
       <label for="application-id">Discord application ID <span>(optional until bot setup)</span></label><input id="application-id" name="discordApplicationId" inputmode="numeric" autocomplete="off" />
       <label for="allowed-users">Allowed Discord user IDs</label><input id="allowed-users" name="discordAllowedUsers" inputmode="numeric" placeholder="123456789012345678,198765432109876543" autocomplete="off" required /><p class="hint">Only these users can interact with Wallis. Use numeric Discord user IDs separated by commas.</p>
@@ -111,6 +119,13 @@ const generateButton = pick<HTMLButtonElement>("#generate");
 const generateMessage = pick("#generate-message");
 const profileBody = pick("#profile-body");
 const loadingStep = pick("#loading-step");
+const voiceForm = pick<HTMLFormElement>("#voice-form");
+const voiceMessage = pick("#voice-message");
+const sttModel = pick<HTMLSelectElement>("#stt-model");
+const sttThreads = pick<HTMLInputElement>("#stt-threads");
+const ttsVoice = pick<HTMLSelectElement>("#tts-voice");
+const ttsSpeed = pick<HTMLInputElement>("#tts-speed");
+const silenceMs = pick<HTMLInputElement>("#silence-ms");
 
 const views = ["setup", "inference", "generate", "loading", "profile", "dashboard"] as const;
 type View = (typeof views)[number];
@@ -151,6 +166,11 @@ function showConfig(next: WallisConfig) {
   if (next.provider) providerSelect.value = next.provider;
   modelInput.value = next.model;
   if (effortSelect.querySelector(`option[value="${next.reasoningEffort}"]`)) effortSelect.value = next.reasoningEffort;
+  sttModel.value = next.sttModel;
+  sttThreads.value = String(next.sttThreads);
+  ttsVoice.value = next.ttsVoice;
+  ttsSpeed.value = String(next.ttsSpeed);
+  silenceMs.value = String(next.silenceMs);
   inferenceSummary.textContent = next.model ? `Thinking with ${next.model} on ${next.provider} at ${next.reasoningEffort} reasoning effort.` : "";
 }
 
@@ -196,6 +216,20 @@ async function openProfile(next: View) {
   }
 }
 
+function voiceOptions(select: HTMLSelectElement, options: VoiceOption[]) {
+  select.innerHTML = options.map((option) => `<option value="${safe(option.id)}">${safe(option.label)} · ${option.megabytes} MB</option>`).join("");
+}
+
+voiceForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const current = await invoke("get_config");
+  const next: WallisConfig = { ...current, sttModel: sttModel.value, sttThreads: Number(sttThreads.value), ttsVoice: ttsVoice.value, ttsSpeed: Number(ttsSpeed.value), silenceMs: Number(silenceMs.value) };
+  try {
+    showConfig(await invoke("save_config", { config: next }));
+    voiceMessage.textContent = "Saved. Restart Wallis to pick up the change; a new model downloads on the next start.";
+  } catch (error) { voiceMessage.textContent = error instanceof Error ? error.message : String(error); }
+});
+
 async function load() {
   try {
     setup = await invoke("get_setup_status");
@@ -203,6 +237,9 @@ async function load() {
     secret = await invoke("get_secret_status");
     tokenStatus.textContent = secret.hasToken ? "Discord token is stored securely." : "No Discord token is configured.";
     showRuntime(await invoke("get_runtime_status"));
+    const [sttOptions, ttsOptions] = await invoke("get_voice_options");
+    voiceOptions(sttModel, sttOptions);
+    voiceOptions(ttsVoice, ttsOptions);
     const stage = await invoke("get_stage");
     if (stage === "inference") await loadProviders();
     showConfig(await invoke("get_config"));

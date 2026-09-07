@@ -20,6 +20,8 @@ export type ModelOption = { id: string; efforts: string[] };
 
 export type ProviderOption = { id: string; label: string; models: ModelOption[] };
 
+export type VoiceOption = { id: string; label: string; megabytes: number };
+
 export type Profile = {
   name: string;
   age: string;
@@ -45,6 +47,11 @@ export type WallisConfig = {
   model: string;
   reasoningEffort: string;
   onboarded: boolean;
+  sttModel: string;
+  sttThreads: number;
+  ttsVoice: string;
+  ttsSpeed: number;
+  silenceMs: number;
 };
 
 type Commands = {
@@ -52,6 +59,7 @@ type Commands = {
   get_runtime_status: RuntimeStatus;
   get_stage: Stage;
   get_progress: string;
+  get_voice_options: [VoiceOption[], VoiceOption[]];
   start_wallis: RuntimeStatus;
   stop_wallis: RuntimeStatus;
   reset_wallis: RuntimeStatus;
@@ -91,6 +99,11 @@ const fallback: WallisConfig = {
   model: "",
   reasoningEffort: "medium",
   onboarded: false,
+  sttModel: "base.en",
+  sttThreads: 4,
+  ttsVoice: "medium",
+  ttsSpeed: 1,
+  silenceMs: 250,
 };
 
 export function invoke<K extends keyof Commands>(command: K, args?: unknown): Promise<Commands[K]> {
