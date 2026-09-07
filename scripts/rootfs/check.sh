@@ -31,7 +31,7 @@ for path in \
   './home/wallis/.hermes/' \
   './home/wallis/.hermes/config.yaml' \
   './home/wallis/.local/bin/hermes'; do
-  tar --numeric-owner -tvf "$archive" "$path" | awk -v owner="$wallis_uid/$wallis_gid" -v path="$path" '$3 == owner && $NF == path { found = 1 } END { exit !found }'
+  tar --numeric-owner -tvf "$archive" "$path" | awk -v owner="$wallis_uid/$wallis_gid" -v path="$path" '$2 == owner && $NF == path { found = 1 } END { exit !found }'
 done
 
 config="$(tar -xOf "$archive" ./home/wallis/.hermes/config.yaml)"
