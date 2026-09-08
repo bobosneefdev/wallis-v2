@@ -41,6 +41,12 @@ export type VoiceCycle = { at: string; sttMs: number; llmMs: number; ttsMs: numb
 export type WallisConfig = {
   discordApplicationId: string;
   discordAllowedUsers: string;
+  discordReadChannels: string;
+  discordWriteChannels: string;
+  discordVoiceTextChannel: string;
+  voiceParticipation: "mentions" | "natural";
+  textParticipation: "mentions" | "natural";
+  participationCooldownSecs: number;
   memoryProvider: "mnemosyne";
   autoStart: boolean;
   rootfsArchive: string;
@@ -48,6 +54,9 @@ export type WallisConfig = {
   distroRoot: string;
   provider: string;
   model: string;
+  backgroundProvider: string;
+  backgroundModel: string;
+  backgroundReasoningEffort: string;
   reasoningEffort: string;
   onboarded: boolean;
   sttModel: string;
@@ -77,6 +86,7 @@ type Commands = {
   get_providers: ProviderOption[];
   get_profile: Profile;
   save_inference: WallisConfig;
+  save_background_inference: WallisConfig;
   generate_wallis: Profile;
 };
 
@@ -94,6 +104,12 @@ export const EFFORT_LABELS: Record<string, string> = { none: "Off — no thinkin
 const fallback: WallisConfig = {
   discordApplicationId: "",
   discordAllowedUsers: "",
+  discordReadChannels: "",
+  discordWriteChannels: "",
+  discordVoiceTextChannel: "",
+  voiceParticipation: "natural",
+  textParticipation: "natural",
+  participationCooldownSecs: 20,
   memoryProvider: "mnemosyne",
   autoStart: false,
   rootfsArchive: "",
@@ -101,6 +117,9 @@ const fallback: WallisConfig = {
   distroRoot: "",
   provider: "",
   model: "",
+  backgroundProvider: "",
+  backgroundModel: "",
+  backgroundReasoningEffort: "high",
   reasoningEffort: "medium",
   onboarded: false,
   sttModel: "base.en",

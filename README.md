@@ -38,6 +38,26 @@ Tauri desktop app
 - **Mnemosyne** — local-first memory provider backed by SQLite. Keep Hermes' built-in memory disabled when Mnemosyne is the active provider to avoid duplicate memory systems.
 - **Discord** — official bot account using the Gateway/API with the smallest practical permission set.
 
+### Discord conversation settings
+
+In **Settings → Discord**, enter comma-separated channel IDs for reading and writing. Empty lists disable text access; a channel needs both permissions for Wallis to reply there. The existing user allow-list applies to text and voice. Enable **Message Content Intent** on the bot's Discord Developer Portal page and grant **View Channel**, **Send Messages** and **Attach Files** in the selected channels. Thread destinations also need **Send Messages in Threads**. Restart Wallis after saving.
+
+Choose a default text channel for voice requests from the write list, in the same server as the call. A request such as “Wallis, write Snake in one HTML file” produces an attachment there, followed by a spoken confirmation after the upload succeeds. Code never enters the speech pipeline as raw model output. Voice prompts explicitly account for STT homophones; text prompts identify typed input. Voice turns also receive a small recent excerpt from configured read channels in the same server, marked as typed chat. Read-only channels can supply that context without receiving replies. Grant **Read Message History** to recognize replies to Wallis after a restart.
+
+**Natural** participation lets Hermes decide whether to contribute or stay quiet, with a configurable cooldown (20 seconds by default). Direct mentions bypass it, and voice follow-ups from the person Wallis just answered remain eligible for 20 seconds. **Only mentions** restores explicit addressing. Wallis waits for a gap before starting audio and discards stale unprompted voice replies. Per-channel ACP sessions keep simultaneous text and voice responses separate; no extra classification model or polling of channel history is involved.
+
+Bot regression checks: `bun install --cwd src-tauri/bot --no-save`, then `bun test src-tauri/bot/bot.test.mjs`. These cover streaming audio, channel routing, attachment delivery failures, participation and simultaneous ACP replies without sending messages to Discord.
+
+### Realtime and background models
+
+In **Settings → AI models**, select **Realtime** or **Background** to save that role's provider, model, reasoning effort and credentials. Realtime handles conversation; when a background model is configured, it hands coding, research and substantial work to a separate warm Hermes process. Wallis acknowledges the handoff immediately, stays available for conversation, then posts the completed result in the selected allowed text channel. Voice requests receive a spoken delivery confirmation after the upload succeeds. Leave the background model blank to disable handoff. Restart Wallis after saving.
+
+Both roles have independent effort settings, even when they use the same model. Hermes supports `agent.reasoning_overrides`, but the installed ACP adapter does not pass reasoning settings into new agents. Wallis's small process-local ACP launcher supplies the chosen effort through Hermes's native `reasoning_config` constructor argument, including when ACP rebuilds an agent for a model change. It does not modify the Hermes installation. Provider/model support still determines the available effort levels.
+
+Background work has one active slot and three waiting slots, a ten-minute model timeout and a 512 KB output limit. Failures are reported in chat and the app. Pending jobs do not survive a restart. A blank background API key retains that provider's stored key, or copies the realtime key when both providers match; keys are stored separately with DPAPI. Providers using Hermes CLI authentication keep using that authentication.
+
+The bot tests cover nonblocking handoff, bounded queue recovery and delivery. Run `test_hermes_acp.py` alongside `hermes_acp.py` using the installed Hermes virtualenv to check effort propagation through the actual ACP session factory without making model requests.
+
 ## Development tooling
 
 - **TypeScript** — UI and any TypeScript-side orchestration.

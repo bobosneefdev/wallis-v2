@@ -98,6 +98,18 @@ struct WallisConfig {
     discord_application_id: String,
     #[serde(default)]
     discord_allowed_users: String,
+    #[serde(default)]
+    discord_read_channels: String,
+    #[serde(default)]
+    discord_write_channels: String,
+    #[serde(default)]
+    discord_voice_text_channel: String,
+    #[serde(default = "default_participation")]
+    voice_participation: String,
+    #[serde(default = "default_participation")]
+    text_participation: String,
+    #[serde(default = "default_participation_cooldown")]
+    participation_cooldown_secs: u32,
     memory_provider: String,
     auto_start: bool,
     rootfs_archive: String,
@@ -107,6 +119,12 @@ struct WallisConfig {
     provider: String,
     #[serde(default)]
     model: String,
+    #[serde(default)]
+    background_provider: String,
+    #[serde(default)]
+    background_model: String,
+    #[serde(default = "default_background_effort")]
+    background_reasoning_effort: String,
     #[serde(default)]
     reasoning_effort: String,
     #[serde(default)]
@@ -128,10 +146,13 @@ fn default_threads() -> u32 { 4 }
 fn default_tts_voice() -> String { "medium".into() }
 fn default_tts_speed() -> f32 { 1.0 }
 fn default_silence_ms() -> u32 { 250 }
+fn default_background_effort() -> String { "high".into() }
+fn default_participation() -> String { "natural".into() }
+fn default_participation_cooldown() -> u32 { 20 }
 
 impl Default for WallisConfig {
     fn default() -> Self {
-        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), memory_provider: "mnemosyne".into(), auto_start: false, rootfs_archive: String::new(), rootfs_sha256: String::new(), distro_root: String::new(), provider: String::new(), model: String::new(), reasoning_effort: "medium".into(), onboarded: false, stt_model: default_stt_model(), stt_threads: default_threads(), tts_voice: default_tts_voice(), tts_speed: default_tts_speed(), silence_ms: default_silence_ms() }
+        Self { background_reasoning_effort: default_background_effort(), background_provider: String::new(), background_model: String::new(), discord_application_id: String::new(), discord_allowed_users: String::new(), discord_read_channels: String::new(), discord_write_channels: String::new(), discord_voice_text_channel: String::new(), voice_participation: default_participation(), text_participation: default_participation(), participation_cooldown_secs: default_participation_cooldown(), memory_provider: "mnemosyne".into(), auto_start: false, rootfs_archive: String::new(), rootfs_sha256: String::new(), distro_root: String::new(), provider: String::new(), model: String::new(), reasoning_effort: "medium".into(), onboarded: false, stt_model: default_stt_model(), stt_threads: default_threads(), tts_voice: default_tts_voice(), tts_speed: default_tts_speed(), silence_ms: default_silence_ms() }
     }
 }
 
@@ -220,6 +241,7 @@ fn default_distro_root() -> PathBuf {
 fn config_path(app_data: &std::path::Path) -> PathBuf { app_data.join(CONFIG_FILE) }
 fn token_path(app_data: &std::path::Path) -> PathBuf { app_data.join(TOKEN_FILE) }
 fn key_path(app_data: &std::path::Path) -> PathBuf { app_data.join(KEY_FILE) }
+fn background_key_path(app_data: &std::path::Path) -> PathBuf { app_data.join("background-provider-key.dpapi") }
 
 fn load_config_file(path: &std::path::Path) -> Result<WallisConfig, String> {
     if !path.is_file() { return Ok(WallisConfig::default()); }
@@ -456,6 +478,7 @@ fn ensure_voice(state: &AppState) -> Result<(), String> {
     set_progress(state, "Installing the Discord bot…");
     write_in_distro(BOT_PACKAGE, BOT_MANIFEST)?;
     write_in_distro(BOT_JS, BOT_SOURCE)?;
+    write_in_distro("/home/wallis/.wallis/bot/hermes_acp.py", include_str!("../bot/hermes_acp.py"))?;
     run_script("install the Discord bot", &format!(
         "set -e\nW={WALLIS_HOME}\ncd \"$W/bot\"\nexport PATH=\"$W/node/bin:$PATH\"\n[ -d node_modules/discord.js ] || npm install --no-audit --no-fund --silent\n"
     ))?;
@@ -481,6 +504,23 @@ fn validate_voice(config: &mut WallisConfig) -> Result<(), String> {
     if !(1..=64).contains(&config.stt_threads) { return Err("Use between 1 and 64 speech recognition threads.".into()); }
     if !(0.5..=2.0).contains(&config.tts_speed) { return Err("Voice speed must be between 0.5 and 2.0.".into()); }
     if !(100..=2000).contains(&config.silence_ms) { return Err("The silence window must be between 100 and 2000 milliseconds.".into()); }
+    Ok(())
+}
+
+fn validate_discord_channels(config: &mut WallisConfig) -> Result<(), String> {
+    for channels in [&mut config.discord_read_channels, &mut config.discord_write_channels] {
+        *channels = if channels.trim().is_empty() { String::new() } else {
+            validate_allowed_users(channels).map_err(|_| "Channel lists must contain numeric Discord channel IDs separated by commas.".to_string())?
+        };
+    }
+    config.discord_voice_text_channel = config.discord_voice_text_channel.trim().to_string();
+    if !config.discord_voice_text_channel.is_empty() && !config.discord_write_channels.split(',').any(|id| id == config.discord_voice_text_channel) {
+        return Err("The voice output channel must be in the write channel list.".into());
+    }
+    if ![&config.voice_participation, &config.text_participation].iter().all(|mode| matches!(mode.as_str(), "mentions" | "natural")) {
+        return Err("Choose a supported participation mode.".into());
+    }
+    if !(5..=300).contains(&config.participation_cooldown_secs) { return Err("Use 5–300 seconds between unprompted contributions.".into()); }
     Ok(())
 }
 
@@ -536,7 +576,7 @@ fn model_catalog(state: &AppState, refresh: bool) -> Result<Vec<ProviderOption>,
     let current = state.config.lock().expect("config state poisoned").provider.clone();
     #[cfg(target_os = "windows")]
     let output = {
-        let secret = provider_key(state).ok().flatten();
+        let secret = provider_key(state, false).ok().flatten();
         let mut command = match secret.as_ref() {
             Some((key_var, key)) => wsl_with_secrets(&[(key_var, key)]),
             None => wsl_with_secrets(&[]),
@@ -618,11 +658,12 @@ fn read_profile() -> Result<Profile, String> {
     serde_json::from_str(&decode_wsl_output(&output.stdout)).map(sanitize_profile).map_err(|_| "Wallis' profile file is not valid JSON.".into())
 }
 
-fn provider_key(state: &AppState) -> Result<Option<(&'static str, String)>, String> {
+fn provider_key(state: &AppState, background: bool) -> Result<Option<(&'static str, String)>, String> {
     let config = state.config.lock().expect("config state poisoned").clone();
-    let Some(key_var) = provider_key_var(&config.provider) else { return Ok(None); };
+    if background && config.background_model.is_empty() { return Ok(None); }
+    let Some(key_var) = provider_key_var(if background { &config.background_provider } else { &config.provider }) else { return Ok(None); };
     let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
-    let key = unprotect_token(&key_path(&app_data))?;
+    let key = unprotect_token(&if background { background_key_path(&app_data) } else { key_path(&app_data) })?;
     validate_secret(&key, "provider API key")?;
     Ok(Some((key_var, key)))
 }
@@ -755,7 +796,8 @@ fn start_wallis_impl(state: &AppState) -> Result<RuntimeStatus, String> {
     if !state.config.lock().expect("config state poisoned").onboarded { return Err("Finish setting Wallis up before starting him.".into()); }
     let application_id = state.config.lock().expect("config state poisoned").discord_application_id.clone();
     let (token, allowed) = prerequisites(state)?;
-    let provider_key = provider_key(state)?;
+    let realtime_key = provider_key(state, false)?;
+    let background_key = provider_key(state, true)?;
     apply_soul(&read_profile()?)?;
     ensure_memory()?;
     ensure_voice(state)?;
@@ -764,10 +806,17 @@ fn start_wallis_impl(state: &AppState) -> Result<RuntimeStatus, String> {
     #[cfg(target_os = "windows")]
     {
         let voice = state.config.lock().expect("config state poisoned").clone();
+        let mut voice = voice;
+        validate_discord_channels(&mut voice)?;
+        let cooldown = voice.participation_cooldown_secs.to_string();
         let (threads, speed, silence) = (voice.stt_threads.to_string(), voice.tts_speed.to_string(), voice.silence_ms.to_string());
         let mut secrets = vec![("DISCORD_BOT_TOKEN", token.as_str()), ("DISCORD_ALLOWED_USERS", allowed.as_str()), ("DISCORD_APPLICATION_ID", application_id.as_str()),
-            ("WALLIS_STT_MODEL", voice.stt_model.as_str()), ("WALLIS_STT_THREADS", threads.as_str()), ("WALLIS_TTS_VOICE", voice.tts_voice.as_str()), ("WALLIS_TTS_SPEED", speed.as_str()), ("WALLIS_SILENCE_MS", silence.as_str())];
-        if let Some((key_var, key)) = provider_key.as_ref() { secrets.push((key_var, key.as_str())); }
+            ("WALLIS_STT_MODEL", voice.stt_model.as_str()), ("WALLIS_STT_THREADS", threads.as_str()), ("WALLIS_TTS_VOICE", voice.tts_voice.as_str()), ("WALLIS_TTS_SPEED", speed.as_str()), ("WALLIS_SILENCE_MS", silence.as_str()),
+            ("DISCORD_READ_CHANNELS", voice.discord_read_channels.as_str()), ("DISCORD_WRITE_CHANNELS", voice.discord_write_channels.as_str()), ("DISCORD_VOICE_TEXT_CHANNEL", voice.discord_voice_text_channel.as_str()),
+            ("WALLIS_VOICE_PARTICIPATION", voice.voice_participation.as_str()), ("WALLIS_TEXT_PARTICIPATION", voice.text_participation.as_str()), ("WALLIS_PARTICIPATION_COOLDOWN_SECS", cooldown.as_str())];
+        secrets.extend([("WALLIS_BACKGROUND_PROVIDER", voice.background_provider.as_str()), ("WALLIS_BACKGROUND_MODEL", voice.background_model.as_str()), ("WALLIS_REALTIME_EFFORT", voice.reasoning_effort.as_str()), ("WALLIS_BACKGROUND_EFFORT", voice.background_reasoning_effort.as_str())]);
+        if let Some((key_var, key)) = realtime_key.as_ref() { secrets.push((key_var, key.as_str())); }
+        if let Some((key_var, key)) = background_key.as_ref() { secrets.extend([("WALLIS_BACKGROUND_KEY_VAR", *key_var), ("WALLIS_BACKGROUND_API_KEY", key.as_str())]); }
         let mut child = wsl_with_secrets(&secrets)
             .args([NODE_BIN, BOT_JS]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
             .spawn().map_err(|error| format!("Unable to start the Wallis bot: {error}"))?;
@@ -794,7 +843,7 @@ fn start_wallis_impl(state: &AppState) -> Result<RuntimeStatus, String> {
         Err("The Wallis bot did not come up within 6 seconds. Check the Discord token and allow-list.".into())
     }
     #[cfg(not(target_os = "windows"))]
-    { let _ = (state, application_id, token, allowed, provider_key); Err("Wallis currently requires Windows with WSL2.".into()) }
+    { let _ = (state, application_id, token, allowed, realtime_key, background_key); Err("Wallis currently requires Windows with WSL2.".into()) }
 }
 
 #[tauri::command]
@@ -859,7 +908,7 @@ fn get_providers(refresh: Option<bool>, state: State<'_, AppState>) -> Result<Ve
 fn get_stage(state: State<'_, AppState>) -> String {
     if !matches!(distro_info(), Ok(Some(_))) { return "setup".into(); }
     let config = state.config.lock().expect("config state poisoned").clone();
-    if provider_key(&state).is_err() || config.model.is_empty() { return "inference".into(); }
+    if provider_key(&state, false).is_err() || config.model.is_empty() { return "inference".into(); }
     if !config.onboarded || read_profile().is_err() { return "generate".into(); }
     "ready".into()
 }
@@ -889,10 +938,35 @@ fn save_inference(provider: String, model: String, reasoning_effort: String, api
     Ok(config)
 }
 
+#[tauri::command(rename_all = "camelCase")]
+fn save_background_inference(provider: String, model: String, reasoning_effort: String, api_key: String, state: State<'_, AppState>) -> Result<WallisConfig, String> {
+    let reasoning_effort = validate_effort(reasoning_effort.trim())?;
+    let mut config = state.config.lock().expect("config state poisoned").clone();
+    let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
+    let model = if model.trim().is_empty() { String::new() } else { validate_model(&model)? };
+    let provider = if model.is_empty() { config.background_provider.clone() } else { validate_provider(&provider)? };
+    if !model.is_empty() {
+        let key = api_key.trim();
+        if !key.is_empty() {
+            if provider_key_var(&provider).is_none() { return Err("Add this provider's credentials through the Hermes CLI, then refresh providers here.".into()); }
+            validate_secret(key, "background provider API key")?;
+            protect_token(&background_key_path(&app_data), key)?;
+        } else if provider_key_var(&provider).is_some() && (config.background_provider != provider || !background_key_path(&app_data).is_file()) {
+            if config.provider != provider { return Err("Add the API key for this background provider.".into()); }
+            let (_, key) = provider_key(&state, false)?.ok_or("Add the API key for this background provider.")?;
+            protect_token(&background_key_path(&app_data), &key)?;
+        }
+    }
+    (config.background_provider, config.background_model, config.background_reasoning_effort) = (provider, model, reasoning_effort);
+    save_config_file(&config_path(&app_data), &config)?;
+    *state.config.lock().expect("config state poisoned") = config.clone();
+    Ok(config)
+}
+
 /// Long-running: installs memory if needed, has Hermes invent itself, then stores that identity.
 #[tauri::command]
 async fn generate_wallis(state: State<'_, AppState>) -> Result<Profile, String> {
-    let provider_key = provider_key(&state)?;
+    let provider_key = provider_key(&state, false)?;
     set_progress(&state, "Setting up memory…");
     ensure_memory()?;
     ensure_voice(&state)?;
@@ -922,6 +996,7 @@ fn save_config(config: WallisConfig, state: State<'_, AppState>) -> Result<Walli
     let mut config = config;
     validate_voice(&mut config)?;
     config.discord_allowed_users = validate_allowed_users(&config.discord_allowed_users)?;
+    validate_discord_channels(&mut config)?;
     let app_data = state.app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
     save_config_file(&config_path(&app_data), &config)?;
     *state.config.lock().expect("config state poisoned") = config.clone();
@@ -995,6 +1070,31 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
     #[test]
+    fn validates_channel_permissions_and_migrates_old_configs() {
+        let mut config = WallisConfig::default();
+        let mut old = serde_json::to_value(&config).unwrap();
+        for key in ["discordReadChannels", "discordWriteChannels", "discordVoiceTextChannel", "voiceParticipation", "textParticipation", "participationCooldownSecs", "backgroundProvider", "backgroundModel", "backgroundReasoningEffort"] { old.as_object_mut().unwrap().remove(key); }
+        let migrated: WallisConfig = serde_json::from_value(old).unwrap();
+        assert!(migrated.discord_read_channels.is_empty());
+        assert!(migrated.background_model.is_empty());
+        assert_eq!(migrated.background_reasoning_effort, "high");
+        assert_ne!(background_key_path(std::path::Path::new("test")), key_path(std::path::Path::new("test")));
+        assert_eq!(migrated.voice_participation, "natural");
+        assert_eq!(migrated.participation_cooldown_secs, 20);
+        config.discord_write_channels = "123456789012".into();
+        config.discord_voice_text_channel = "999999999999".into();
+        assert!(validate_discord_channels(&mut config).is_err());
+        config.discord_voice_text_channel = "123456789012".into();
+        assert!(validate_discord_channels(&mut config).is_ok());
+        let saved: WallisConfig = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(saved.discord_voice_text_channel, config.discord_voice_text_channel);
+        config.voice_participation = "always".into();
+        assert!(validate_discord_channels(&mut config).is_err());
+        config.voice_participation = "natural".into();
+        config.participation_cooldown_secs = 0;
+        assert!(validate_discord_channels(&mut config).is_err());
+    }
+    #[test]
     fn rejects_secret_values_that_could_escape_stdin() {
         assert!(validate_secret("token\nwith-newline", "Discord token").is_err());
         assert!(validate_secret("", "Discord token").is_err());
@@ -1053,5 +1153,5 @@ pub fn run() {
             std::thread::spawn(move || { let _ = start_wallis_impl(&handle.state::<AppState>()); });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_wallis, stop_wallis, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, generate_wallis, get_stage, get_progress, get_voice_options, get_voice_cycles]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_wallis, stop_wallis, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, save_background_inference, generate_wallis, get_stage, get_progress, get_voice_options, get_voice_cycles]).run(tauri::generate_context!()).expect("error while running Wallis");
 }

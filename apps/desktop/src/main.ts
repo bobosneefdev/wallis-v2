@@ -74,7 +74,9 @@ app.innerHTML = `
     <div id="pane-profile" role="tabpanel" aria-labelledby="tab-profile" hidden><div id="profile-host"></div></div>
 
     <div id="pane-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
-      <div id="inference-home"><section aria-labelledby="inference-title"><h2 id="inference-title">AI model</h2><form id="inference-form">
+      <div id="inference-home"><section aria-labelledby="inference-title"><h2 id="inference-title">AI models</h2><form id="inference-form">
+        <div id="model-purpose-field"><label for="model-purpose">Purpose</label><select id="model-purpose"><option value="realtime">Realtime — conversation</option><option value="background">Background — coding and substantial work</option></select></div>
+        <p id="model-purpose-hint" class="hint">Realtime keeps conversation responsive. Background work can finish while you keep talking.</p>
         <label for="provider">Provider</label><div class="input-action"><select id="provider" name="provider"></select><button id="refresh-providers" type="button" class="secondary">Refresh</button></div>
         <label for="model">Model</label><input id="model" name="model" list="model-options" autocomplete="off" placeholder="anthropic/claude-opus-5" required /><datalist id="model-options"></datalist>
         <label for="effort">Reasoning effort</label><select id="effort" name="reasoningEffort"></select><p class="hint" id="effort-hint"></p>
@@ -92,6 +94,16 @@ app.innerHTML = `
       <section aria-labelledby="config-title"><h2 id="config-title">Discord</h2><form id="config-form">
         <label for="application-id">Application ID</label><input id="application-id" name="discordApplicationId" inputmode="numeric" autocomplete="off" />
         <label for="allowed-users">Allowed user IDs</label><input id="allowed-users" name="discordAllowedUsers" inputmode="numeric" placeholder="123456789012345678,198765432109876543" autocomplete="off" required />
+        <label for="read-channels">Text channels Wallis can read</label><input id="read-channels" name="discordReadChannels" placeholder="Channel IDs, separated by commas" autocomplete="off" aria-describedby="channel-help" />
+        <label for="write-channels">Text channels Wallis can write in</label><input id="write-channels" name="discordWriteChannels" placeholder="Channel IDs, separated by commas" autocomplete="off" aria-describedby="channel-help" />
+        <p id="channel-help" class="hint">Empty lists disable text access. Enable Developer Mode in Discord, then right-click a channel to copy its ID. Wallis only responds to allowed users. To reply in a channel, include it in both lists.</p>
+        <p class="hint">Enable Message Content Intent on the bot's Discord Developer Portal page. Grant View Channel, Send Messages and Attach Files in the chosen channels.</p>
+        <label for="voice-text-channel">Default text channel for voice requests</label><input id="voice-text-channel" name="discordVoiceTextChannel" inputmode="numeric" placeholder="A channel ID from the write list" autocomplete="off" />
+        <p class="hint">Code and files requested in voice go here. Wallis confirms the post out loud after it succeeds. The destination must be in the same server as the call.</p>
+        <label for="voice-participation">Voice participation</label><select id="voice-participation" name="voiceParticipation"><option value="natural">Natural — follow-ups and occasional contributions</option><option value="mentions">Only when addressed by name</option></select>
+        <label for="text-participation">Text participation</label><select id="text-participation" name="textParticipation"><option value="natural">Natural — mentions, replies and occasional contributions</option><option value="mentions">Only mentions and replies</option></select>
+        <label for="participation-cooldown">Minimum time between unprompted contributions (seconds)</label><input id="participation-cooldown" name="participationCooldownSecs" type="number" min="5" max="300" step="1" />
+        <p class="hint">Wallis can choose to stay quiet. Direct mentions and voice follow-ups do not wait for this interval.</p>
         <label for="discord-token">Bot token</label><input id="discord-token" name="discordToken" type="password" autocomplete="new-password" placeholder="Leave blank to keep the saved token" /><p id="token-status" class="hint" role="status"></p>
         <label class="check"><input id="auto-start" name="autoStart" type="checkbox" /> Start Wallis when the app opens</label>
         <button type="submit">Save Discord settings</button><p id="config-message" role="status" aria-live="polite"></p>
@@ -114,6 +126,12 @@ const installForm = pick<HTMLFormElement>("#install-form");
 const form = pick<HTMLFormElement>("#config-form");
 const applicationId = pick<HTMLInputElement>("#application-id");
 const allowedUsers = pick<HTMLInputElement>("#allowed-users");
+const readChannels = pick<HTMLInputElement>("#read-channels");
+const writeChannels = pick<HTMLInputElement>("#write-channels");
+const voiceTextChannel = pick<HTMLInputElement>("#voice-text-channel");
+const voiceParticipation = pick<HTMLSelectElement>("#voice-participation");
+const textParticipation = pick<HTMLSelectElement>("#text-participation");
+const participationCooldown = pick<HTMLInputElement>("#participation-cooldown");
 const token = pick<HTMLInputElement>("#discord-token");
 const autoStart = pick<HTMLInputElement>("#auto-start");
 const rootfsArchive = pick<HTMLInputElement>("#rootfs-archive");
@@ -130,6 +148,7 @@ const inferenceMessage = pick("#inference-message");
 const providerSelect = pick<HTMLSelectElement>("#provider");
 const refreshProvidersButton = pick<HTMLButtonElement>("#refresh-providers");
 const modelInput = pick<HTMLInputElement>("#model");
+const modelPurpose = pick<HTMLSelectElement>("#model-purpose");
 const modelOptions = pick("#model-options");
 const effortSelect = pick<HTMLSelectElement>("#effort");
 const effortHint = pick("#effort-hint");
@@ -182,6 +201,8 @@ function showView(view: View) {
   showSteps(view);
   pick(view === "inference" ? "#inference-host" : "#inference-home").append(inferenceSection);
   inferenceSubmit.textContent = view === "inference" ? "Continue" : "Save model";
+  pick("#model-purpose-field").hidden = view === "inference";
+  if (view === "inference") modelPurpose.value = "realtime";
   if (view === "profile") { pick("#view-profile").append(profileCard); profileDone.hidden = false; }
   for (const name of views) pick(`#view-${name}`).hidden = name !== view;
   if (view === "dashboard") showTab("home"); else watchCycles(false);
@@ -255,13 +276,24 @@ function showRuntime(next: RuntimeStatus) {
 function showConfig(next: WallisConfig) {
   applicationId.value = next.discordApplicationId;
   allowedUsers.value = next.discordAllowedUsers;
+  readChannels.value = next.discordReadChannels;
+  writeChannels.value = next.discordWriteChannels;
+  voiceTextChannel.value = next.discordVoiceTextChannel;
+  voiceParticipation.value = next.voiceParticipation;
+  textParticipation.value = next.textParticipation;
+  participationCooldown.value = String(next.participationCooldownSecs);
   autoStart.checked = next.autoStart;
   rootfsArchive.value = next.rootfsArchive;
   rootfsSha256.value = next.rootfsSha256;
   distroRoot.value = next.distroRoot;
-  if (next.provider) providerSelect.value = next.provider;
-  modelInput.value = next.model;
-  if (effortSelect.querySelector(`option[value="${next.reasoningEffort}"]`)) effortSelect.value = next.reasoningEffort;
+  const background = modelPurpose.value === "background";
+  if (next.provider) providerSelect.value = background ? next.backgroundProvider || next.provider : next.provider;
+  modelInput.value = background ? next.backgroundModel : next.model;
+  modelInput.required = !background;
+  pick("#model-purpose-hint").textContent = background
+    ? "Leave the model blank to disable handoff. A blank key keeps this background provider's saved key, or reuses the realtime key when both providers match. Each role has its own reasoning effort."
+    : "Realtime keeps conversation responsive. Background work can finish while you keep talking.";
+  showEfforts(background ? next.backgroundReasoningEffort : next.reasoningEffort);
   sttModel.value = next.sttModel;
   sttThreads.value = String(next.sttThreads);
   ttsVoice.value = next.ttsVoice;
@@ -272,7 +304,7 @@ function showConfig(next: WallisConfig) {
 function showModels(keepChoice = false, preferred?: string) {
   const models = providers.find((option) => option.id === providerSelect.value)?.models ?? [];
   modelOptions.innerHTML = models.map((model) => `<option value="${safe(model.id)}"></option>`).join("");
-  if (!keepChoice || !modelInput.value) modelInput.value = models[0]?.id ?? "";
+  if (!keepChoice || (!modelInput.value && modelPurpose.value === "realtime")) modelInput.value = models[0]?.id ?? "";
   showEfforts(preferred);
 }
 
@@ -393,11 +425,19 @@ inferenceForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   inferenceMessage.textContent = "Applying…";
   try {
-    await invoke("save_inference", { provider: providerSelect.value, model: modelInput.value, reasoningEffort: effortSelect.value, apiKey: apiKey.value });
+    const command = modelPurpose.value === "background" ? "save_background_inference" : "save_inference";
+    showConfig(await invoke(command, { provider: providerSelect.value, model: modelInput.value, reasoningEffort: effortSelect.value, apiKey: apiKey.value }));
     apiKey.value = "";
-    inferenceMessage.textContent = "Saved.";
+    inferenceMessage.textContent = "Saved. Restart Wallis to apply model changes.";
     if (!pick("#view-inference").hidden) showView("generate");
   } catch (error) { inferenceMessage.textContent = error instanceof Error ? error.message : String(error); }
+});
+
+modelPurpose.addEventListener("change", async () => {
+  apiKey.value = "";
+  inferenceMessage.textContent = "";
+  try { showConfig(await invoke("get_config")); showModels(true); }
+  catch (error) { inferenceMessage.textContent = String(error); }
 });
 
 generateButton.addEventListener("click", async () => {
@@ -443,6 +483,12 @@ form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const current = await invoke("get_config");
   const next: WallisConfig = { ...current, discordApplicationId: applicationId.value.trim(), discordAllowedUsers: allowedUsers.value.trim(), autoStart: autoStart.checked, rootfsArchive: rootfsArchive.value.trim(), rootfsSha256: rootfsSha256.value.trim(), distroRoot: distroRoot.value.trim() };
+  next.discordReadChannels = readChannels.value.replace(/\s/g, "");
+  next.discordWriteChannels = writeChannels.value.replace(/\s/g, "");
+  next.discordVoiceTextChannel = voiceTextChannel.value.trim();
+  next.voiceParticipation = voiceParticipation.value as WallisConfig["voiceParticipation"];
+  next.textParticipation = textParticipation.value as WallisConfig["textParticipation"];
+  next.participationCooldownSecs = Number(participationCooldown.value);
   const error = validateConfig(next);
   if (error) { configMessage.textContent = error; return; }
   try {
@@ -450,7 +496,7 @@ form.addEventListener("submit", async (event) => {
     if (token.value) secret = await invoke("save_discord_token", { token: token.value });
     token.value = "";
     tokenStatus.textContent = secret.hasToken ? "Discord token is stored securely." : "No Discord token is configured.";
-    configMessage.textContent = "Configuration saved.";
+    configMessage.textContent = "Configuration saved. Restart Wallis to apply Discord and participation changes.";
   }
   catch (saveError) { configMessage.textContent = saveError instanceof Error ? saveError.message : "Unable to save configuration."; }
 });
