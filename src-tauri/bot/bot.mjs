@@ -42,7 +42,7 @@ const GREETING = "Sup boys";
 /** Wallis only speaks when spoken to, the way V1 did — his name is the trigger. */
 const NAME = /\bwall(?:is|ace|y|ie)\b/i;
 const MIN_AMPLITUDE = 500;
-const VOICE_BRIEF = "You are in a Discord voice call with friends. Answer out loud in one or two short spoken sentences. Plain speech only: no markdown, no emoji, no stage directions, no lists.";
+const VOICE_BRIEF = "You are in a Discord voice call with friends. The user's words come from speech-to-text, so interpret names and homophones by sound without commenting on their spelling. Answer out loud in one or two short spoken sentences. Plain speech only: no markdown, no emoji, no stage directions, no lists.";
 
 process.env.FFMPEG_PATH = ffmpegPath;
 
@@ -139,11 +139,13 @@ async function startSpeech() {
   try { await speechStarting; } finally { speechStarting = null; }
 }
 
-async function transcribe(wav) {
+async function transcribe(wav, signal) {
   const body = new FormData();
   body.append("file", new Blob([wav], { type: "audio/wav" }), "audio.wav");
   body.append("response_format", "json");
-  const response = await fetch(`${STT_URL}/inference`, { method: "POST", body });
+  body.append("no_timestamps", "true");
+  body.append("token_timestamps", "false");
+  const response = await fetch(`${STT_URL}/inference`, { method: "POST", body, signal });
   if (!response.ok) return "";
   const data = await response.json();
   // Whisper marks non-speech as bracketed events; drop those rather than transcribe them.
@@ -236,19 +238,26 @@ async function synthesize(text, timing) {
     throw new Error(`piper refused: ${response.status}`);
   }
 
+  const audio = Readable.fromWeb(response.body);
+  const encoded = encodeSpeech(audio);
+  speech.queue.push({ resource: createAudioResource(encoded, { inputType: StreamType.OggOpus }), timing });
+  playNext();
+}
+
+/** Keep the PCM pipe streaming: probing and one-second Ogg pages otherwise buffer speech. */
+export function encodeSpeech(audio) {
   const encoder = spawn(ffmpegPath, [
-    "-loglevel", "error", "-f", "s16le", "-ar", "22050", "-ac", "1", "-i", "pipe:0",
-    "-ar", "48000", "-ac", "2", "-c:a", "libopus", "-f", "ogg", "pipe:1",
+    "-loglevel", "error", "-f", "s16le", "-ar", "22050", "-ac", "1",
+    "-probesize", "32", "-analyzeduration", "0", "-i", "pipe:0",
+    "-ar", "48000", "-ac", "2", "-c:a", "libopus", "-page_duration", "20000", "-flush_packets", "1", "-f", "ogg", "pipe:1",
   ], { stdio: ["pipe", "pipe", "pipe"] });
   encoder.stderr.on("data", (data) => diagnose("lastError", { where: "ffmpeg", message: data.toString().trim().slice(-500) }));
   encoder.on("error", (error) => failed("ffmpeg", error));
 
-  speech.queue.push({ resource: createAudioResource(encoder.stdout, { inputType: StreamType.OggOpus }), timing });
-  playNext();
-  const audio = Readable.fromWeb(response.body);
   audio.on("error", (error) => { encoder.stdin.destroy(); failed("piper stream", error); });
   encoder.stdin.on("error", (error) => failed("ffmpeg input", error));
   audio.pipe(encoder.stdin);
+  return encoder.stdout;
 }
 
 function say(text, timing = null) {
@@ -294,6 +303,15 @@ export function mergeTranscript(prefix, suffix) {
   let overlap = Math.min(left.length, right.length);
   while (overlap && !left.slice(-overlap).every((value, index) => word(value) === word(right[index]))) overlap -= 1;
   return [...left, ...right.slice(overlap)].join(" ").trim();
+}
+
+/** A stale in-flight snapshot must not hold up the final audio; a complete one needs no rerun. */
+export async function finalTranscript(samples, rolling) {
+  if (rolling.pending && rolling.pendingSamples < samples.length) rolling.controller.abort();
+  await rolling.pending;
+  if (rolling.text && rolling.samples === samples.length) return rolling.text;
+  const overlapStart = rolling.text ? Math.max(0, rolling.samples - 16000) : 0;
+  return mergeTranscript(rolling.text, await transcribe(toWav(samples.subarray(overlapStart))));
 }
 
 // ---------------------------------------------------------------- the agent
@@ -422,14 +440,16 @@ function listen(receiver, guild) {
     const chunks = [];
     // ponytail: rolling batch snapshots reuse today's Whisper server; use native streaming STT
     // only if concurrent speakers or long utterances make repeated snapshots measurably expensive.
-    const rolling = { text: "", samples: 0, pending: null };
+    const rolling = { text: "", samples: 0, pending: null, pendingSamples: 0, controller: null };
     const transcribePartial = () => {
       if (rolling.pending || chunks.length === 0) return;
       const samples = downsample(Buffer.concat(chunks));
       if (samples.length < 16000) return;
-      rolling.pending = transcribe(toWav(samples)).then((text) => {
+      rolling.controller = new AbortController();
+      rolling.pendingSamples = samples.length;
+      rolling.pending = transcribe(toWav(samples), rolling.controller.signal).then((text) => {
         if (text) { rolling.text = text; rolling.samples = samples.length; }
-      }).catch((error) => failed("partial transcription", error)).finally(() => { rolling.pending = null; });
+      }).catch((error) => { if (!rolling.controller.signal.aborted) failed("partial transcription", error); }).finally(() => { rolling.pending = null; });
     };
     const partialTimer = setInterval(transcribePartial, PARTIAL_MS);
     decoder.on("error", () => {});
@@ -443,18 +463,11 @@ function listen(receiver, guild) {
       await new Promise((resolve) => { decoder.once("end", resolve); decoder.end(); });
       if (chunks.length === 0) return;
       try {
-        await rolling.pending;
         const samples = downsample(Buffer.concat(chunks));
         let peak = 0;
         for (const sample of samples) peak = Math.max(peak, Math.abs(sample));
-        if (peak < MIN_AMPLITUDE) return;
-        let said;
-        if (rolling.text) {
-          const overlapStart = Math.max(0, rolling.samples - 16000);
-          said = mergeTranscript(rolling.text, await transcribe(toWav(samples.subarray(overlapStart))));
-        } else {
-          said = await transcribe(toWav(samples));
-        }
+        if (peak < MIN_AMPLITUDE) { rolling.controller?.abort(); return; }
+        const said = await finalTranscript(samples, rolling);
         if (!said) return;
         const timing = { stoppedAt, transcribedAt: performance.now(), firstTextAt: null, playingAt: null };
         const speaker = guild.members.cache.get(userId)?.displayName ?? userId;
