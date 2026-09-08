@@ -1,6 +1,7 @@
 import "./styles.css";
 import { validateConfig } from "./config";
-import { EFFORTS, EFFORT_LABELS, invoke, type VoiceOption, type Profile, type ProviderOption, type RuntimeStatus, type SecretStatus, type SetupStatus, type WallisConfig } from "./invoke";
+import { Chart } from "chart.js/auto";
+import { EFFORTS, EFFORT_LABELS, invoke, type VoiceCycle, type VoiceOption, type Profile, type ProviderOption, type RuntimeStatus, type SecretStatus, type SetupStatus, type WallisConfig } from "./invoke";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("Wallis mount is missing");
@@ -64,6 +65,10 @@ app.innerHTML = `
 
     <div id="pane-home" role="tabpanel" aria-labelledby="tab-home">
       <section aria-labelledby="runtime-title"><h2 id="runtime-title">Runtime</h2><p id="runtime-message" role="status"></p><div id="readiness" class="pills"></div><div class="actions"><button id="start" type="button">Start Wallis</button><button id="stop" type="button" class="secondary">Stop Wallis</button><button id="reset" type="button" class="secondary">Reset Wallis</button></div></section>
+      <section aria-labelledby="performance-title"><h2 id="performance-title">Conversational Performance</h2>
+        <p class="hint">Delay per stage of the last 25 round trips, in milliseconds.</p>
+        <div class="chart"><canvas id="performance-chart" role="img" aria-label="Stacked bar chart of speech recognition, response and speech delays per round trip"></canvas></div>
+        <p id="performance-message" class="hint" role="status"></p></section>
       <section aria-labelledby="terminal-title"><h2 id="terminal-title">Terminal</h2>
         <pre id="terminal-output" role="log" aria-live="polite" tabindex="0">Ready.</pre>
         <form id="terminal-form" class="prompt"><span aria-hidden="true">$</span><input id="terminal-command" name="command" placeholder="hermes --help" autocomplete="off" spellcheck="false" required aria-label="Command to run in the Wallis distro" /><button type="submit">Run</button><button id="open-terminal" type="button" class="secondary">Open shell window</button></form></section>
@@ -145,6 +150,7 @@ const ttsSpeed = pick<HTMLInputElement>("#tts-speed");
 const silenceMs = pick<HTMLInputElement>("#silence-ms");
 const profileCard = pick("#profile-card");
 const profileDone = pick<HTMLButtonElement>("#profile-done");
+const performanceMessage = pick("#performance-message");
 const bootProgress = pick<HTMLProgressElement>("#boot-progress");
 const bootStep = pick("#boot-step");
 
@@ -162,7 +168,7 @@ function showView(view: View) {
   inferenceSubmit.textContent = view === "inference" ? "Continue" : "Save model";
   if (view === "profile") { pick("#view-profile").append(profileCard); profileDone.hidden = false; }
   for (const name of views) pick(`#view-${name}`).hidden = name !== view;
-  if (view === "dashboard") showTab("home");
+  if (view === "dashboard") showTab("home"); else watchCycles(false);
   clearInterval(progressTimer);
   if (view !== "loading") return;
   progressTimer = setInterval(async () => {
@@ -176,10 +182,48 @@ function showTab(tab: Tab) {
     pick(`#pane-${name}`).hidden = name !== tab;
     pick(`#tab-${name}`).setAttribute("aria-selected", String(name === tab));
   }
+  watchCycles(tab === "home");
   if (tab !== "profile") return;
   pick("#profile-host").append(profileCard);
   profileDone.hidden = true;
   void loadProfile();
+}
+
+const STAGES = [
+  { key: "sttMs", label: "Speech recognition", color: "#6f7d90" },
+  { key: "llmMs", label: "Response", color: "#92d3b4" },
+  { key: "ttsMs", label: "Speech", color: "#7fa8d9" },
+] as const;
+
+const performanceChart = new Chart(pick<HTMLCanvasElement>("#performance-chart"), {
+  type: "bar",
+  data: { labels: [] as string[], datasets: STAGES.map((stage) => ({ label: stage.label, data: [] as number[], backgroundColor: stage.color })) },
+  options: {
+    animation: false,
+    maintainAspectRatio: false,
+    scales: {
+      x: { stacked: true, grid: { display: false }, ticks: { color: "#6f7d90" } },
+      y: { stacked: true, beginAtZero: true, grid: { color: "#262e3a" }, ticks: { color: "#6f7d90" }, title: { display: true, text: "ms", color: "#93a0b2" } },
+    },
+    plugins: { legend: { labels: { color: "#93a0b2" } }, tooltip: { callbacks: { label: (item) => `${item.dataset.label}: ${item.formattedValue} ms` } } },
+  },
+});
+
+function showCycles(cycles: VoiceCycle[]) {
+  performanceChart.data.labels = cycles.map((cycle) => new Date(cycle.at).toLocaleTimeString());
+  for (const [index, stage] of STAGES.entries()) performanceChart.data.datasets[index]!.data = cycles.map((cycle) => cycle[stage.key]);
+  performanceChart.update();
+  performanceMessage.textContent = cycles.length ? "" : "No round trips yet. Talk to Wallis in a voice channel.";
+}
+
+/** The chart only matters while the home tab is open, so it polls there and nowhere else. */
+let cyclesTimer: ReturnType<typeof setInterval> | undefined;
+const loadCycles = async () => showCycles(await invoke("get_voice_cycles").catch(() => []));
+function watchCycles(active: boolean) {
+  clearInterval(cyclesTimer);
+  if (!active) return;
+  void loadCycles();
+  cyclesTimer = setInterval(() => void loadCycles(), 5000);
 }
 
 function showRuntime(next: RuntimeStatus) {

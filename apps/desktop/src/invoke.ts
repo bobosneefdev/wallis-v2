@@ -35,6 +35,9 @@ export type Profile = {
   funFact: string;
 };
 
+/** One Wallis round trip: the delay of each pipeline stage, in milliseconds. */
+export type VoiceCycle = { at: string; sttMs: number; llmMs: number; ttsMs: number };
+
 export type WallisConfig = {
   discordApplicationId: string;
   discordAllowedUsers: string;
@@ -60,6 +63,7 @@ type Commands = {
   get_stage: Stage;
   get_progress: string;
   get_voice_options: [VoiceOption[], VoiceOption[]];
+  get_voice_cycles: VoiceCycle[];
   start_wallis: RuntimeStatus;
   stop_wallis: RuntimeStatus;
   reset_wallis: RuntimeStatus;

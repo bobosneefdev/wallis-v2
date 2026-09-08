@@ -659,19 +659,22 @@ fn inspect_bot() -> Result<bool, String> {
     Ok(bot_running(&decode_wsl_output(&output.stdout)))
 }
 
-fn bot_diagnostic() -> Option<String> {
+fn bot_status() -> Option<serde_json::Value> {
     let output = wsl_output(&["--distribution", DISTRO, "--user", USER, "--", "cat", BOT_STATUS]).ok()?;
     if !output.status.success() { return None; }
-    let value: serde_json::Value = serde_json::from_str(&decode_wsl_output(&output.stdout)).ok()?;
-    if let Some(error) = value.get("lastError").filter(|error| !error.is_null()) {
-        return Some(format!("Last voice error ({}): {}", error.get("where")?.as_str()?, error.get("message")?.as_str()?));
-    }
-    let latency = value.get("lastLatency")?.as_object()?;
-    Some(format!(
-        "Last voice latency: {} ms total (speech recognition {}, first response {}, speech {}).",
-        latency.get("totalMs")?.as_u64()?, latency.get("stopToTranscriptMs")?.as_u64()?,
-        latency.get("transcriptToFirstTextMs")?.as_u64()?, latency.get("firstTextToAudioMs")?.as_u64()?,
-    ))
+    serde_json::from_str(&decode_wsl_output(&output.stdout)).ok()
+}
+
+fn bot_diagnostic() -> Option<String> {
+    let value = bot_status()?;
+    let error = value.get("lastError").filter(|error| !error.is_null())?;
+    Some(format!("Last voice error ({}): {}", error.get("where")?.as_str()?, error.get("message")?.as_str()?))
+}
+
+/// Round trips the bot recorded, oldest first; the home page charts them per pipeline stage.
+#[tauri::command]
+fn get_voice_cycles() -> Vec<serde_json::Value> {
+    bot_status().and_then(|value| Some(value.get("cycles")?.as_array()?.clone())).unwrap_or_default()
 }
 
 fn status(state: &str, message: impl Into<String>, discord_ready: bool, memory_ready: bool) -> RuntimeStatus { RuntimeStatus { state: state.into(), message: message.into(), discord_ready, memory_ready } }
@@ -1036,5 +1039,5 @@ pub fn run() {
             std::thread::spawn(move || { let _ = start_wallis_impl(&handle.state::<AppState>()); });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_wallis, stop_wallis, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, generate_wallis, get_stage, get_progress, get_voice_options]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_wallis, stop_wallis, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, generate_wallis, get_stage, get_progress, get_voice_options, get_voice_cycles]).run(tauri::generate_context!()).expect("error while running Wallis");
 }

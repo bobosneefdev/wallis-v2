@@ -42,11 +42,12 @@ const GREETING = "Sup boys";
 /** Wallis only speaks when spoken to, the way V1 did — his name is the trigger. */
 const NAME = /\bwall(?:is|ace|y|ie)\b/i;
 const MIN_AMPLITUDE = 500;
+const CYCLES = 25;
 const VOICE_BRIEF = "You are in a Discord voice call with friends. The user's words come from speech-to-text, so interpret names and homophones by sound without commenting on their spelling. Answer out loud in one or two short spoken sentences. Plain speech only: no markdown, no emoji, no stage directions, no lists.";
 
 process.env.FFMPEG_PATH = ffmpegPath;
 
-const diagnostics = { lastError: null, lastLatency: null };
+const diagnostics = { lastError: null, cycles: [] };
 const log = (...parts) => console.log("[wallis]", ...parts);
 const saveDiagnostics = () => { try { writeFileSync(STATUS_FILE, JSON.stringify(diagnostics)); } catch {} };
 function diagnose(kind, value) {
@@ -208,12 +209,15 @@ player.on(AudioPlayerStatus.Playing, () => {
   if (!timing || timing.playingAt) return;
   timing.playingAt = performance.now();
   diagnostics.lastError = null;
-  diagnose("lastLatency", {
-    stopToTranscriptMs: Math.round(timing.transcribedAt - timing.stoppedAt),
-    transcriptToFirstTextMs: Math.round(timing.firstTextAt - timing.transcribedAt),
-    firstTextToAudioMs: Math.round(timing.playingAt - timing.firstTextAt),
-    totalMs: Math.round(timing.playingAt - timing.stoppedAt),
+  // The desktop app charts the last CYCLES round trips, so keep a rolling window rather than one sample.
+  diagnostics.cycles.push({
+    at: new Date().toISOString(),
+    sttMs: Math.round(timing.transcribedAt - timing.stoppedAt),
+    llmMs: Math.round(timing.firstTextAt - timing.transcribedAt),
+    ttsMs: Math.round(timing.playingAt - timing.firstTextAt),
   });
+  diagnostics.cycles = diagnostics.cycles.slice(-CYCLES);
+  saveDiagnostics();
 });
 
 async function synthesize(text, timing) {
