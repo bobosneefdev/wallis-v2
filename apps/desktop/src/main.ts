@@ -21,7 +21,6 @@ app.innerHTML = `
   </div>
 
   <div id="view-setup" hidden>
-    <ol class="steps"><li class="now">Import distro</li><li>Choose a model</li><li>Generate Wallis</li></ol>
     <section aria-labelledby="setup-title"><h2 id="setup-title">Setup</h2><p id="setup-message" role="status">${setup.message}</p><form id="install-form">
       <label for="rootfs-archive">Wallis rootfs archive</label><input id="rootfs-archive" name="rootfsArchive" placeholder="C:\\Downloads\\wallis-rootfs.tar" autocomplete="off" required />
       <label for="rootfs-sha256">Expected SHA-256</label><input id="rootfs-sha256" name="rootfsSha256" placeholder="64 hexadecimal characters" autocomplete="off" required />
@@ -31,12 +30,10 @@ app.innerHTML = `
   </div>
 
   <div id="view-inference" hidden>
-    <ol class="steps"><li class="done" data-view="setup">Import distro</li><li class="now">Choose a model</li><li>Generate Wallis</li></ol>
     <div id="inference-host"></div>
   </div>
 
   <div id="view-generate" hidden>
-    <ol class="steps"><li class="done" data-view="setup">Import distro</li><li class="done" data-view="inference">Choose a model</li><li class="now">Generate Wallis</li></ol>
     <section class="centered" aria-labelledby="generate-title"><h2 id="generate-title">Generate Wallis</h2>
       <p>Wallis writes his own profile, then downloads his voice models and Discord bot — about 400 MB into the distro.</p>
       <div class="actions"><button id="generate" type="button">Generate Wallis</button></div>
@@ -162,8 +159,27 @@ let progressTimer: ReturnType<typeof setInterval> | undefined;
 const tabs = ["home", "profile", "settings"] as const;
 type Tab = (typeof tabs)[number];
 
+const WIZARD = { setup: "Import distro", inference: "Choose a model", generate: "Generate Wallis" } as const;
+type Step = keyof typeof WIZARD;
+const steps = Object.keys(WIZARD) as Step[];
+const stepBar = document.createElement("ol");
+stepBar.className = "steps";
+/** How far the wizard has been taken; every step up to here stays reachable in both directions. */
+let reached = 0;
+
+/** One step bar, moved into whichever wizard view is showing, so the steps never drift apart. */
+function showSteps(view: View) {
+  const at = steps.indexOf(view as Step);
+  if (at < 0) return;
+  reached = Math.max(reached, at);
+  pick(`#view-${view}`).prepend(stepBar);
+  stepBar.innerHTML = steps.map((step, index) =>
+    `<li class="${index === at ? "now" : index <= reached ? "done" : ""}"${index !== at && index <= reached ? ` data-view="${step}"` : ""}>${WIZARD[step]}</li>`).join("");
+}
+
 /** The model form and the profile card exist once and move between the wizard and the tabs. */
 function showView(view: View) {
+  showSteps(view);
   pick(view === "inference" ? "#inference-host" : "#inference-home").append(inferenceSection);
   inferenceSubmit.textContent = view === "inference" ? "Continue" : "Save model";
   if (view === "profile") { pick("#view-profile").append(profileCard); profileDone.hidden = false; }
@@ -218,7 +234,7 @@ function showCycles(cycles: VoiceCycle[]) {
 
 /** The chart only matters while the home tab is open, so it polls there and nowhere else. */
 let cyclesTimer: ReturnType<typeof setInterval> | undefined;
-const loadCycles = async () => showCycles(await invoke("get_voice_cycles").catch(() => []));
+const loadCycles = async () => showCycles((await invoke("get_voice_cycles").catch(() => [])) ?? []);
 function watchCycles(active: boolean) {
   clearInterval(cyclesTimer);
   if (!active) return;
@@ -314,6 +330,7 @@ async function step<T>(label: string, work: Promise<T>): Promise<T> {
 async function load() {
   showView("boot");
   bootProgress.value = 0;
+  reached = 0;
   try {
     setup = await step("Checking WSL2…", invoke("get_setup_status"));
     setupMessage.textContent = setup.message;
@@ -363,12 +380,7 @@ async function goToStep(view: View) {
     pick<HTMLButtonElement>("#setup-reset").hidden = false;
     installMessage.textContent = "Wallis is already imported. Reset it first if you need a different rootfs archive.";
   }
-  if (view === "inference") {
-    const current = await invoke("get_config");
-    await loadProviders();
-    showConfig(current);
-    showModels(true, current.reasoningEffort);
-  }
+  if (view === "inference" && !providers.length) await loadProviders().catch(() => {});
   showView(view);
 }
 
@@ -381,7 +393,7 @@ inferenceForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   inferenceMessage.textContent = "Applying…";
   try {
-    showConfig(await invoke("save_inference", { provider: providerSelect.value, model: modelInput.value, reasoningEffort: effortSelect.value, apiKey: apiKey.value }));
+    await invoke("save_inference", { provider: providerSelect.value, model: modelInput.value, reasoningEffort: effortSelect.value, apiKey: apiKey.value });
     apiKey.value = "";
     inferenceMessage.textContent = "Saved.";
     if (!pick("#view-inference").hidden) showView("generate");

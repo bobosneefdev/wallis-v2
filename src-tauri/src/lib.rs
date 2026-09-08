@@ -66,7 +66,7 @@ const TTS_VOICES: [(&str, &str, &str, u32); 2] = [
     ("medium", "Medium — about twice as fast", "abf4c274862564ed647ba0d2c47f8ee7c9b717d27bdad9219100eb310db4047a", 60),
     ("high", "High — richer, slower", "b3990d7606e183ec8dbfba70a4607074f162de1a0c412e0180d1ff60bb154eca", 115),
 ];
-const STT_MODEL_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-";
+const STT_MODEL_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 const TTS_VOICE_BASE: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/";
 
 const WSL_CONF: &str = "[automount]\nenabled=false\n\n[interop]\nenabled=false\nappendWindowsPath=false\n\n[user]\ndefault=wallis\n";
@@ -708,7 +708,7 @@ fn get_runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn import_wallis(rootfs_archive: String, expected_sha256: String, install_root: Option<String>) -> Result<RuntimeStatus, String> {
+fn import_wallis(rootfs_archive: String, expected_sha256: String, install_root: Option<String>, state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
     let (archive, expected_sha256, root) = validate_import_inputs(&rootfs_archive, &expected_sha256, install_root.as_deref())?;
     let (_, _) = check_wsl2()?;
     if let Some(version) = distro_info()? { require_wsl2_version(&version)?; return Err("The Wallis distro is already imported. Use Reset Wallis first to remove it.".into()); }
@@ -724,10 +724,15 @@ fn import_wallis(rootfs_archive: String, expected_sha256: String, install_root: 
         let imported = command("wsl.exe").args(["--import", DISTRO, root, path, "--version", "2"]).output().map_err(|error| format!("Unable to import the Wallis distro: {error}"))?;
         if !imported.status.success() { return Err("WSL rejected the Wallis rootfs import. Verify the archive is a Linux rootfs tar and WSL2 is supported.".into()); }
         apply_wsl_conf()?;
+        // Remember what was imported, so the setup step still shows it after a restart.
+        let mut config = state.config.lock().expect("config state poisoned").clone();
+        (config.rootfs_archive, config.rootfs_sha256, config.distro_root) = (rootfs_archive.trim().into(), expected_sha256.clone(), install_root.unwrap_or_default().trim().into());
+        if let Some(app_data) = state.app_data.lock().expect("app data state poisoned").clone() { save_config_file(&config_path(&app_data), &config)?; }
+        *state.config.lock().expect("config state poisoned") = config;
         Ok(stopped("Wallis imported as WSL2 and configured for the non-root wallis user.", false, false))
     }
     #[cfg(not(target_os = "windows"))]
-    { let _ = (archive, expected_sha256, root); Err("Wallis currently requires Windows with WSL2.".into()) }
+    { let _ = (archive, expected_sha256, root, state, rootfs_archive, install_root); Err("Wallis currently requires Windows with WSL2.".into()) }
 }
 
 #[cfg(target_os = "windows")]
@@ -945,6 +950,15 @@ fn save_discord_token(token: String, state: State<'_, AppState>) -> Result<Secre
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The model URLs are built by string interpolation, so a duplicated prefix reads fine and 404s.
+    #[test]
+    fn builds_model_download_urls() {
+        let config = WallisConfig { stt_model: "base.en".into(), tts_voice: "medium".into(), ..WallisConfig::default() };
+        let script = voice_steps(&config).pop().expect("voice steps").1;
+        assert!(script.contains("'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin'"), "{script}");
+        assert!(script.contains("'https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/medium/en_US-ryan-medium.onnx'"), "{script}");
+    }
+
     #[test]
     fn parses_wsl_version_and_utf16_output() {
         assert_eq!(parse_wsl_version("WSL version: 2.5.9.0\nKernel version: 5.15"), Some("2.5.9.0".into()));

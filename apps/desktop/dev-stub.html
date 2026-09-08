@@ -12,6 +12,7 @@ const replies = {
   get_stage: new URLSearchParams(location.search).get("stage") || "ready",
   get_config: config, save_config: config, save_inference: config,
   get_providers: [{ id: "openrouter", label: "OpenRouter", models: [{ id: "anthropic/claude-opus-5", efforts: ["none", "medium", "high"] }] }],
+  get_voice_cycles: Array.from({ length: 25 }, (_, index) => ({ at: new Date(Date.now() - (25 - index) * 60000).toISOString(), sttMs: 200 + index * 5, llmMs: 300 + (index % 7) * 40, ttsMs: 120 + (index % 5) * 20 })),
   get_profile: profile, generate_wallis: profile, get_progress: "",
 };
 window.__TAURI__ = { core: { invoke: (command) => new Promise((resolve) => setTimeout(() => resolve(replies[command] ?? null), 150)) } };
