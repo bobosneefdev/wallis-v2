@@ -8,7 +8,8 @@ describe("validateConfig", () => {
   test("requires valid Discord IDs", () => {
     expect(validateConfig({ ...base, discordApplicationId: "abc" })).toBe("Discord application ID must be a numeric ID.");
     expect(validateConfig({ ...base, discordApplicationId: "123456789012" })).toBeNull();
-    expect(validateConfig({ ...base, discordAllowedUsers: "" })).toBe("Add at least one numeric Discord user ID to the allow-list.");
+    expect(validateConfig({ ...base, discordAllowedUsers: "*" })).toBeNull();
+    expect(validateConfig({ ...base, discordAllowedUsers: "" })).toBe("Add Discord user IDs or * for anyone to the allow-list.");
   });
   test("limits Discord channels, output routing and participation settings", () => {
     expect(validateConfig(base)).toBeNull();

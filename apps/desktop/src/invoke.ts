@@ -109,7 +109,7 @@ const fallback: WallisConfig = {
   discordVoiceTextChannel: "",
   voiceParticipation: "natural",
   textParticipation: "natural",
-  participationCooldownSecs: 20,
+  participationCooldownSecs: 5,
   memoryProvider: "mnemosyne",
   autoStart: false,
   rootfsArchive: "",
@@ -126,7 +126,7 @@ const fallback: WallisConfig = {
   sttThreads: 4,
   ttsVoice: "medium",
   ttsSpeed: 1,
-  silenceMs: 250,
+  silenceMs: 350,
 };
 
 export function invoke<K extends keyof Commands>(command: K, args?: unknown): Promise<Commands[K]> {

@@ -2,7 +2,31 @@ import { expect, test } from "bun:test";
 import { EventEmitter, once } from "node:events";
 import { PassThrough } from "node:stream";
 import { opus } from "prism-media";
-import { Agent, deliverAction, dispatchBackground, encodeSpeech, enqueueBackground, finalTranscript, mergeTranscript, responsePrompt, shouldConsider, takeActions } from "./bot.mjs";
+import { Agent, createVoiceCoordinator, deliverAction, dispatchBackground, encodeSpeech, enqueueBackground, finalTranscript, isAllowed, joinCall, mergeTranscript, responsePrompt, shouldConsider, takeActions } from "./bot.mjs";
+
+test("allow-list wildcard permits anyone", () => {
+  expect(isAllowed("123", new Set(["*"]))).toBe(true);
+  expect(isAllowed("123", new Set(["456"]))).toBe(false);
+});
+
+test("join acknowledges Discord before connecting and reports only a ready call", async () => {
+  const events = [];
+  const interaction = {
+    deferReply: async () => events.push("deferred"),
+    editReply: async (message) => events.push(message),
+  };
+  const call = { subscribe: () => events.push("subscribed"), destroy: () => events.push("destroyed") };
+  const channel = { id: "voice", name: "General", guild: { id: "guild", voiceAdapterCreator: {} } };
+  const connect = () => { events.push("connecting"); return call; };
+  const ready = async () => events.push("ready");
+
+  expect(await joinCall(interaction, channel, connect, ready, {})).toBe(call);
+  expect(events).toEqual(["deferred", "connecting", "subscribed", "ready", "Joined General."]);
+
+  events.length = 0;
+  await expect(joinCall(interaction, channel, connect, async () => { throw new Error("timed out"); }, {})).rejects.toThrow("timed out");
+  expect(events).toEqual(["deferred", "connecting", "subscribed", "destroyed"]);
+});
 
 test("merges the overlapping final transcription", () => {
     expect(mergeTranscript("Wallis what did we decide about the trip", "about the trip next weekend?")).toBe(
@@ -38,6 +62,61 @@ test("natural participation permits relevant opportunities and follow-ups withou
   expect(shouldConsider({ ...turn, participation: "mentions" }, state, 20000)).toBe(false);
   expect(shouldConsider(turn, { ...state, lastReplyUser: "Jake", lastReplyAt: 500 }, 1000)).toBe(true);
   expect(shouldConsider({ ...turn, mode: "text" }, { ...state, lastReplyUser: "Jake", lastReplyAt: 500 }, 1000)).toBe(false);
+});
+
+test("voice coordination joins thought pauses, flushes fluid talk and steers its one active turn", async () => {
+  let now = 0;
+  const jobs = new Set();
+  const timers = {
+    set: (run, delay) => { const job = { at: now + delay, run }; jobs.add(job); return job; },
+    clear: (job) => jobs.delete(job),
+    advance: async (delay) => {
+      now += delay;
+      for (const job of [...jobs].filter(({ at }) => at <= now).sort((a, b) => a.at - b.at)) {
+        jobs.delete(job);
+        job.run();
+        await Promise.resolve();
+      }
+    },
+  };
+  const turns = [], steers = [];
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const coordinator = createVoiceCoordinator(async (segments) => { turns.push(segments.map(({ text }) => text)); await blocked; },
+    { quietMs: 350, maxMs: 900, steer: async ({ text }) => { steers.push(text); return true; }, setTimer: timers.set, clearTimer: timers.clear });
+
+  coordinator.speaking();
+  coordinator.push({ text: "Wallis, I was thinking" });
+  coordinator.roomQuiet();
+  await timers.advance(200);
+  coordinator.speaking();
+  coordinator.push({ text: "we should leave tomorrow" });
+  coordinator.roomQuiet();
+  await timers.advance(349);
+  expect(turns).toEqual([]);
+  await timers.advance(1);
+  expect(turns).toEqual([["Wallis, I was thinking", "we should leave tomorrow"]]);
+
+  coordinator.speaking();
+  coordinator.push({ text: "A fluid conversation" });
+  expect(steers).toEqual(["A fluid conversation"]);
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  coordinator.speaking();
+  coordinator.push({ text: "The next fluid turn" });
+  await timers.advance(900);
+  expect(turns.at(-1)).toEqual(["The next fluid turn"]);
+
+  coordinator.hold();
+  coordinator.speaking();
+  coordinator.push({ text: "Captured while Wallis owns the floor" });
+  coordinator.roomQuiet();
+  await timers.advance(900);
+  expect(turns).toHaveLength(2);
+  coordinator.resume();
+  await timers.advance(350);
+  expect(turns.at(-1)).toEqual(["Captured while Wallis owns the floor"]);
 });
 
 test("voice Snake request posts the complete HTML before speaking a confirmation; failures never confirm", async () => {
@@ -81,18 +160,30 @@ test("text replies stay in text and long replies become attachments without mass
   expect(responsePrompt({ ...turn, mode: "voice" }, [])).toContain("interpret names and homophones by sound");
 });
 
-test("concurrent voice and text ACP streams reach only their own callbacks", async () => {
-  let sessions = 0;
+test("realtime prompts serialize while steering stays on the active voice callback", async () => {
+  let sessions = 0, activePrompts = 0, maxActivePrompts = 0;
   const models = [];
   const child = new EventEmitter();
+  const steers = [];
   child.stdout = new PassThrough();
   child.stdin = { write: (line) => {
     const request = JSON.parse(line);
     if (request.method === "session/set_model") models.push(request.params);
+    if (request.method === "session/prompt" && !request.params.prompt[0].text.startsWith("/steer ")) {
+      activePrompts += 1;
+      maxActivePrompts = Math.max(maxActivePrompts, activePrompts);
+    }
     setTimeout(() => {
-      if (request.method === "session/prompt") child.stdout.write(JSON.stringify({ method: "session/update", params: { sessionId: request.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: request.params.prompt[0].text } } } }) + "\n");
+      if (request.method === "session/prompt") {
+        const text = request.params.prompt[0].text;
+        if (text.startsWith("/steer ")) {
+          steers.push(text);
+          child.stdout.write(JSON.stringify({ method: "session/update", params: { sessionId: request.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `⏩ Steer queued for the active turn: ${text.slice(7)}` } } } }) + "\n");
+        } else child.stdout.write(JSON.stringify({ method: "session/update", params: { sessionId: request.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } }) + "\n");
+      }
+      if (request.method === "session/prompt" && !request.params.prompt[0].text.startsWith("/steer ")) activePrompts -= 1;
       child.stdout.write(JSON.stringify({ id: request.id, result: request.method === "session/new" ? { sessionId: "session-" + ++sessions } : {} }) + "\n");
-    }, request.method === "session/prompt" ? 20 : 0);
+    }, request.method === "session/prompt" && !request.params.prompt[0].text.startsWith("/steer ") ? 20 : 0);
   } };
   const agent = new Agent((_command, args, { env }) => {
     expect(args[0]).toEndWith("hermes_acp.py");
@@ -101,10 +192,16 @@ test("concurrent voice and text ACP streams reach only their own callbacks", asy
     expect(env.WALLIS_BACKGROUND_API_KEY).toBeUndefined();
     return child;
   }, "openrouter:background-model", {}, "high"), voice = [], text = [];
-  await Promise.all([agent.ask("voice reply", (chunk) => voice.push(chunk), "voice"), agent.ask("text reply", (chunk) => text.push(chunk), "text")]);
+  await agent.ready();
+  const replies = Promise.all([agent.ask("voice reply", (chunk) => voice.push(chunk), "voice"), agent.ask("text reply", (chunk) => text.push(chunk), "text")]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(await agent.steer("new voice window", "voice")).toBe(true);
+  await replies;
   expect(voice).toEqual(["voice reply"]);
   expect(text).toEqual(["text reply"]);
+  expect(maxActivePrompts).toBe(1);
   expect(models).toEqual([{ sessionId: "session-1", modelId: "openrouter:background-model" }, { sessionId: "session-2", modelId: "openrouter:background-model" }]);
+  expect(steers).toEqual(["/steer new voice window"]);
   child.stdout.end();
 });
 

@@ -145,10 +145,10 @@ fn default_stt_model() -> String { "base.en".into() }
 fn default_threads() -> u32 { 4 }
 fn default_tts_voice() -> String { "medium".into() }
 fn default_tts_speed() -> f32 { 1.0 }
-fn default_silence_ms() -> u32 { 250 }
+fn default_silence_ms() -> u32 { 350 }
 fn default_background_effort() -> String { "high".into() }
 fn default_participation() -> String { "natural".into() }
-fn default_participation_cooldown() -> u32 { 20 }
+fn default_participation_cooldown() -> u32 { 5 }
 
 impl Default for WallisConfig {
     fn default() -> Self {
@@ -245,8 +245,11 @@ fn background_key_path(app_data: &std::path::Path) -> PathBuf { app_data.join("b
 
 fn load_config_file(path: &std::path::Path) -> Result<WallisConfig, String> {
     if !path.is_file() { return Ok(WallisConfig::default()); }
-    serde_json::from_slice(&std::fs::read(path).map_err(|error| format!("Unable to read Wallis configuration: {error}"))?)
-        .map_err(|error| format!("Wallis configuration is invalid: {error}"))
+    let mut config: WallisConfig = serde_json::from_slice(&std::fs::read(path).map_err(|error| format!("Unable to read Wallis configuration: {error}"))?)
+        .map_err(|error| format!("Wallis configuration is invalid: {error}"))?;
+    if config.silence_ms == 250 { config.silence_ms = default_silence_ms(); }
+    if config.participation_cooldown_secs == 20 { config.participation_cooldown_secs = default_participation_cooldown(); }
+    Ok(config)
 }
 
 fn save_config_file(path: &std::path::Path, config: &WallisConfig) -> Result<(), String> {
@@ -262,8 +265,8 @@ fn save_config_file(path: &std::path::Path, config: &WallisConfig) -> Result<(),
 
 fn validate_allowed_users(value: &str) -> Result<String, String> {
     let value = value.trim();
-    if value.is_empty() || !value.split(',').all(|id| (10..=25).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_digit())) {
-        return Err("Add at least one numeric Discord user ID to the allow-list.".into());
+    if value.is_empty() || !value.split(',').all(|id| id == "*" || (10..=25).contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_digit())) {
+        return Err("Add Discord user IDs or * for anyone to the allow-list.".into());
     }
     Ok(value.to_string())
 }
@@ -398,6 +401,12 @@ fn hermes_config_set(pairs: &[(&str, &str)]) -> Result<(), String> {
     }
     Ok(())
 }
+
+fn inference_settings(config: &WallisConfig) -> [(&str, &str); 4] {
+    [("model.base_url", ""), ("model.provider", &config.provider), ("model.default", &config.model), ("agent.reasoning_effort", &config.reasoning_effort)]
+}
+
+fn sync_inference_config(config: &WallisConfig) -> Result<(), String> { hermes_config_set(&inference_settings(config)) }
 
 fn release_value(key: &str) -> Result<String, String> {
     let output = wsl_output(&["--distribution", DISTRO, "--user", USER, "--", "cat", RELEASE_PATH])?;
@@ -789,7 +798,7 @@ fn apply_wsl_conf() -> Result<(), String> {
 }
 
 /// Starts Wallis' own Discord bot inside the distro. Hermes stays headless: the bot calls it
-/// per utterance, so only one process ever holds the Discord token.
+/// per conversation turn, so only one process ever holds the Discord token.
 fn start_wallis_impl(state: &AppState) -> Result<RuntimeStatus, String> {
     let (_, _) = check_wsl2()?;
     match distro_info()? { None => return Err("Wallis is not imported. Import a verified rootfs archive first.".into()), Some(version) => require_wsl2_version(&version)? }
@@ -802,6 +811,7 @@ fn start_wallis_impl(state: &AppState) -> Result<RuntimeStatus, String> {
     ensure_memory()?;
     ensure_voice(state)?;
     *state.memory_ready.lock().expect("memory state poisoned") = true;
+    sync_inference_config(&state.config.lock().expect("config state poisoned"))?;
     if inspect_bot()? { return Ok(status("running", "Wallis is already running as the non-root wallis user.", true, true)); }
     #[cfg(target_os = "windows")]
     {
@@ -930,9 +940,9 @@ fn save_inference(provider: String, model: String, reasoning_effort: String, api
     } else if provider_key_var(&provider).is_some() && !key_path(&app_data).is_file() {
         return Err("Add the API key for this provider.".into());
     }
-    hermes_config_set(&[("model.provider", &provider), ("model.default", &model), ("agent.reasoning_effort", &reasoning_effort)])?;
     let mut config = state.config.lock().expect("config state poisoned").clone();
     (config.provider, config.model, config.reasoning_effort) = (provider, model, reasoning_effort);
+    sync_inference_config(&config)?;
     save_config_file(&config_path(&app_data), &config)?;
     *state.config.lock().expect("config state poisoned") = config.clone();
     Ok(config)
@@ -1062,11 +1072,17 @@ mod tests {
     #[test]
     fn validates_allow_list_and_round_trips_non_secret_config() {
         assert_eq!(validate_allowed_users("123456789012").unwrap(), "123456789012");
+        assert_eq!(validate_allowed_users("*").unwrap(), "*");
         assert!(validate_allowed_users("all-users").is_err());
         let path = std::env::temp_dir().join(format!("wallis-config-test-{}.json", std::process::id()));
-        let config = WallisConfig { discord_allowed_users: "123456789012".into(), ..WallisConfig::default() };
+        let mut config = WallisConfig { discord_allowed_users: "123456789012".into(), ..WallisConfig::default() };
+        config.silence_ms = 250;
+        config.participation_cooldown_secs = 20;
         save_config_file(&path, &config).unwrap();
-        assert_eq!(load_config_file(&path).unwrap().discord_allowed_users, config.discord_allowed_users);
+        let loaded = load_config_file(&path).unwrap();
+        assert_eq!(loaded.discord_allowed_users, config.discord_allowed_users);
+        assert_eq!(loaded.silence_ms, 350);
+        assert_eq!(loaded.participation_cooldown_secs, 5);
         let _ = std::fs::remove_file(path);
     }
     #[test]
@@ -1080,7 +1096,7 @@ mod tests {
         assert_eq!(migrated.background_reasoning_effort, "high");
         assert_ne!(background_key_path(std::path::Path::new("test")), key_path(std::path::Path::new("test")));
         assert_eq!(migrated.voice_participation, "natural");
-        assert_eq!(migrated.participation_cooldown_secs, 20);
+        assert_eq!(migrated.participation_cooldown_secs, 5);
         config.discord_write_channels = "123456789012".into();
         config.discord_voice_text_channel = "999999999999".into();
         assert!(validate_discord_channels(&mut config).is_err());
@@ -1136,6 +1152,8 @@ mod tests {
         assert!(validate_model("model; rm -rf /").is_err());
         assert!(validate_effort("medium").is_ok());
         assert!(validate_effort("ludicrous").is_err());
+        let config = WallisConfig { provider: "opencode-go".into(), model: "muse-spark-1.3-contributor".into(), reasoning_effort: "minimal".into(), ..WallisConfig::default() };
+        assert_eq!(inference_settings(&config), [("model.base_url", ""), ("model.provider", "opencode-go"), ("model.default", "muse-spark-1.3-contributor"), ("agent.reasoning_effort", "minimal")]);
     }
 }
 

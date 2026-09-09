@@ -93,7 +93,7 @@ app.innerHTML = `
       </form></section>
       <section aria-labelledby="config-title"><h2 id="config-title">Discord</h2><form id="config-form">
         <label for="application-id">Application ID</label><input id="application-id" name="discordApplicationId" inputmode="numeric" autocomplete="off" />
-        <label for="allowed-users">Allowed user IDs</label><input id="allowed-users" name="discordAllowedUsers" inputmode="numeric" placeholder="123456789012345678,198765432109876543" autocomplete="off" required />
+        <label for="allowed-users">Allowed user IDs</label><input id="allowed-users" name="discordAllowedUsers" placeholder="123456789012345678, or * for anyone" autocomplete="off" required />
         <label for="read-channels">Text channels Wallis can read</label><input id="read-channels" name="discordReadChannels" placeholder="Channel IDs, separated by commas" autocomplete="off" aria-describedby="channel-help" />
         <label for="write-channels">Text channels Wallis can write in</label><input id="write-channels" name="discordWriteChannels" placeholder="Channel IDs, separated by commas" autocomplete="off" aria-describedby="channel-help" />
         <p id="channel-help" class="hint">Empty lists disable text access. Enable Developer Mode in Discord, then right-click a channel to copy its ID. Wallis only responds to allowed users. To reply in a channel, include it in both lists.</p>

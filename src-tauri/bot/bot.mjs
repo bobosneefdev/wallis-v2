@@ -16,8 +16,10 @@ import {
   createAudioPlayer,
   createAudioResource,
   EndBehaviorType,
+  entersState,
   joinVoiceChannel,
   StreamType,
+  VoiceConnectionStatus,
 } from "@discordjs/voice";
 import { Client, EmbedBuilder, Events, GatewayIntentBits, MessageFlags, PermissionFlagsBits, REST, Routes, SlashCommandBuilder } from "discord.js";
 import ffmpegPath from "ffmpeg-static";
@@ -29,19 +31,24 @@ const PROFILE = process.env.WALLIS_PROFILE ?? "/home/wallis/.hermes/wallis-profi
 const TOKEN = process.env.DISCORD_BOT_TOKEN;
 const APPLICATION_ID = process.env.DISCORD_APPLICATION_ID;
 const ALLOWED = new Set((process.env.DISCORD_ALLOWED_USERS ?? "").split(",").map((id) => id.trim()).filter(Boolean));
+export const isAllowed = (userId, allowed = ALLOWED) => allowed.has("*") || allowed.has(userId);
 const READ_CHANNELS = new Set((process.env.DISCORD_READ_CHANNELS ?? "").split(",").filter(Boolean));
 const WRITE_CHANNELS = new Set((process.env.DISCORD_WRITE_CHANNELS ?? "").split(",").filter(Boolean));
 const VOICE_TEXT_CHANNEL = process.env.DISCORD_VOICE_TEXT_CHANNEL ?? "";
 const VOICE_PARTICIPATION = process.env.WALLIS_VOICE_PARTICIPATION ?? "natural";
 const TEXT_PARTICIPATION = process.env.WALLIS_TEXT_PARTICIPATION ?? "natural";
-const PARTICIPATION_COOLDOWN = Number(process.env.WALLIS_PARTICIPATION_COOLDOWN_SECS ?? 20) * 1000;
+const PARTICIPATION_COOLDOWN = Number(process.env.WALLIS_PARTICIPATION_COOLDOWN_SECS ?? 5) * 1000;
 const BACKGROUND_MODEL = process.env.WALLIS_BACKGROUND_MODEL ?? "";
 const BACKGROUND_PROVIDER = process.env.WALLIS_BACKGROUND_PROVIDER ?? "";
 const STT_MODEL = join(HOME, "models", `ggml-${process.env.WALLIS_STT_MODEL ?? "base.en"}.bin`);
 const STT_THREADS = process.env.WALLIS_STT_THREADS ?? "4";
 const TTS_MODEL = join(HOME, "models", `en_US-ryan-${process.env.WALLIS_TTS_VOICE ?? "medium"}.onnx`);
 const TTS_SPEED = Number(process.env.WALLIS_TTS_SPEED ?? 1);
-const SILENCE_MS = Number(process.env.WALLIS_SILENCE_MS ?? 250);
+const RESPONSE_GAP_MS = Number(process.env.WALLIS_SILENCE_MS ?? 350);
+const CAPTURE_SILENCE_MS = 150;
+const MAX_TURN_MS = 900;
+const NATURAL_REPLY_TTL_MS = 2500;
+const DIRECT_REPLY_TTL_MS = 6000;
 const PARTIAL_MS = 750;
 const STT_URL = "http://127.0.0.1:8085";
 const TTS_URL = "http://127.0.0.1:8086";
@@ -80,8 +87,7 @@ const failed = (where, error) => {
 saveDiagnostics();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let connection = null;
-let listening = null;
-let voiceActivity = { active: new Set(), revision: 0, lastAudioAt: 0 };
+let voiceActivity = { active: new Set(), lastAudioAt: 0, coordinator: null };
 const player = createAudioPlayer();
 player.on("error", (error) => failed("player", error));
 
@@ -207,15 +213,15 @@ export function toWav(samples) {
 const speech = { queue: [], current: null };
 let synthesis = Promise.resolve();
 let playbackTimer = null;
-const currentVoiceTurn = (turn) => connection && (!turn || (connection === turn.connection && (turn.direct || voiceActivity.revision === turn.revision)));
+const currentVoiceTurn = (turn) => connection && (!turn || (connection === turn.connection && (turn.started || !turn.expiresAt || Date.now() < turn.expiresAt)));
 
 function playNext() {
   clearTimeout(playbackTimer);
   if (speech.current) return;
   while (speech.queue.length && !currentVoiceTurn(speech.queue[0].turn)) speech.queue.shift().resource.playStream.destroy();
   if (!speech.queue.length) return;
-  if (voiceActivity.active.size || Date.now() - voiceActivity.lastAudioAt < SILENCE_MS) {
-    playbackTimer = setTimeout(playNext, 100);
+  if (voiceActivity.active.size && !speech.queue[0].turn?.started) {
+    playbackTimer = setTimeout(playNext, 50);
     return;
   }
   const item = speech.queue.shift();
@@ -227,9 +233,15 @@ function playNext() {
 player.on(AudioPlayerStatus.Idle, () => {
   speech.current = null;
   playNext();
+  if (!speech.current && !speech.queue.length) voiceActivity.coordinator?.resume();
 });
 
 player.on(AudioPlayerStatus.Playing, () => {
+  if (speech.current?.turn) {
+    speech.current.turn.started = true;
+    speech.current.turn.expiresAt = null;
+  }
+  voiceActivity.coordinator?.hold();
   const timing = speech.current?.timing;
   if (!timing || timing.playingAt) return;
   timing.playingAt = performance.now();
@@ -338,6 +350,7 @@ export class Agent {
   #starting = null;
   #sessions = new Map();
   #callbacks = new Map();
+  #work = Promise.resolve();
   constructor(startProcess = spawn, model = "", credentials = {}, effort = process.env.WALLIS_REALTIME_EFFORT || "medium") { this.startProcess = startProcess; this.model = model; this.credentials = credentials; this.effort = effort; }
 
   async #start() {
@@ -378,6 +391,13 @@ export class Agent {
 
   stop() { this.#child?.kill(); }
 
+  async steer(text, key) {
+    const session = this.#sessions.get(key);
+    if (!session || !this.#child || !text.trim()) return false;
+    const result = await this.#request("session/prompt", { sessionId: await session, prompt: [{ type: "text", text: `/steer ${text.trim()}` }] });
+    return result.stopReason !== "refusal";
+  }
+
   async #newSession() {
     const session = await this.#request("session/new", { cwd: "/home/wallis", mcpServers: [] });
     if (this.model) await this.#request("session/set_model", { sessionId: session.sessionId, modelId: this.model });
@@ -403,7 +423,8 @@ export class Agent {
     }
     if (message.method === "session/update") {
       const update = message.params?.update ?? {};
-      if (update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text") this.#callbacks.get(message.params.sessionId)?.(update.content.text);
+      if (update.sessionUpdate === "agent_message_chunk" && update.content?.type === "text"
+        && !/^(?:⏩ Steer queued|No active turn|Usage: \/steer|⚠️ Steer failed)/.test(update.content.text)) this.#callbacks.get(message.params.sessionId)?.(update.content.text);
       return;
     }
     // The agent asks before using a tool. Inside its own distro that gate adds nothing but a
@@ -416,23 +437,28 @@ export class Agent {
     if (message.id !== undefined) this.#send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "not supported" } });
   }
 
-  /** Separate channel histories on one warm ACP process; callers serialize turns per channel. */
-  async ask(text, onChunk, key) {
-    await this.ready();
-    if (!this.#sessions.has(key)) {
-      const session = this.#sessions.size === 0 ? Promise.resolve(this.#session)
-        : this.#newSession();
-      this.#sessions.set(key, session);
-    }
-    let sessionId;
-    try { sessionId = await this.#sessions.get(key); }
-    catch (error) { this.#sessions.delete(key); throw error; }
-    this.#callbacks.set(sessionId, onChunk);
-    try {
-      await this.#request("session/prompt", { sessionId, prompt: [{ type: "text", text }] });
-    } finally {
-      this.#callbacks.delete(sessionId);
-    }
+  /** Separate channel histories, one realtime model request; steering joins the active voice turn. */
+  ask(text, onChunk, key) {
+    const run = async () => {
+      await this.ready();
+      if (!this.#sessions.has(key)) {
+        const session = this.#sessions.size === 0 ? Promise.resolve(this.#session)
+          : this.#newSession();
+        this.#sessions.set(key, session);
+      }
+      let sessionId;
+      try { sessionId = await this.#sessions.get(key); }
+      catch (error) { this.#sessions.delete(key); throw error; }
+      this.#callbacks.set(sessionId, onChunk);
+      try {
+        await this.#request("session/prompt", { sessionId, prompt: [{ type: "text", text }] });
+      } finally {
+        this.#callbacks.delete(sessionId);
+      }
+    };
+    const completion = this.#work.then(run);
+    this.#work = completion.catch(() => {});
+    return completion;
   }
 }
 
@@ -473,6 +499,43 @@ export function shouldConsider(turn, state, now = Date.now()) {
   if (turn.mode === "voice" && turn.speaking) return false;
   if (turn.mode === "voice" && state.lastReplyUser === turn.userId && now - state.lastReplyAt < 20_000) return true;
   return !state.pending && now >= state.nextConsiderAt;
+}
+
+/** One active voice turn and one coalescing inbox: quiet gaps flush promptly, fluid talk cannot starve it. */
+export function createVoiceCoordinator(flush, { quietMs = RESPONSE_GAP_MS, maxMs = MAX_TURN_MS, steer = async () => false,
+  setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  let segments = [], running = false, quiet = false, held = false, quietTimer = null, maxTimer = null;
+  const clear = (timer) => { if (timer) clearTimer(timer); };
+  const drain = async () => {
+    clear(quietTimer);
+    clear(maxTimer);
+    quietTimer = maxTimer = null;
+    if (running || held || !segments.length) return;
+    const batch = segments.sort((a, b) => a.startedAt - b.startedAt);
+    segments = [];
+    running = true;
+    try { await flush(batch); }
+    finally { running = false; if (segments.length) arm(); }
+  };
+  const arm = () => {
+    if (running || held || !segments.length) return;
+    if (!maxTimer) maxTimer = setTimer(() => { maxTimer = null; void drain(); }, maxMs);
+    clear(quietTimer);
+    quietTimer = quiet ? setTimer(() => { quietTimer = null; void drain(); }, quietMs) : null;
+  };
+  const steerOrKeep = async (segment) => {
+    try { if (await steer(segment)) return; } catch (error) { failed("voice steering", error); }
+    segments.push(segment);
+    arm();
+  };
+  return {
+    speaking() { quiet = false; clear(quietTimer); quietTimer = null; },
+    push(segment) { if (running) void steerOrKeep(segment); else { segments.push(segment); arm(); } },
+    roomQuiet() { quiet = true; arm(); },
+    hold() { held = true; clear(quietTimer); clear(maxTimer); quietTimer = maxTimer = null; },
+    resume() { held = false; arm(); },
+    clear() { segments = []; held = false; clear(quietTimer); clear(maxTimer); quietTimer = maxTimer = null; },
+  };
 }
 
 async function writableChannels(guild) {
@@ -538,7 +601,7 @@ export async function dispatchBackground(action, turn, context, speak, worker = 
   const id = action.channelId || turn.defaultChannel;
   const channel = turn.channels.get(id);
   if (!channel || channel.guildId !== turn.guild.id) throw new Error("Choose an allowed text channel for background results");
-  const jobTurn = { ...turn, direct: true, timing: null, defaultChannel: id, channels: new Map([[id, channel]]) };
+  const jobTurn = { ...turn, direct: true, timing: null, expiresAt: null, defaultChannel: id, channels: new Map([[id, channel]]) };
   const origin = `${turn.mode}:${turn.guild.id}:${turn.channelId}`;
   let acknowledged = Promise.resolve();
   const completion = enqueueBackground(async () => {
@@ -567,14 +630,14 @@ export async function dispatchBackground(action, turn, context, speak, worker = 
 
 function respond(turn) {
   const key = `${turn.mode}:${turn.guild.id}:${turn.channelId}`;
+  turn.key = key;
   const state = remember(key, turn.speaker, turn.said);
   turn.speaking = Boolean(speech.current || speech.queue.length);
   if (!shouldConsider(turn, state)) return;
-  state.nextConsiderAt = Date.now() + PARTICIPATION_COOLDOWN;
   const context = state.history.slice(0, -1);
   state.pending += 1;
   state.work = state.work.then(async () => {
-    if (turn.mode === "voice" && (connection !== turn.connection || (!turn.direct && voiceActivity.revision !== turn.revision))) return;
+    if (turn.mode === "voice" && !currentVoiceTurn(turn)) return;
     turn.channels = await writableChannels(turn.guild);
     turn.defaultChannel = turn.mode === "voice" ? VOICE_TEXT_CHANNEL : turn.channelId;
     // Read-only channels supply context but cannot trigger unsolicited cross-channel replies.
@@ -588,7 +651,6 @@ function respond(turn) {
     let buffer = "", error = null, count = 0, delivered = false, delegated = false;
     let delivery = Promise.resolve();
     const speak = async (text) => {
-      while (connection === turn.connection && (voiceActivity.active.size || Date.now() - voiceActivity.lastAudioAt < SILENCE_MS)) await sleep(100);
       if (!currentVoiceTurn(turn)) return false;
       if (turn.timing) turn.timing.firstTextAt ??= performance.now();
       await say(text, turn.timing, turn);
@@ -602,7 +664,7 @@ function respond(turn) {
         delivery = delivery.then(async () => {
           if (error) return;
           if (delegated) return;
-          if (turn.mode === "voice" && (connection !== turn.connection || (!turn.direct && voiceActivity.revision !== turn.revision))) return;
+          if (turn.mode === "voice" && !currentVoiceTurn(turn)) return;
           if (action.type === "delegate") {
             await dispatchBackground(action, turn, context, speak);
             delivered = delegated = true;
@@ -638,17 +700,34 @@ function respond(turn) {
 
 function listen(receiver, guild) {
   const call = connection;
-  const activity = { active: new Set(), revision: 0, lastAudioAt: 0 };
+  const key = `voice:${guild.id}:${call.joinConfig.channelId}`;
+  const activity = { active: new Set(), lastAudioAt: 0, coordinator: null };
   voiceActivity = activity;
   const active = activity.active;
+  const coordinator = createVoiceCoordinator(async (segments) => {
+    if (connection !== call) return;
+    const latest = segments.at(-1);
+    const direct = segments.some((segment) => segment.direct);
+    const target = segments.findLast((segment) => segment.direct) ?? latest;
+    await respond({ mode: "voice", guild, channelId: call.joinConfig.channelId, connection: call,
+      userId: target.userId, speaker: "Conversation", said: segments.map(({ speaker, said }) => `${speaker}: ${said}`).join("\n"),
+      timing: latest.timing, direct, expiresAt: Date.now() + (direct ? DIRECT_REPLY_TTL_MS : NATURAL_REPLY_TTL_MS), participation: VOICE_PARTICIPATION });
+  }, { steer: async ({ speaker, said }) => {
+    const text = `New live voice transcript from ${speaker}: ${said}`;
+    const accepted = await agent.steer(text, key);
+    if (accepted) remember(key, speaker, said);
+    return accepted;
+  } });
+  activity.coordinator = coordinator;
   receiver.speaking.on("start", (userId) => {
     if (connection !== call) return;
-    if (active.has(userId) || !ALLOWED.has(userId)) return;
+    if (active.has(userId) || !isAllowed(userId)) return;
     if (guild.members.cache.get(userId)?.user.bot) return;
     active.add(userId);
-    activity.revision += 1;
+    coordinator.speaking();
+    const startedAt = performance.now();
 
-    const stream = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_MS } });
+    const stream = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: CAPTURE_SILENCE_MS } });
     const decoder = new opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
     const chunks = [];
     // ponytail: rolling batch snapshots reuse today's Whisper server; use native streaming STT
@@ -671,16 +750,20 @@ function listen(receiver, guild) {
     stream.on("error", (error) => log("voice stream error:", error.message));
     stream.on("close", () => {
       clearInterval(partialTimer);
-      if (!stream.readableEnded) { active.delete(userId); rolling.controller?.abort(); decoder.destroy(); }
+      if (!stream.readableEnded) {
+        active.delete(userId);
+        rolling.controller?.abort();
+        decoder.destroy();
+        if (!active.size) coordinator.roomQuiet();
+      }
     });
     stream.on("end", async () => {
       const stoppedAt = performance.now();
-      const revision = activity.revision;
       clearInterval(partialTimer);
       active.delete(userId);
       await new Promise((resolve) => { decoder.once("end", resolve); decoder.end(); });
-      if (chunks.length === 0) return;
       try {
+        if (chunks.length === 0) return;
         const samples = downsample(Buffer.concat(chunks));
         let peak = 0;
         for (const sample of samples) peak = Math.max(peak, Math.abs(sample));
@@ -690,8 +773,9 @@ function listen(receiver, guild) {
         const timing = { stoppedAt, transcribedAt: performance.now(), firstTextAt: null, playingAt: null };
         const speaker = guild.members.cache.get(userId)?.displayName ?? userId;
         log(`${speaker}: ${said}`);
-        await respond({ mode: "voice", guild, channelId: call.joinConfig.channelId, connection: call, revision, userId, speaker, said, timing, direct: NAME.test(said), participation: VOICE_PARTICIPATION });
+        coordinator.push({ userId, speaker, said, text: said, timing, direct: NAME.test(said), startedAt });
       } catch (error) { failed("capture failed", error); }
+      finally { if (!active.size) coordinator.roomQuiet(); }
     });
   });
 }
@@ -703,7 +787,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 
 client.on(Events.Error, (error) => failed("discord", error));
 client.on(Events.MessageCreate, async (message) => {
-  if (!message.guild || message.author.bot || message.webhookId || !ALLOWED.has(message.author.id) || !READ_CHANNELS.has(message.channelId) || !message.content.trim()) return;
+  if (!message.guild || message.author.bot || message.webhookId || !isAllowed(message.author.id) || !READ_CHANNELS.has(message.channelId) || !message.content.trim()) return;
   let direct = message.mentions.users.has(client.user.id) || /\bwallis\b/i.test(message.content);
   if (!direct && message.reference?.messageId && message.reference.channelId === message.channelId) {
     const reference = message.channel.messages.cache.get(message.reference.messageId)
@@ -743,18 +827,43 @@ function profileEmbed() {
   return fields.length ? embed.addFields(fields) : embed;
 }
 
+/** Discord invalidates slash commands unless they are acknowledged within three seconds. */
+export async function joinCall(interaction, channel, connect = joinVoiceChannel, ready = entersState, audioPlayer = player) {
+  await interaction.deferReply();
+  const call = connect({
+    channelId: channel.id,
+    guildId: channel.guild.id,
+    adapterCreator: channel.guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false,
+  });
+  try {
+    call.subscribe(audioPlayer);
+    await ready(call, VoiceConnectionStatus.Ready, 15_000);
+    await interaction.editReply(`Joined ${channel.name}.`);
+    return call;
+  } catch (error) {
+    call.destroy();
+    throw error;
+  }
+}
+
+async function replyToInteraction(interaction, response) {
+  return interaction.deferred || interaction.replied ? interaction.editReply(response) : interaction.reply(response);
+}
+
 client.once(Events.ClientReady, async () => {
   log(`online as ${client.user?.tag}`);
-  try { await registerCommands(); } catch (error) { log("command registration failed:", error.message); }
+  try { await registerCommands(); } catch (error) { failed("command registration", error); }
   // Warm everything now, so the first person to speak does not pay for any of it.
-  try { await startSpeech(); } catch (error) { log(error.message); }
-  try { await agent.ready(); } catch (error) { log("agent unavailable:", error.message); }
+  try { await startSpeech(); } catch (error) { failed("speech startup", error); }
+  try { await agent.ready(); } catch (error) { failed("agent unavailable", error); }
   if (BACKGROUND_MODEL) void backgroundAgent.ready().catch((error) => failed("background agent unavailable", error));
 });
 
-client.on(Events.InteractionCreate, async (interaction) => {
+async function handleInteraction(interaction) {
   if (!interaction.isChatInputCommand()) return;
-  if (!ALLOWED.has(interaction.user.id)) {
+  if (!isAllowed(interaction.user.id)) {
     await interaction.reply({ content: "You are not on this Wallis' allow-list.", flags: MessageFlags.Ephemeral });
     return;
   }
@@ -766,9 +875,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   if (interaction.commandName === "leave") {
+    voiceActivity.coordinator?.clear();
     connection?.destroy();
     connection = null;
-    listening = null;
     speech.queue.length = 0;
     player.stop();
     await interaction.reply("Later.");
@@ -781,28 +890,35 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
   try {
+    voiceActivity.coordinator?.clear();
     connection?.destroy();
+    connection = null;
     speech.queue.length = 0;
     player.stop();
-    connection = joinVoiceChannel({
-      channelId: channel.id,
-      guildId: channel.guild.id,
-      adapterCreator: channel.guild.voiceAdapterCreator,
-      selfDeaf: false,
-      selfMute: false,
-    });
-    connection.subscribe(player);
-    if (listening !== connection) {
-      listen(connection.receiver, channel.guild);
-      listening = connection;
+    connection = await joinCall(interaction, channel);
+    connection.on("error", (error) => failed("voice connection", error));
+    listen(connection.receiver, channel.guild);
+    try {
+      await startSpeech();
+      await say(GREETING);
+    } catch (error) {
+      failed("speech startup", error);
+      await interaction.editReply(`Joined ${channel.name}, but voice services are unavailable. Check the Wallis app.`);
     }
-    await interaction.reply(`Joined ${channel.name}.`);
-    await startSpeech();
-    await say(GREETING);
   } catch (error) {
-    log("join failed:", error.message);
-    if (!interaction.replied) await interaction.reply({ content: "Could not join that channel.", flags: MessageFlags.Ephemeral });
+    failed("join failed", error);
+    connection?.destroy();
+    connection = null;
+    await replyToInteraction(interaction, "Could not join that channel. Check the Wallis app for the error.");
   }
+}
+
+client.on(Events.InteractionCreate, (interaction) => {
+  void handleInteraction(interaction).catch(async (error) => {
+    failed("interaction", error);
+    await replyToInteraction(interaction, "That command failed. Check the Wallis app for the error.")
+      .catch((replyError) => failed("interaction error reply", replyError));
+  });
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {

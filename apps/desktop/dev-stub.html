@@ -3,7 +3,7 @@
 <body><main id="app"></main>
 <script>
 const profile = { name: "Wallis Okonkwo", age: "31", pronouns: "he/him", location: "Lisbon, Portugal", occupation: "Sound engineer", tagline: "Records rain for a living", bio: "Short bio.", interests: ["field recording", "chess"], lookingFor: "Odd conversations", funFact: "Owns 40 microphones" };
-const config = { discordApplicationId: "123456789012345678", discordAllowedUsers: "123456789012345678", discordReadChannels: "", discordWriteChannels: "", discordVoiceTextChannel: "", voiceParticipation: "natural", textParticipation: "natural", participationCooldownSecs: 20, memoryProvider: "mnemosyne", autoStart: false, rootfsArchive: "C:\\x.tar", rootfsSha256: "a".repeat(64), distroRoot: "", provider: "openrouter", model: "anthropic/claude-opus-5", reasoningEffort: "medium", onboarded: true, sttModel: "base.en", sttThreads: 4, ttsVoice: "medium", ttsSpeed: 1, silenceMs: 250 };
+const config = { discordApplicationId: "123456789012345678", discordAllowedUsers: "123456789012345678", discordReadChannels: "", discordWriteChannels: "", discordVoiceTextChannel: "", voiceParticipation: "natural", textParticipation: "natural", participationCooldownSecs: 5, memoryProvider: "mnemosyne", autoStart: false, rootfsArchive: "C:\\x.tar", rootfsSha256: "a".repeat(64), distroRoot: "", provider: "openrouter", model: "anthropic/claude-opus-5", reasoningEffort: "medium", onboarded: true, sttModel: "base.en", sttThreads: 4, ttsVoice: "medium", ttsSpeed: 1, silenceMs: 350 };
 const replies = {
   get_setup_status: { wsl2Available: true, wslVersion: "2.3.24", message: "WSL2 is available." },
   get_runtime_status: { state: "running", message: "Wallis is online.", discordReady: true, memoryReady: true },
