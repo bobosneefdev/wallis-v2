@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use wallis_core::agent::{Access, Agent};
 use wallis_core::host::{Discord, Host};
 use wallis_core::jobs::Jobs;
-use wallis_core::participation::{names_wallis, should_consider, Mode, Participation, State, Turn};
+use wallis_core::participation::{should_consider, sounds_like_wallis, Mode, Participation, State, Turn};
 use wallis_core::{pi_config, prompts};
 use wallis_core::role::{Role, RoleConfig};
 use wallis_core::stats::Stats;
@@ -55,7 +55,7 @@ impl Discord for WorkerSink<'_> {
 /// What the realtime agent is told for one event.
 pub fn turn_prompt(mode: Mode, channel: u64, speaker: &str, said: &str) -> String {
     match mode {
-        Mode::Voice => format!("[voice call] {speaker}: {said}"),
+        Mode::Voice => format!("[voice transcript] {speaker}: {said}"),
         Mode::Text => format!("[text channel {channel}] {speaker}: {said}"),
     }
 }
@@ -113,7 +113,10 @@ impl Brain {
                         // Talking over Wallis cuts him off, then what they said steers the turn already underway.
                         out.stop_speaking(guild);
                         match speech::transcribe(&pcm) {
-                            Ok(said) if !said.is_empty() => { stats.steered(); steers.push(turn_prompt(Mode::Voice, 0, &speaker, &said)); let _ = user; }
+                            Ok(said) if !said.is_empty() => {
+                                let text = turn_prompt(Mode::Voice, 0, &speaker, &said);
+                                stats.steered(); stats.audit("heard", &format!("{speaker}: {said}")); stats.audit("steer", &text); steers.push(text); let _ = user;
+                            }
                             Ok(_) => {}
                             Err(error) => eprintln!("wallis: {error}"),
                         }
@@ -123,7 +126,12 @@ impl Brain {
             }
             steers
         };
-        let result = agent.turn_steered(&prompt, Duration::from_secs(60), &mut steer, &mut |call| host.handle(call), &mut |_| {});
+        self.stats.audit("prompt", &prompt);
+        let audit = self.stats.clone();
+        let result = agent.turn_steered(&prompt, Duration::from_secs(60), &mut steer, &mut |call| {
+            if call.tool == "delegate" { audit.audit("delegate", call.args.get("task").and_then(serde_json::Value::as_str).unwrap_or("")); }
+            host.handle(call)
+        }, &mut |_| {});
         let spoke = !host.skipped;
         drop(host);
         stats.turn(started.elapsed().as_millis() as u64, result.is_ok());
@@ -142,12 +150,14 @@ impl Brain {
     fn handle(&mut self, event: Incoming, queue: &mut Queue) {
         match event {
             Incoming::Text { guild, channel, user, speaker, said, direct, .. } => {
+                self.stats.audit("typed", &format!("{speaker}: {said}"));
                 if self.consider(Mode::Text, user, direct) { self.respond(guild, user, turn_prompt(Mode::Text, channel, &speaker, &said), queue); }
             }
             Incoming::Voice { guild, channel, user, speaker, pcm } => {
                 self.out.stop_speaking(guild);
                 let said = match speech::transcribe(&pcm) { Ok(text) if !text.is_empty() => text, Ok(_) => return, Err(error) => return eprintln!("wallis: {error}") };
-                if self.consider(Mode::Voice, user, names_wallis(&said)) { self.respond(guild, user, turn_prompt(Mode::Voice, channel, &speaker, &said), queue); }
+                self.stats.audit("heard", &format!("{speaker}: {said}"));
+                if self.consider(Mode::Voice, user, sounds_like_wallis(&said)) { self.respond(guild, user, turn_prompt(Mode::Voice, channel, &speaker, &said), queue); }
             }
             Incoming::Joined { guild, .. } => self.respond(guild, 0, "[system] You just joined the voice call. Greet everyone with one short line.".into(), queue),
             Incoming::Left { guild } => self.out.stop_speaking(guild),
@@ -217,7 +227,7 @@ mod tests {
 
     #[test]
     fn prompts_tell_the_agent_where_the_message_came_from() {
-        assert_eq!(turn_prompt(Mode::Voice, 1, "Jake", "hi"), "[voice call] Jake: hi");
+        assert_eq!(turn_prompt(Mode::Voice, 1, "Jake", "hi"), "[voice transcript] Jake: hi");
         assert_eq!(turn_prompt(Mode::Text, 42, "Jake", "hi"), "[text channel 42] Jake: hi");
     }
 }

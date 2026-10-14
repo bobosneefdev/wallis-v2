@@ -44,6 +44,8 @@ export type RoleConfig = { provider: string; model: string; effort: string; fast
 /** The OpenAI-compatible endpoint. `models` and per-model `efforts` are whatever the provider's /models exposed (missing: use text inputs). */
 export type Provider = { baseUrl: string; models: string[]; efforts: Record<string, string[]>; hasKey: boolean };
 
+export type AuditEvent = { atMs: number; kind: "heard" | "typed" | "prompt" | "steer" | "delegate"; text: string };
+
 export type Stats = { turns: number; steers: number; errors: number; lastTurnMs: number; averageTurnMs: number };
 
 export type Roles = { realtime: RoleConfig; worker: RoleConfig };
@@ -59,6 +61,7 @@ type Commands = {
   save_provider: Provider;
   refresh_provider_models: Provider;
   get_stats: Stats | null;
+  get_audit_log: AuditEvent[];
   get_roles: Roles;
   save_roles: Roles;
   get_runtime_status: RuntimeStatus;

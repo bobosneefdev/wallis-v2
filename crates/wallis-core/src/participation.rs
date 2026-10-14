@@ -21,9 +21,32 @@ pub fn should_consider(turn: &Turn, state: &State, now_ms: u64) -> bool {
     state.pending == 0 && now_ms >= state.next_consider_at_ms
 }
 
-/// True when the text addresses Wallis by name (wallis, wallace, wally, wallie as a whole word).
+/// American Soundex: first letter plus three consonant-class digits, so words that sound alike share a code.
+fn soundex(word: &str) -> Option<String> {
+    let class = |c: char| match c { 'b' | 'f' | 'p' | 'v' => '1', 'c' | 'g' | 'j' | 'k' | 'q' | 's' | 'x' | 'z' => '2', 'd' | 't' => '3', 'l' => '4', 'm' | 'n' => '5', 'r' => '6', 'h' | 'w' => '-', _ => '0' };
+    let mut letters = word.chars().filter(char::is_ascii_alphabetic).map(|c| c.to_ascii_lowercase());
+    let first = letters.next()?;
+    let (mut code, mut last) = (first.to_ascii_uppercase().to_string(), class(first));
+    for c in letters {
+        let digit = class(c);
+        if digit == '-' { continue; }
+        if digit != '0' && digit != last { code.push(digit); }
+        last = digit;
+    }
+    Some(format!("{code:0<4}").chars().take(4).collect())
+}
+
+/// True when typed text names Wallis as a whole word, under any common spelling.
 pub fn names_wallis(text: &str) -> bool {
     text.split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|word| ["wallis", "wallace", "wally", "wallie"].contains(&word.to_lowercase().as_str()))
+}
+
+/// True when a speech transcript may name Wallis: a word, or a word split before a vowel ("wall is", "wall ace"), sounding like "Wallis".
+/// ponytail: deliberately over-matches (walls, wells); the realtime agent reads the transcript by sound and calls `skip` when it was not meant.
+pub fn sounds_like_wallis(text: &str) -> bool {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let target = soundex("wallis");
+    words.iter().map(|word| word.to_string()).chain(words.windows(2).filter(|pair| pair[1].starts_with(['a', 'e', 'i', 'o', 'u'])).map(|pair| pair.concat())).any(|word| soundex(&word) == target) || names_wallis(text)
 }
 
 #[cfg(test)]
@@ -49,5 +72,12 @@ mod tests {
     fn recognises_the_name_only_as_a_whole_word() {
         assert!(names_wallis("hey Wallis, what's up") && names_wallis("thanks wally!") && names_wallis("WALLACE"));
         assert!(!names_wallis("the wallisford road") && !names_wallis("small walls"));
+    }
+
+    #[test]
+    fn transcripts_match_the_name_by_sound() {
+        assert_eq!((soundex("Wallis"), soundex("Robert"), soundex("Ashcraft")), (Some("W420".into()), Some("R163".into()), Some("A261".into())));
+        assert!(sounds_like_wallis("hey wallace") && sounds_like_wallis("Wallis's turn") && sounds_like_wallis("hey wall is there") && sounds_like_wallis("ok wally"));
+        assert!(!sounds_like_wallis("I will go") && !sounds_like_wallis("what is that"));
     }
 }

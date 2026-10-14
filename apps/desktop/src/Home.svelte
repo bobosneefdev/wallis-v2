@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke, type Job, type RuntimeStatus, type Stats, type UpdateCheck } from "./invoke";
+  import { invoke, type AuditEvent, type Job, type RuntimeStatus, type Stats, type UpdateCheck } from "./invoke";
 
   let { runtime = $bindable(), hasProfile, hasToken }: { runtime: RuntimeStatus; hasProfile: boolean; hasToken: boolean } = $props();
 
@@ -8,6 +8,8 @@
 
   let jobs = $state<Job[]>([]);
   let stats = $state<Stats | null>(null);
+  let audit = $state<AuditEvent[]>([]);
+  const auditLabel = { heard: "Heard", typed: "Typed", prompt: "Prompt", steer: "Steer", delegate: "Delegated" };
   let progress = $state("");
   let busy = $state(false);
   let note = $state("");
@@ -15,7 +17,7 @@
 
   async function poll() {
     runtime = await invoke("get_runtime_status");
-    [jobs, stats] = await Promise.all([invoke("get_jobs").catch(() => []), invoke("get_stats").catch(() => null)]);
+    [jobs, stats, audit] = await Promise.all([invoke("get_jobs").catch(() => []), invoke("get_stats").catch(() => null), invoke("get_audit_log").catch(() => [])]);
   }
 
   /** Runs a long command while polling Rust for the current install step. */
@@ -58,6 +60,17 @@
       <div class="field"><dt>Failed turns</dt><dd>{stats.errors}</dd></div>
     </dl>
   {:else}<p class="hint">Stats appear while Wallis is online.</p>{/if}
+</section>
+
+<section aria-labelledby="audit-title">
+  <h2 id="audit-title">Audit Log</h2>
+  {#if audit.length}
+    <ol class="jobs audit">
+      {#each audit.toReversed() as event}
+        <li><time>{new Date(event.atMs).toLocaleTimeString()}</time> <span class="pill" class:ok={event.kind === "delegate"}>{auditLabel[event.kind]}</span> {event.text}</li>
+      {/each}
+    </ol>
+  {:else}<p class="hint">The latest 256 messages, agent prompts, steers and delegations appear here while Wallis is online.</p>{/if}
 </section>
 
 {#if jobs.length}
