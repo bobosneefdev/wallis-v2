@@ -120,6 +120,30 @@ pub fn merge_auth(existing: &str, credentials: &Credentials) -> Result<String, S
     serde_json::to_string_pretty(&root).map_err(|error| error.to_string())
 }
 
+/// Parses the stored credential back out of Pi's `auth.json`.
+pub fn load(auth_json: &str) -> Option<Credentials> {
+    let entry = serde_json::from_str::<Value>(auth_json).ok()?.get("openai-codex")?.clone();
+    if entry["type"] != "oauth" { return None; }
+    Some(Credentials { access: entry["access"].as_str()?.into(), refresh: entry["refresh"].as_str()?.into(), expires_ms: entry["expires"].as_u64()?, account_id: entry["accountId"].as_str()?.into() })
+}
+
+/// Writes the credential into `<dir>/auth.json`, creating the directory and keeping other providers' keys.
+pub fn store(dir: &std::path::Path, credentials: &Credentials) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("Unable to create {}: {error}", dir.display()))?;
+    let path = dir.join("auth.json");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    std::fs::write(&path, merge_auth(&existing, credentials)?).map_err(|error| format!("Unable to write {}: {error}", path.display()))
+}
+
+/// Returns usable credentials from `<dir>/auth.json`, refreshing (and persisting) them when they expire within a minute.
+pub fn fresh(dir: &std::path::Path) -> Result<Credentials, String> {
+    let stored = std::fs::read_to_string(dir.join("auth.json")).ok().and_then(|text| load(&text)).ok_or("Not signed in to ChatGPT.")?;
+    if stored.expires_ms > now_ms() + 60_000 { return Ok(stored); }
+    let renewed = refresh(&stored)?;
+    store(dir, &renewed)?;
+    Ok(renewed)
+}
+
 /// Reads the signed-in account from Pi's `auth.json`, if any (used to show "Signed in" in Settings).
 pub fn signed_in(auth_json: &str) -> bool {
     serde_json::from_str::<Value>(auth_json).ok().and_then(|root| root.pointer("/openai-codex/type").and_then(Value::as_str).map(|kind| kind == "oauth")).unwrap_or(false)
@@ -169,6 +193,15 @@ mod tests {
         assert_eq!(merged["openrouter"]["key"], "k");
         assert_eq!(merged["openai-codex"]["type"], "oauth");
         assert_eq!(merged["openai-codex"]["accountId"], "acct-1");
+        assert_eq!(load(&merged.to_string()), Some(credentials.clone()));
+        assert!(load(r#"{"openai-codex":{"type":"api_key"}}"#).is_none());
+        let dir = std::env::temp_dir().join(format!("wallis-auth-{}", std::process::id()));
+        store(&dir, &credentials).unwrap();
+        assert_eq!(load(&std::fs::read_to_string(dir.join("auth.json")).unwrap()), Some(credentials.clone()));
+        let far = Credentials { expires_ms: now_ms() + 3_600_000, ..credentials.clone() };
+        store(&dir, &far).unwrap();
+        assert_eq!(fresh(&dir).unwrap(), far, "unexpired credentials must not hit the network");
+        std::fs::remove_dir_all(&dir).ok();
         assert!(signed_in(&merged.to_string()) && !signed_in("{}") && !signed_in("garbage"));
     }
 }
