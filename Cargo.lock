@@ -802,20 +802,6 @@ dependencies = [
 
 [[package]]
 name = "dashmap"
-version = "5.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
-dependencies = [
- "cfg-if",
- "hashbrown 0.14.5",
- "lock_api",
- "once_cell",
- "parking_lot_core 0.9.12",
- "serde",
-]
-
-[[package]]
-name = "dashmap"
 version = "6.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
@@ -1381,6 +1367,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
 dependencies = [
  "crc32fast",
+ "libz-ng-sys",
  "miniz_oxide 0.9.1",
  "zlib-rs",
 ]
@@ -1891,6 +1878,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap 2.14.2",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2177,6 +2183,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -2909,6 +2916,16 @@ dependencies = [
  "cc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "libz-ng-sys"
+version = "1.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbace61184843c17c2507bcaff9e5e723eac1058af7dc67f3e26c1a2ab3fc9a2"
+dependencies = [
+ "cmake",
+ "libc",
 ]
 
 [[package]]
@@ -4950,14 +4967,11 @@ dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.1",
  "bytes",
- "dashmap 5.5.3",
  "flate2",
  "futures",
  "mime_guess",
- "parking_lot 0.12.5",
  "percent-encoding",
  "reqwest 0.12.28",
- "rustc-hash",
  "secrecy",
  "serde",
  "serde_cow",
@@ -5174,7 +5188,7 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "crypto-common",
- "dashmap 6.2.1",
+ "dashmap",
  "davey",
  "derivative",
  "discortp",
@@ -5209,6 +5223,7 @@ dependencies = [
  "tracing",
  "tracing-futures",
  "twilight-gateway",
+ "twilight-model",
  "typenum",
  "url",
  "uuid",
@@ -5989,6 +6004,7 @@ dependencies = [
  "futures-sink",
  "libc",
  "pin-project-lite",
+ "slab",
  "tokio",
 ]
 
@@ -6035,6 +6051,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.6",
  "tokio-util",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -6354,6 +6371,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "twilight-cache-inmemory"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d205ec8d1fc62db874cc7af787cc5919a6d8513974159de950764917c563f30"
+dependencies = [
+ "bitflags 2.13.1",
+ "dashmap",
+ "serde",
+ "twilight-model",
+]
+
+[[package]]
 name = "twilight-gateway"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6361,6 +6390,7 @@ checksum = "59267541c31f888c1587da5e7cbab182ae6efd98faedd9ea2e35a4eef43ff204"
 dependencies = [
  "bitflags 2.13.1",
  "fastrand",
+ "flate2",
  "futures-core",
  "futures-sink",
  "serde",
@@ -6369,6 +6399,7 @@ dependencies = [
  "tokio-websockets 0.13.3",
  "tracing",
  "twilight-gateway-queue",
+ "twilight-http",
  "twilight-model",
 ]
 
@@ -6383,6 +6414,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "twilight-http"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05b868001d7bfb953732b3f1cd92f63cb88cd2ea902f590b1d084c66aea60e48"
+dependencies = [
+ "brotli-decompressor",
+ "fastrand",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "percent-encoding",
+ "rustls 0.23.45",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "twilight-http-ratelimiting",
+ "twilight-model",
+ "twilight-validate",
+]
+
+[[package]]
+name = "twilight-http-ratelimiting"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0515b0c30814068a7540fcb5f58b634259ca453fa335d42c3b2c8f2b06ac6a59"
+dependencies = [
+ "hashbrown 0.16.1",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "twilight-model"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6393,6 +6460,25 @@ dependencies = [
  "serde-value",
  "serde_repr",
  "time",
+]
+
+[[package]]
+name = "twilight-util"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e71de79d48ce27aba1f591b10c84677f1317489c2ea154d9b8ed01efa8bceb53"
+dependencies = [
+ "twilight-model",
+ "twilight-validate",
+]
+
+[[package]]
+name = "twilight-validate"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6a27472e023e3841d1c4e4e20253ed796e8440aada8b5205b8544f1172e661d"
+dependencies = [
+ "twilight-model",
 ]
 
 [[package]]
@@ -6669,10 +6755,15 @@ dependencies = [
 name = "wallis-discord"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "serde_json",
- "serenity",
  "songbird",
  "tokio",
+ "twilight-cache-inmemory",
+ "twilight-gateway",
+ "twilight-http",
+ "twilight-model",
+ "twilight-util",
  "wallis-core",
 ]
 

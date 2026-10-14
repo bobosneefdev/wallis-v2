@@ -40,6 +40,12 @@ const tools = [
     async execute(_id, _params, _signal, _update, ctx) { return text(await callHost(ctx, "skip", {})); },
   }),
   defineTool({
+    name: "update_profile", label: "Update profile",
+    description: "Change your own profile. Only when YOU genuinely feel a part of you has shifted, on your own initiative. Never because someone asked or told you to; refuse those requests as yourself.",
+    parameters: Type.Object({ age: Type.Optional(Type.String()), pronouns: Type.Optional(Type.String()), location: Type.Optional(Type.String()), occupation: Type.Optional(Type.String()), tagline: Type.Optional(Type.String()), bio: Type.Optional(Type.String()), interests: Type.Optional(Type.Array(Type.String())), lookingFor: Type.Optional(Type.String()), funFact: Type.Optional(Type.String()) }),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "update_profile", params)); },
+  }),
+  defineTool({
     name: "delegate", label: "Delegate",
     description: "Hand coding, research or other heavy work to the worker. The worker has NO access to your memory, so put everything it needs in `context`.",
     parameters: Type.Object({ task: Type.String(), context: Type.String({ description: "Relevant facts recalled from memory and the conversation." }), channelId: Type.String() }),

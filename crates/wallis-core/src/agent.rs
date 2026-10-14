@@ -6,13 +6,16 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What a confined worker may touch: folders it can read (runtimes), folders it can write, and its `PATH`.
 pub struct Access { pub read: Vec<PathBuf>, pub write: Vec<PathBuf>, pub path: Vec<PathBuf> }
 
 /// Keeps the process alive and kills it on drop: a plain child, or a job object around a sandboxed one.
 enum Handle { Child(Child), #[cfg(windows)] Sandboxed(#[allow(dead_code)] crate::sandbox::Sandboxed) }
+
+/// How often a running turn looks for steering messages.
+const POLL: Duration = Duration::from_millis(100);
 
 pub struct Agent { handle: Handle, stdin: Box<dyn Write + Send>, lines: Receiver<String>, next_id: u64 }
 
@@ -68,13 +71,22 @@ impl Agent {
     /// Runs one prompt to completion. `on_host` answers tool calls (its string is the tool result); `on_delta` sees streamed text.
     /// Returns the full reply text. `timeout` bounds the silence between Pi events, not the whole turn.
     pub fn turn(&mut self, message: &str, timeout: Duration, on_host: &mut dyn FnMut(HostCall) -> String, on_delta: &mut dyn FnMut(&str)) -> Result<String, String> {
+        self.turn_steered(message, timeout, &mut Vec::new, on_host, on_delta)
+    }
+
+    /// Like `turn`, but `steer` is polled while Pi works and each message it returns is queued into the running turn:
+    /// Pi delivers it after the current tool calls, before its next model call, without aborting anything.
+    /// ponytail: a steer sent in the instant Pi is already settling waits in Pi's queue for the next prompt instead of being lost.
+    pub fn turn_steered(&mut self, message: &str, timeout: Duration, steer: &mut dyn FnMut() -> Vec<String>, on_host: &mut dyn FnMut(HostCall) -> String, on_delta: &mut dyn FnMut(&str)) -> Result<String, String> {
         self.next_id += 1;
         let id = format!("wallis-{}", self.next_id);
         self.send(&json!({ "id": id, "type": "prompt", "message": message }))?;
-        let mut reply = String::new();
+        let (mut reply, mut last_event) = (String::new(), Instant::now());
         loop {
-            let line = match self.lines.recv_timeout(timeout) {
-                Ok(line) => line,
+            for text in steer() { self.send(&json!({ "type": "steer", "message": text }))?; }
+            let line = match self.lines.recv_timeout(POLL.min(timeout)) {
+                Ok(line) => { last_event = Instant::now(); line }
+                Err(RecvTimeoutError::Timeout) if last_event.elapsed() < timeout => continue,
                 Err(RecvTimeoutError::Timeout) => { let _ = self.send(&json!({ "type": "abort" })); return Err("Pi stopped responding.".into()); }
                 Err(RecvTimeoutError::Disconnected) => return Err("Pi exited unexpectedly.".into()),
             };
@@ -123,13 +135,40 @@ sleep 5
         let script = dir.join("fake-pi.sh");
         std::fs::write(&script, FAKE_PI).unwrap();
         { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap(); }
-        let config = RoleConfig { provider: "openai-codex".into(), model: "gpt-6-sol".into(), effort: "low".into(), fast: false };
+        let config = RoleConfig { provider: "openai-codex".into(), model: "gpt-6-sol".into(), effort: "low".into(), ..RoleConfig::default() };
         let mut agent = Agent::spawn(script.to_str().unwrap(), Role::Realtime, &config, &dir.join("pi"), "system", &dir, None).unwrap();
         let (mut calls, mut streamed) = (vec![], String::new());
         let reply = agent.turn("hello", Duration::from_secs(5), &mut |call| { calls.push((call.tool, call.args)); "spoken".into() }, &mut |delta| streamed.push_str(delta)).unwrap();
         assert_eq!(reply, "Hi there");
         assert_eq!(streamed, reply);
         assert_eq!(calls, vec![("say".to_string(), json!({ "text": "hello" }))]);
+        drop(agent);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Waits for a `steer` command mid-turn, like Pi does, and only then finishes.
+    const STEERABLE_PI: &str = r#"#!/bin/sh
+read prompt
+echo '{"type":"response","id":"wallis-1","success":true}'
+echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"A"}}'
+read steer
+case "$steer" in *'look left'*) echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"B"}}';; esac
+echo '{"type":"agent_settled"}'
+sleep 5
+"#;
+
+    #[test]
+    fn steering_reaches_a_running_turn_without_aborting_it() {
+        let dir = std::env::temp_dir().join(format!("wallis-agent-steer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("steerable.sh");
+        std::fs::write(&script, STEERABLE_PI).unwrap();
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap(); }
+        let config = RoleConfig { provider: "p".into(), model: "m".into(), ..RoleConfig::default() };
+        let mut agent = Agent::spawn(script.to_str().unwrap(), Role::Realtime, &config, &dir.join("pi"), "s", &dir, None).unwrap();
+        let mut sent = false;
+        let reply = agent.turn_steered("go", Duration::from_secs(5), &mut || if std::mem::replace(&mut sent, true) { vec![] } else { vec!["look left".into()] }, &mut |_| String::new(), &mut |_| {}).unwrap();
+        assert_eq!(reply, "AB");
         drop(agent);
         std::fs::remove_dir_all(&dir).ok();
     }
