@@ -61,7 +61,10 @@ pub fn turn_prompt(mode: Mode, channel: u64, speaker: &str, said: &str) -> Strin
 }
 
 /// The realtime Pi: memory (Mnemosyne over MCP) plus Wallis' own tools, no shell or files.
-pub fn spawn_realtime(config: &BotConfig) -> Result<Agent, String> {
+pub fn spawn_realtime(config: &BotConfig) -> Result<Agent, String> { spawn_realtime_with(config, &prompts::realtime_prompt(&config.persona)) }
+
+/// The same Pi, but with a caller-supplied system prompt (used by the one-off profile generator).
+pub fn spawn_realtime_with(config: &BotConfig, system_prompt: &str) -> Result<Agent, String> {
     let dir = config.data_dir.join("pi").join("realtime");
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let mcp = prompts::realtime_mcp(&config.python, &config.data_dir.join("memory").to_string_lossy());
@@ -69,7 +72,7 @@ pub fn spawn_realtime(config: &BotConfig) -> Result<Agent, String> {
     pi_config::write_settings(&dir, &config.realtime.packages, serde_json::json!({}))?;
     let cwd = config.data_dir.join("realtime-cwd");
     std::fs::create_dir_all(&cwd).map_err(|error| error.to_string())?;
-    Agent::spawn(&config.pi_program, Role::Realtime, &config.realtime, &dir, &prompts::realtime_prompt(&config.persona), &cwd, None)
+    Agent::spawn(&config.pi_program, Role::Realtime, &config.realtime, &dir, system_prompt, &cwd, None)
 }
 
 struct Brain { config: BotConfig, out: Out, jobs: Jobs, stats: Arc<Stats>, agent: Option<Agent>, last_reply_at: Option<Instant>, last_reply_user: Option<u64>, next_consider_at: Instant, started: Instant }
