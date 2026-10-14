@@ -99,6 +99,15 @@ pub fn exchange(pending: &Pending, code: &str) -> Result<Credentials, String> {
     credentials_from(response, now_ms())
 }
 
+/// Trades a refresh token for new credentials (used before catalog fetches when the access token is stale).
+pub fn refresh(credentials: &Credentials) -> Result<Credentials, String> {
+    let response: TokenResponse = ureq::post(TOKEN_URL)
+        .send_form([("grant_type", "refresh_token"), ("client_id", CLIENT_ID), ("refresh_token", &credentials.refresh)])
+        .map_err(|error| format!("ChatGPT sign-in expired, sign in again: {error}"))?
+        .body_mut().read_json().map_err(|error| format!("ChatGPT returned an unreadable token: {error}"))?;
+    credentials_from(response, now_ms())
+}
+
 /// The `auth.json` object Pi reads for the `openai-codex` provider.
 pub fn auth_json(credentials: &Credentials) -> Value {
     json!({ "openai-codex": { "type": "oauth", "access": credentials.access, "refresh": credentials.refresh, "expires": credentials.expires_ms, "accountId": credentials.account_id } })
