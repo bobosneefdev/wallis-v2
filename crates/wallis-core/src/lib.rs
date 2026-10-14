@@ -4,4 +4,5 @@ pub mod catalog;
 pub mod codex_auth;
 pub mod jobs;
 pub mod pi;
+pub mod prompts;
 pub mod role;
