@@ -11,7 +11,7 @@ Tauri app (Rust)
 ├── wallis-discord   serenity + songbird: gateway, slash commands, text, voice receive/playback
 ├── wallis-core      Pi RPC, jobs, speech, provisioning, prompts (pure logic, tested on Linux)
 ├── Pi (realtime)    conversation + long-term memory (Mnemosyne over MCP); no shell or file tools
-├── Pi (worker)      coding/research in a sandboxed scratch folder; NO memory
+├── Pi (worker)      coding/research in a scratch folder; NO memory
 ├── whisper-server   native speech-to-text (whisper.cpp)
 └── Piper server     native text-to-speech (embedded Python venv)
 ```
@@ -33,7 +33,7 @@ Enter comma-separated channel IDs for reading and writing in the app. Empty list
 
 ## Security model
 
-The realtime agent is not sandboxed but has no shell or file tools. The worker runs in a scratch folder with Pi's coding tools; the AppContainer + Job Object sandbox that confines it is below VM-grade isolation and should not be treated as a boundary against hostile code.
+The realtime agent has no shell or file tools. **The worker is not sandboxed yet**: it runs as the current user with Pi's coding tools in a scratch folder. The planned AppContainer + Job Object sandbox will be below VM-grade isolation and must not be treated as a boundary against hostile code.
 
 ## Stack
 
