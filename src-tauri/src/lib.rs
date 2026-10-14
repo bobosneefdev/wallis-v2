@@ -54,7 +54,7 @@ struct WallisConfig {
 
 impl Default for WallisConfig {
     fn default() -> Self {
-        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), discord_read_channels: String::new(), discord_write_channels: String::new(), discord_voice_text_channel: String::new(), voice_participation: "natural".into(), text_participation: "natural".into(), participation_cooldown_secs: 5, auto_start: false, onboarded: false, stt_model: "base.en".into(), stt_threads: 4, tts_voice: "medium".into(), tts_speed: 1.0, silence_ms: 350 }
+        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), discord_read_channels: String::new(), discord_write_channels: String::new(), discord_voice_text_channel: String::new(), voice_participation: "natural".into(), text_participation: "natural".into(), participation_cooldown_secs: 5, auto_start: false, onboarded: false, stt_model: "parakeet-110m-int8".into(), stt_threads: 4, tts_voice: "alba".into(), tts_speed: 1.0, silence_ms: 350 }
     }
 }
 
@@ -87,8 +87,11 @@ fn token_path(app_data: &Path) -> PathBuf { app_data.join(TOKEN_FILE) }
 
 fn load_config_file(path: &Path) -> Result<WallisConfig, String> {
     if !path.is_file() { return Ok(WallisConfig::default()); }
-    serde_json::from_slice(&std::fs::read(path).map_err(|error| format!("Unable to read Wallis configuration: {error}"))?)
-        .map_err(|error| format!("Wallis configuration is invalid: {error}"))
+    let mut config: WallisConfig = serde_json::from_slice(&std::fs::read(path).map_err(|error| format!("Unable to read Wallis configuration: {error}"))?)
+        .map_err(|error| format!("Wallis configuration is invalid: {error}"))?;
+    if ["tiny.en", "base.en", "small.en"].contains(&config.stt_model.as_str()) { config.stt_model = "parakeet-110m-int8".into(); }
+    if ["medium", "high"].contains(&config.tts_voice.as_str()) { config.tts_voice = "alba".into(); config.tts_speed = 1.0; }
+    Ok(config)
 }
 
 fn save_config_file(path: &Path, config: &WallisConfig) -> Result<(), String> {
@@ -499,10 +502,21 @@ mod tests {
     }
 
     #[test]
+    fn migrates_old_speech_settings_without_losing_other_preferences() {
+        let path = std::env::temp_dir().join(format!("wallis-speech-migration-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"sttModel":"small.en","ttsVoice":"high","ttsSpeed":0.7,"sttThreads":2,"discordAllowedUsers":"*"}"#).unwrap();
+        let config = load_config_file(&path).unwrap();
+        assert_eq!((config.stt_model.as_str(), config.tts_voice.as_str(), config.tts_speed, config.stt_threads, config.discord_allowed_users.as_str()), ("parakeet-110m-int8", "alba", 1.0, 2, "*"));
+        save_config_file(&path, &config).unwrap();
+        assert_eq!(load_config_file(&path).unwrap().tts_voice, "alba");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn validates_channels_and_fills_missing_config_fields() {
         let mut config = WallisConfig::default();
         let partial: WallisConfig = serde_json::from_str(r#"{"discordAllowedUsers":"*"}"#).unwrap();
-        assert_eq!((partial.voice_participation.as_str(), partial.participation_cooldown_secs, partial.stt_model.as_str()), ("natural", 5, "base.en"));
+        assert_eq!((partial.voice_participation.as_str(), partial.participation_cooldown_secs, partial.stt_model.as_str()), ("natural", 5, "parakeet-110m-int8"));
         config.discord_write_channels = "123456789012".into();
         config.discord_voice_text_channel = "999999999999".into();
         assert!(validate_discord_channels(&mut config).is_err());

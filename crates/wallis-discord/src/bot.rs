@@ -38,7 +38,7 @@ pub struct BotConfig {
 struct Sink<'a> { out: &'a Out, guild: u64, speed: f32 }
 
 impl Discord for Sink<'_> {
-    fn say(&mut self, text: &str) -> Result<(), String> { self.out.play(self.guild, &speech::synthesize(text, self.speed)?) }
+    fn say(&mut self, text: &str) -> Result<(), String> { self.out.speak(self.guild, text, self.speed) }
     fn message(&mut self, channel_id: &str, text: &str) -> Result<(), String> { self.out.message(channel_id.parse().map_err(|_| "Bad channel id")?, text) }
     fn file(&mut self, channel_id: &str, filename: &str, content: &str, text: &str) -> Result<(), String> { self.out.file(channel_id.parse().map_err(|_| "Bad channel id")?, filename, content, text) }
 }

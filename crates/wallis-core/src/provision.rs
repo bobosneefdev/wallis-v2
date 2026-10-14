@@ -7,13 +7,14 @@ pub struct Artifact { pub name: &'static str, pub url: &'static str, pub sha256:
     pub strip: &'static str }
 
 pub const PI: Artifact = Artifact { name: "pi", url: "https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-windows-x64.zip", sha256: "bd272b508657ad8d0ac6176e7751913c848a89cfb8cbe21ff319941e6ca140be", strip: "" };
-pub const WHISPER: Artifact = Artifact { name: "whisper", url: "https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-x64.zip", sha256: "c2a4b60edb11f7e11a9191ffb50929535527d4d91c9903dbe3e554583bbbc63d", strip: "Release/" };
 pub const UV: Artifact = Artifact { name: "uv", url: "https://github.com/astral-sh/uv/releases/download/0.13.0/uv-x86_64-pc-windows-msvc.zip", sha256: "088962f9e7b7bd9ea740c04c650b2a21c8928c345bd99ac24350dc924dba656c", strip: "" };
 /// busybox-w32 (single exe, applets built in): the worker's `sh`. MSYS shells cannot initialise inside an AppContainer.
 pub const BUSYBOX_URL: &str = "https://frippery.org/files/busybox/busybox-w64u-FRP-6075-g169694ebd.exe";
 pub const BUSYBOX_SHA256: &str = "6e263d154d8548d1eb936f65d1d8312c80df31c45974e48d6335e4dcc0f4f34c";
 /// Python packages installed into the app's own virtual environment (voice and realtime memory).
-pub const PIPER_PACKAGE: &str = "piper-tts==1.8.0";
+pub const POCKET_PACKAGE: &str = "pocket-tts==3.3.0";
+pub const SHERPA_PACKAGE: &str = "sherpa-onnx==1.13.8";
+pub const TORCH_PACKAGE: &str = "torch==2.14.1+cpu";
 pub const MEMORY_PACKAGE: &str = "mnemosyne-memory[all]==3.15.1";
 pub const PYTHON_VERSION: &str = "3.12";
 
@@ -113,24 +114,23 @@ mod tests {
 
     #[test]
     fn pinned_checksums_are_well_formed() {
-        for artifact in [&PI, &WHISPER, &UV] { assert!(artifact.sha256.len() == 64 && artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit()), "{}", artifact.name); }
+        for artifact in [&PI, &UV] { assert!(artifact.sha256.len() == 64 && artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit()), "{}", artifact.name); }
     }
 }
 
 /// Speech models the GUI can choose between: (id, label, sha256, megabytes).
-pub const STT_MODELS: [(&str, &str, &str, u32); 3] = [
-    ("tiny.en", "Tiny — fastest, least accurate", "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f", 74),
-    ("base.en", "Base — the Wallis V1 default", "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002", 141),
-    ("small.en", "Small — most accurate, slowest", "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d", 465),
+pub const STT_MODELS: [(&str, &str, &str, u32); 1] = [
+    ("parakeet-110m-int8", "Parakeet 110M INT8 — English, CPU", "f628312e9fdf8686374cb01a69425c41732529d540860311f16f37cbc32cfe9b", 108),
 ];
-/// Piper voices, same speaker as V1 at two quality levels. Medium synthesises about twice as fast.
-pub const TTS_VOICES: [(&str, &str, &str, u32); 2] = [
-    ("medium", "Medium — about twice as fast", "abf4c274862564ed647ba0d2c47f8ee7c9b717d27bdad9219100eb310db4047a", 60),
-    ("high", "High — richer, slower", "b3990d7606e183ec8dbfba70a4607074f162de1a0c412e0180d1ff60bb154eca", 115),
+/// Permanent Pocket preset states; no voice cloning or Hugging Face account required.
+pub const TTS_VOICES: [(&str, &str, &str, u32); 3] = [
+    ("alba", "Alba", "d291428b416d6c36a1de7835e51dbe1e334b75e5af512bb18dd23a1047fe8f3b", 6),
+    ("marius", "Marius", "b05946f39371f8853902b0486231f2d401c8a9570da9978329120d4ecfd009e9", 6),
+    ("javert", "Javert", "580e4b72d4065e906c14e580f97da478c9707bead74b0ef9c049e0ca8de997d9", 6),
 ];
-const STT_MODEL_BASE: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
-const TTS_VOICE_BASE: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/";
-pub const PIPER_SERVER: &str = include_str!("../py/piper_server.py");
+const STT_ARCHIVE: &str = "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8";
+const POCKET_BASE: &str = "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/4e1e0a3e611c51c0b4ed8174fc10f32a54644303/languages/english_2026-09";
+pub const SPEECH_SERVER: &str = include_str!("../py/speech_server.py");
 
 /// Where everything lives under the app data folder.
 pub struct Layout(pub PathBuf);
@@ -139,14 +139,13 @@ impl Layout {
     fn exe(name: &str) -> String { if cfg!(windows) { format!("{name}.exe") } else { name.to_string() } }
     pub fn tools(&self) -> PathBuf { self.0.join("tools") }
     pub fn pi(&self) -> PathBuf { self.tools().join("pi").join(Self::exe("pi")) }
-    pub fn whisper(&self) -> PathBuf { self.tools().join("whisper").join(Self::exe("whisper-server")) }
     pub fn shell(&self) -> PathBuf { self.tools().join("busybox").join(Self::exe("sh")) }
     pub fn uv(&self) -> PathBuf { self.tools().join("uv").join(Self::exe("uv")) }
     pub fn venv(&self) -> PathBuf { self.tools().join("venv") }
     pub fn python(&self) -> PathBuf { if cfg!(windows) { self.venv().join("Scripts").join("python.exe") } else { self.venv().join("bin").join("python") } }
-    pub fn piper_script(&self) -> PathBuf { self.tools().join("piper_server.py") }
-    pub fn stt_model(&self, id: &str) -> PathBuf { self.0.join("models").join(format!("ggml-{id}.bin")) }
-    pub fn tts_model(&self, id: &str) -> PathBuf { self.0.join("models").join(format!("en_US-ryan-{id}.onnx")) }
+    pub fn speech_script(&self) -> PathBuf { self.tools().join("speech_server.py") }
+    pub fn stt_model(&self, id: &str) -> PathBuf { self.0.join("models").join(id) }
+    pub fn tts_model(&self, id: &str) -> PathBuf { self.0.join("models/pocket").join(format!("{id}.safetensors")) }
 }
 
 fn run(program: &Path, args: &[&str], what: &str) -> Result<(), String> {
@@ -159,7 +158,7 @@ fn run(program: &Path, args: &[&str], what: &str) -> Result<(), String> {
     Err(format!("Unable to {what}: {}", String::from_utf8_lossy(&output.stderr).lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no output")))
 }
 
-/// Installs every runtime piece (idempotent): Pi, whisper-server, uv, a Python venv with Piper and Mnemosyne, and the voice models.
+/// Installs every runtime piece (idempotent): Pi, uv, a CPU Python environment with speech and memory packages, and pinned models.
 /// `progress` receives a one-line description of each step.
 pub fn ensure_all(layout: &Layout, stt: &str, tts: &str, progress: &dyn Fn(&str)) -> Result<(), String> {
     let (stt_entry, tts_entry) = (STT_MODELS.iter().find(|m| m.0 == stt).ok_or("Unknown speech model.")?, TTS_VOICES.iter().find(|m| m.0 == tts).ok_or("Unknown voice.")?);
@@ -167,24 +166,37 @@ pub fn ensure_all(layout: &Layout, stt: &str, tts: &str, progress: &dyn Fn(&str)
     progress("Installing the agent runtime…");
     install(&PI, &tools, &Layout::exe("pi"))?;
     progress("Installing speech recognition…");
-    install(&WHISPER, &tools, &Layout::exe("whisper-server"))?;
     install(&UV, &tools, &Layout::exe("uv"))?;
     progress("Installing the worker shell…");
     download_verified(BUSYBOX_URL, BUSYBOX_SHA256, &layout.shell())?;
     if !layout.python().is_file() {
         progress("Setting up Python for voice and memory…");
         run(&layout.uv(), &["venv", "--python", PYTHON_VERSION, &layout.venv().to_string_lossy()], "create the Python environment")?;
-        run(&layout.uv(), &["pip", "install", "--python", &layout.python().to_string_lossy(), PIPER_PACKAGE, MEMORY_PACKAGE], "install the voice and memory packages")?;
     }
-    std::fs::write(layout.piper_script(), PIPER_SERVER).map_err(|error| format!("Unable to write the voice server: {error}"))?;
-    progress("Downloading the local voice models…");
-    download_verified(&format!("{STT_MODEL_BASE}ggml-{stt}.bin"), stt_entry.2, &layout.stt_model(stt))?;
-    download_verified(&format!("{TTS_VOICE_BASE}{tts}/en_US-ryan-{tts}.onnx"), tts_entry.2, &layout.tts_model(tts))?;
-    let config = layout.tts_model(tts).with_extension("onnx.json");
-    if !config.is_file() {
-        let body = ureq::get(format!("{TTS_VOICE_BASE}{tts}/en_US-ryan-{tts}.onnx.json")).call().map_err(|error| error.to_string())?.body_mut().read_to_string().map_err(|error| error.to_string())?;
-        std::fs::write(&config, body).map_err(|error| error.to_string())?;
+    let packages = format!("{POCKET_PACKAGE} {SHERPA_PACKAGE} {TORCH_PACKAGE} {MEMORY_PACKAGE}");
+    let marker = layout.venv().join("wallis-packages.txt");
+    if std::fs::read_to_string(&marker).ok().as_deref() != Some(&packages) {
+        progress("Installing CPU speech and memory packages…");
+        run(&layout.uv(), &["pip", "install", "--python", &layout.python().to_string_lossy(), "--index-url", "https://download.pytorch.org/whl/cpu", TORCH_PACKAGE], "install CPU PyTorch")?;
+        run(&layout.uv(), &["pip", "install", "--python", &layout.python().to_string_lossy(), TORCH_PACKAGE, POCKET_PACKAGE, SHERPA_PACKAGE, MEMORY_PACKAGE], "install speech and memory packages")?;
+        std::fs::write(marker, packages).map_err(|error| error.to_string())?;
     }
+    std::fs::write(layout.speech_script(), SPEECH_SERVER).map_err(|error| format!("Unable to write the speech server: {error}"))?;
+    progress("Downloading the local speech models…");
+    let archive = tools.join("downloads/parakeet.tar.bz2");
+    download_verified(&format!("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{STT_ARCHIVE}.tar.bz2"), stt_entry.2, &archive)?;
+    let stt_dir = layout.stt_model(stt);
+    if std::fs::read_to_string(stt_dir.join("installed.txt")).ok().as_deref() != Some(stt_entry.2) {
+        run(&layout.python(), &["-c", "import sys,tarfile; tarfile.open(sys.argv[1]).extractall(sys.argv[2], filter='data')", &archive.to_string_lossy(), &stt_dir.to_string_lossy()], "extract Parakeet")?;
+        for file in ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"] {
+            if !stt_dir.join(STT_ARCHIVE).join(file).is_file() { return Err(format!("Parakeet installed without {file}.")); }
+        }
+        std::fs::write(stt_dir.join("installed.txt"), stt_entry.2).map_err(|error| error.to_string())?;
+    }
+    let pocket = layout.tts_model(tts).parent().unwrap().to_path_buf();
+    download_verified(&format!("{POCKET_BASE}/model.safetensors"), "916ccd2686e9311cb40054893a3c4284393d658825ffc714a276f3e9b152344f", &pocket.join("model.safetensors"))?;
+    download_verified(&format!("{POCKET_BASE}/tokenizer.json"), "f498428e1eafee50492f7be13dc9bfafcfc12e508cd0eb1b01c92ecd5d8c6687", &pocket.join("tokenizer.json"))?;
+    download_verified(&format!("{POCKET_BASE}/embeddings/{tts}.safetensors"), tts_entry.2, &layout.tts_model(tts))?;
     progress("");
     Ok(())
 }
@@ -194,19 +206,31 @@ pub struct SpeechServers(Vec<std::process::Child>);
 
 impl SpeechServers {
     pub fn start(layout: &Layout, stt: &str, threads: u32, tts: &str) -> Result<Self, String> {
-        let spawn = |program: &Path, args: Vec<String>, what: &str| {
+        let spawn = |program: &Path, args: Vec<String>, what: &str, port: u16| {
             let mut command = std::process::Command::new(program);
-            command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            let log = std::fs::File::create(layout.tools().join(format!("speech-{port}.log"))).map_err(|error| error.to_string())?;
+            command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(log);
             #[cfg(windows)]
             { use std::os::windows::process::CommandExt; command.creation_flags(0x0800_0000); }
             command.spawn().map_err(|error| format!("Unable to start {what}: {error}"))
         };
-        let whisper = spawn(&layout.whisper(), vec!["-m".into(), layout.stt_model(stt).to_string_lossy().into(), "--port".into(), "8085".into(), "-t".into(), threads.to_string()], "speech recognition")?;
-        let mut servers = Self(vec![whisper]);
-        servers.0.push(spawn(&layout.python(), vec!["-u".into(), layout.piper_script().to_string_lossy().into(), layout.tts_model(tts).to_string_lossy().into(), "8086".into()], "the voice")?);
+        if !STT_MODELS.iter().any(|m| m.0 == stt) || !TTS_VOICES.iter().any(|m| m.0 == tts) || !(1..=64).contains(&threads) { return Err("Invalid speech settings.".into()); }
+        let stt_server = spawn(&layout.python(), vec!["-u".into(), layout.speech_script().to_string_lossy().into(), "stt".into(), layout.stt_model(stt).join(STT_ARCHIVE).to_string_lossy().into(), threads.to_string()], "speech recognition", 8085)?;
+        let mut servers = Self(vec![stt_server]);
+        servers.0.push(spawn(&layout.python(), vec!["-u".into(), layout.speech_script().to_string_lossy().into(), "tts".into(), layout.tts_model(tts).to_string_lossy().into(), threads.to_string()], "the voice", 8086)?);
         for (name, port) in [("speech recognition", 8085u16), ("the voice", 8086)] {
-            let up = (0..300).any(|_| { let ok = std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(); if !ok { std::thread::sleep(std::time::Duration::from_millis(200)); } ok });
-            if !up { return Err(format!("{name} did not start.")); }
+            let mut up = false;
+            for _ in 0..300 {
+                for (index, child) in servers.0.iter_mut().enumerate() {
+                    if child.try_wait().map_err(|error| error.to_string())?.is_some() {
+                        let log = std::fs::read_to_string(layout.tools().join(format!("speech-{}.log", 8085 + index))).unwrap_or_default();
+                        return Err(format!("Speech server exited: {}", log.lines().last().unwrap_or("no output")));
+                    }
+                }
+                if ureq::get(format!("http://127.0.0.1:{port}/health")).config().timeout_global(Some(std::time::Duration::from_secs(1))).build().call().is_ok() { up = true; break; }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            if !up { return Err(format!("{name} did not start. See tools/speech-{port}.log.")); }
         }
         Ok(servers)
     }
@@ -223,9 +247,9 @@ mod layout_tests {
     #[test]
     fn layout_keeps_models_and_tools_apart_and_voices_are_pinned() {
         let layout = Layout(PathBuf::from("data"));
-        assert!(layout.stt_model("base.en").ends_with("models/ggml-base.en.bin") && layout.tts_model("medium").ends_with("models/en_US-ryan-medium.onnx"));
+        assert!(layout.stt_model("parakeet-110m-int8").ends_with("models/parakeet-110m-int8") && layout.tts_model("alba").ends_with("models/pocket/alba.safetensors"));
         assert!(layout.python().starts_with("data/tools/venv"));
         assert!(STT_MODELS.iter().chain(TTS_VOICES.iter()).all(|m| m.2.len() == 64));
-        assert!(PIPER_SERVER.contains("PiperVoice.load"));
+        assert!(SPEECH_SERVER.contains("TTSModel.load_model"));
     }
 }
