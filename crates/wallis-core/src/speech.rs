@@ -1,12 +1,11 @@
-//! Speech plumbing between Discord (48 kHz stereo PCM), whisper.cpp (16 kHz mono WAV) and Piper (22.05 kHz mono PCM).
-//! The two servers are the same local HTTP services the Node bot used.
+//! Speech plumbing between Discord (48 kHz stereo PCM), Parakeet (16 kHz mono WAV) and Pocket TTS (24 kHz mono f32 PCM).
 use std::io::Read;
 
-pub const WHISPER_URL: &str = "http://127.0.0.1:8085";
-pub const PIPER_URL: &str = "http://127.0.0.1:8086";
-const PIPER_RATE: usize = 22_050;
+pub const STT_URL: &str = "http://127.0.0.1:8085";
+pub const TTS_URL: &str = "http://127.0.0.1:8086";
+const TTS_RATE: usize = 24_000;
 
-/// Discord voice -> whisper: average each 3 stereo frames (48 kHz -> 16 kHz) into one mono sample.
+/// Discord voice -> Parakeet: average each 3 stereo frames (48 kHz -> 16 kHz) into one mono sample.
 pub fn downsample(pcm: &[i16]) -> Vec<i16> {
     pcm.chunks_exact(6).map(|frame| (frame.iter().map(|&s| s as i32).sum::<i32>() / 6) as i16).collect()
 }
@@ -23,13 +22,13 @@ pub fn wav16k(samples: &[i16]) -> Vec<u8> {
     wav
 }
 
-/// Piper output -> Discord voice: linear-interpolate 22.05 kHz mono up to 48 kHz and duplicate to stereo.
-pub fn piper_to_discord(mono: &[i16]) -> Vec<i16> {
+/// Pocket TTS output -> Discord voice: linear-interpolate 24 kHz mono up to 48 kHz and duplicate to stereo.
+pub fn pocket_to_discord(mono: &[i16]) -> Vec<i16> {
     if mono.is_empty() { return vec![]; }
-    let frames = mono.len() * 48_000 / PIPER_RATE;
+    let frames = mono.len() * 48_000 / TTS_RATE;
     let mut out = Vec::with_capacity(frames * 2);
     for frame in 0..frames {
-        let position = frame as f64 * PIPER_RATE as f64 / 48_000.0;
+        let position = frame as f64 * TTS_RATE as f64 / 48_000.0;
         let (index, fraction) = (position as usize, position.fract());
         let (a, b) = (mono[index] as f64, mono[(index + 1).min(mono.len() - 1)] as f64);
         let sample = (a + (b - a) * fraction) as i16;
@@ -48,35 +47,29 @@ pub fn clean_transcript(text: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn multipart(wav: &[u8], boundary: &str) -> Vec<u8> {
-    let mut body = Vec::new();
-    for (name, value) in [("response_format", "json"), ("no_timestamps", "true"), ("token_timestamps", "false")] {
-        body.extend(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").bytes());
-    }
-    body.extend(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n").bytes());
-    body.extend(wav);
-    body.extend(format!("\r\n--{boundary}--\r\n").bytes());
-    body
-}
-
-/// Speech to text through the local whisper-server.
+/// Speech to text through the local Parakeet server.
 pub fn transcribe(pcm_48k_stereo: &[i16]) -> Result<String, String> {
-    let boundary = "wallis-boundary-7f3a";
-    let response: serde_json::Value = ureq::post(format!("{WHISPER_URL}/inference"))
-        .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
-        .send(&multipart(&wav16k(&downsample(pcm_48k_stereo)), boundary)).map_err(|error| format!("whisper-server failed: {error}"))?
-        .body_mut().read_json().map_err(|error| format!("whisper-server sent unreadable output: {error}"))?;
-    Ok(clean_transcript(response["text"].as_str().unwrap_or("")))
+    let response: serde_json::Value = ureq::post(format!("{STT_URL}/inference")).config().timeout_global(Some(std::time::Duration::from_secs(60))).build()
+        .header("Content-Type", "audio/wav")
+        .send(&wav16k(&downsample(pcm_48k_stereo))).map_err(|error| format!("Parakeet failed: {error}"))?
+        .body_mut().read_json().map_err(|error| format!("Parakeet sent unreadable output: {error}"))?;
+    Ok(clean_transcript(response["text"].as_str().ok_or("Parakeet returned no transcript field.")?))
 }
 
-/// Text to speech through the local Piper server; returns 48 kHz stereo PCM ready for Discord.
-pub fn synthesize(text: &str, length_scale: f32) -> Result<Vec<i16>, String> {
-    let mut response = ureq::post(format!("{PIPER_URL}/synthesize")).send_json(serde_json::json!({ "text": text, "length_scale": length_scale }))
-        .map_err(|error| format!("Piper failed: {error}"))?;
+/// Streaming 24 kHz mono little-endian f32 PCM. Dropping the reader cancels the HTTP stream.
+pub fn synthesize_stream(text: &str) -> Result<impl Read + Send + Sync + 'static, String> {
+    let response = ureq::post(format!("{TTS_URL}/synthesize")).config().timeout_recv_response(Some(std::time::Duration::from_secs(30))).timeout_recv_body(Some(std::time::Duration::from_secs(600))).build().send_json(serde_json::json!({ "text": text }))
+        .map_err(|error| format!("Pocket TTS failed: {error}"))?;
+    Ok(response.into_body().into_reader())
+}
+
+/// Buffered roundtrip helper for the provisioning check; Discord uses synthesize_stream directly.
+pub fn synthesize(text: &str) -> Result<Vec<i16>, String> {
     let mut bytes = Vec::new();
-    response.body_mut().as_reader().read_to_end(&mut bytes).map_err(|error| format!("Piper stream failed: {error}"))?;
-    let mono: Vec<i16> = bytes.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
-    Ok(piper_to_discord(&mono))
+    synthesize_stream(text)?.read_to_end(&mut bytes).map_err(|error| format!("Pocket TTS stream failed: {error}"))?;
+    if bytes.len() % 4 != 0 { return Err("Pocket TTS returned incomplete PCM.".into()); }
+    let mono: Vec<i16> = bytes.chunks_exact(4).map(|sample| (f32::from_le_bytes(sample.try_into().unwrap()).clamp(-1.0, 1.0) * 32767.0) as i16).collect();
+    Ok(pocket_to_discord(&mono))
 }
 
 #[cfg(test)]
@@ -98,11 +91,11 @@ mod tests {
     }
 
     #[test]
-    fn upsamples_piper_audio_to_discord_stereo() {
-        let out = piper_to_discord(&vec![1000; 2205]);
+    fn upsamples_pocket_audio_to_discord_stereo() {
+        let out = pocket_to_discord(&vec![1000; 2400]);
         assert_eq!(out.len(), 4800 * 2, "0.1 s at 48 kHz stereo");
         assert!(out.iter().all(|&s| s == 1000) && out.chunks(2).all(|f| f[0] == f[1]));
-        assert!(piper_to_discord(&[]).is_empty());
+        assert!(pocket_to_discord(&[]).is_empty());
     }
 
     #[test]
@@ -110,9 +103,4 @@ mod tests {
         assert_eq!(clean_transcript(" [BLANK_AUDIO] hello (music) there [ a [b] ] "), "hello there");
     }
 
-    #[test]
-    fn multipart_body_carries_the_wav_and_closes_the_boundary() {
-        let body = String::from_utf8_lossy(&multipart(b"WAVDATA", "b")).to_string();
-        assert!(body.contains("name=\"file\"; filename=\"audio.wav\"") && body.contains("WAVDATA\r\n--b--\r\n") && body.contains("name=\"response_format\""));
-    }
 }

@@ -3,11 +3,10 @@
 pub mod bot;
 use songbird::driver::DecodeMode;
 use songbird::events::{CoreEvent, Event, EventContext, EventHandler as VoiceHandler};
-use songbird::input::{Input, RawAdapter};
+use songbird::input::{core::io::{MediaSource, ReadOnlySource}, AudioStream, AudioStreamError, Compose, Input, RawAdapter};
 use songbird::shards::TwilightMap;
 use songbird::{Config as VoiceConfig, Songbird};
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use twilight_cache_inmemory::{DefaultInMemoryCache, ResourceType};
 use twilight_gateway::{Config, Event as Gateway, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
@@ -47,6 +46,22 @@ fn allowed(list: &[String], user: u64) -> bool { list.iter().any(|id| id == "*" 
 #[derive(Clone)]
 pub struct Out { http: Arc<Client>, songbird: Arc<Songbird>, runtime: tokio::runtime::Handle }
 
+// Songbird opens the request when this track starts, so queued speech cannot block interruption.
+struct Pocket { text: String, rate: u32 }
+
+#[async_trait::async_trait]
+impl Compose for Pocket {
+    fn create(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
+        let stream = wallis_core::speech::synthesize_stream(&self.text).map_err(|error| {
+            eprintln!("wallis: {error}");
+            AudioStreamError::Fail(error.into())
+        })?;
+        Ok(AudioStream { input: Box::new(RawAdapter::new(ReadOnlySource::new(stream), self.rate, 1)) })
+    }
+    async fn create_async(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> { Err(AudioStreamError::Unsupported) }
+    fn should_create_async(&self) -> bool { false }
+}
+
 impl Out {
     pub fn message(&self, channel: u64, text: &str) -> Result<(), String> {
         let none = AllowedMentions::default();
@@ -61,12 +76,14 @@ impl Out {
         self.runtime.block_on(async { request.await }).map(|_| ()).map_err(|error| error.to_string())
     }
 
-    /// Queues 48 kHz stereo PCM on the guild's call; returns once playback has been handed off.
-    pub fn play(&self, guild: u64, pcm: &[i16]) -> Result<(), String> {
+    /// Queues a live Pocket PCM stream. Songbird resamples to Discord's 48 kHz stereo.
+    pub fn speak(&self, guild: u64, text: &str, length_scale: f32) -> Result<(), String> {
+        if !length_scale.is_finite() || !(0.5..=2.0).contains(&length_scale) { return Err("Invalid speaking speed.".into()); }
         let call = self.songbird.get(Id::<GuildMarker>::new(guild)).ok_or("Wallis is not in a voice channel.")?;
-        let bytes: Vec<u8> = pcm.iter().flat_map(|&s| (s as f32 / 32768.0).to_le_bytes()).collect();
-        let input: Input = RawAdapter::new(Cursor::new(bytes), 48_000, 2).into();
-        self.runtime.block_on(async { call.lock().await.enqueue_input(input).await });
+        if text.trim().is_empty() || text.chars().count() > 16_000 { return Err("Speech must contain 1–16000 characters.".into()); }
+        // ponytail: speed changes pitch; add time stretching when pitch-preserving speed is required.
+        let input = Input::Lazy(Box::new(Pocket { text: text.into(), rate: (24_000.0 / length_scale).round() as u32 }));
+        self.runtime.block_on(async { call.lock().await.enqueue_with_preload(input.into(), None) });
         Ok(())
     }
 
@@ -202,3 +219,31 @@ pub async fn run(settings: Settings, ready: impl FnOnce(Out) + std::marker::Send
     Err("Discord closed the connection (check the bot token and its Message Content intent).".into())
 }
 
+#[cfg(test)]
+mod speech_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn songbird_decodes_live_pocket_pcm_before_the_stream_ends() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        let (done, wait) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.write_all(&0.25f32.to_le_bytes().repeat(2400)).unwrap();
+            // No EOF until the decoder has consumed a packet.
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(3));
+        });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let input: Input = RawAdapter::new(ReadOnlySource::new(socket), 24_000, 1).into();
+        let mut playable = input.make_playable(songbird::input::codecs::get_codec_registry(), songbird::input::codecs::get_probe(), runtime.handle()).unwrap();
+        let parsed = playable.parsed_mut().unwrap();
+        let packet = parsed.format.next_packet().unwrap();
+        let audio = parsed.decoder.decode(&packet).unwrap();
+        assert_eq!((audio.spec().rate, audio.spec().channels.count(), audio.frames()), (24_000, 1, 480));
+        done.send(()).unwrap();
+        producer.join().unwrap();
+    }
+}

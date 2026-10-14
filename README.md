@@ -1,0 +1,34 @@
+# Wallis
+
+A Windows desktop Discord companion, built with Tauri, Svelte, Twilight and Songbird. Pi runs the realtime and worker agents; Mnemosyne provides local memory.
+
+## Local speech
+
+Wallis 0.3.0 replaces Whisper/Piper with **Parakeet TDT 110M INT8** through Sherpa-ONNX and **Pocket TTS 3.3.0** (English September 2026). Both run on CPU. First startup downloads checksummed models and installs CPU PyTorch in the app's Python environment, including upgrades from an existing installation. No GPU or Hugging Face account is required.
+
+Pocket audio streams directly into Songbird as 24 kHz mono float PCM; Songbird resamples it for Discord. Playback starts while the rest of the sentence is still being synthesized. Interrupting Wallis stops the queued track and closes its stream. Speaking speed adjusts playback rate and therefore pitch; 1.0 preserves the preset voice.
+
+Alba, Marius and Javert are fixed, locally stored preset voice states. The app uses only the ungated model and accepts no audio prompts for cloning. Saved Whisper selections migrate to Parakeet; Piper selections migrate to Alba at normal speed. Other preferences remain intact.
+
+The CPU model downloads total approximately 333 MB for one preset, plus Python packages. The STT model is English-only. Live Discord timing depends on CPU load and the voice connection.
+
+## Development checks
+
+```sh
+bun install --frozen-lockfile
+bun run check
+bun run lint
+bun run test
+cargo test -p wallis-core -p wallis-discord
+cargo check --workspace
+```
+
+On Windows, `cargo run -p wallis-core --example provision -- <data_dir>` checks full provisioning and a Pocket-to-Parakeet audio roundtrip. Append `--installed` to test an already provisioned directory. `python crates/wallis-core/py/speech_check.py <data_dir>` checks actual model streaming, cancellation, malformed requests and a transcription roundtrip using the installed speech environment.
+
+The release workflow runs on pushes to `master`. Merging the 0.3.0 version bump builds and publishes a new Windows installer if `v0.3.0` does not already exist.
+
+## Speech sources and licenses
+
+- [NVIDIA Parakeet TDT-CTC 110M](https://huggingface.co/nvidia/parakeet-tdt_ctc-110m): CC BY 4.0, exported and INT8 quantized by [Sherpa-ONNX](https://github.com/k2-fsa/sherpa-onnx) (Apache 2.0). Wallis uses the TDT transducer export.
+- [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts): MIT code and CC BY 4.0 [ungated preset-only weights](https://huggingface.co/kyutai/pocket-tts-without-voice-cloning).
+- [Preset recordings](https://huggingface.co/kyutai/tts-voices): Alba MacKenna's casual voice is CC BY 4.0; Marius (Selfie) and Javert (Butter) are CC0 volunteer voice donations. Their preset states are supplied by Kyutai. Attribution is retained here; no changes are made to the source recordings.

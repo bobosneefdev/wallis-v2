@@ -135,7 +135,7 @@
     <input id="threads" type="number" min="1" max="64" bind:value={config.sttThreads} />
     <label for="tts">Voice</label>
     <select id="tts" bind:value={config.ttsVoice}>{#each ttsOptions as option (option.id)}<option value={option.id}>{option.label} · {option.megabytes} MB</option>{/each}</select>
-    <label for="speed">Speaking speed <span>(length scale: lower is faster)</span></label>
+    <label for="speed">Speaking speed <span>(lower is faster; also changes pitch)</span></label>
     <input id="speed" type="number" min="0.5" max="2" step="0.05" bind:value={config.ttsSpeed} />
     <label class="check"><input type="checkbox" bind:checked={config.autoStart} /> Start Wallis when the app opens</label>
     <button type="submit">Save</button>
