@@ -1,5 +1,6 @@
 //! Discord transport for Wallis: gateway, slash commands, text events, and voice receive/playback.
 //! It knows nothing about agents; it turns Discord activity into `Incoming` and exposes `Out` for replies.
+pub mod bot;
 use serenity::all::{
     ChannelId, Client, Command, Context, CreateAttachment, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
     CreateMessage, EventHandler, GatewayIntents, GuildId, Interaction, Message, Ready, UserId,
