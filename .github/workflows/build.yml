@@ -1,0 +1,55 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  TARGET: x86_64-pc-windows-gnullvm
+  MINGW: llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64
+
+jobs:
+  release:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Install the Windows cross toolchain
+        run: |
+          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/$MINGW.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$MINGW/bin" >> "$GITHUB_PATH"
+
+      - name: Build the Windows release
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-static
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER: x86_64-w64-mingw32-clang
+          CC_x86_64_pc_windows_gnullvm: x86_64-w64-mingw32-clang
+          AR_x86_64_pc_windows_gnullvm: llvm-ar
+        run: cargo build -p wallis --release --features custom-protocol --target "$TARGET"
+
+      - name: Collect
+        run: |
+          mkdir dist
+          cp "target/$TARGET/release/wallis.exe" dist/
+          cp "$(find "target/$TARGET/release/build" -path '*webview2-com-sys-*/out/x64/WebView2Loader.dll' | head -1)" dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wallis-windows
+          path: dist/*
+          if-no-files-found: error
