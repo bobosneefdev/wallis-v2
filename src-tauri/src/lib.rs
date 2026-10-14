@@ -354,6 +354,14 @@ fn get_stats(state: State<'_, AppState>) -> Option<wallis_core::stats::Snapshot>
 }
 
 #[tauri::command]
+fn get_audit_log(state: State<'_, AppState>) -> Vec<wallis_core::stats::Event> {
+    let running = state.running.lock().expect("running state poisoned");
+    let Some(running) = running.as_ref() else { return Vec::new() };
+    let log = running.bot.lock().expect("bot state poisoned").as_ref().map(|bot| bot.stats.audit_log()).unwrap_or_default();
+    log
+}
+
+#[tauri::command]
 fn get_config(state: State<'_, AppState>) -> WallisConfig { state.config.lock().expect("config state poisoned").clone() }
 
 #[derive(Serialize)]
@@ -497,7 +505,7 @@ pub fn run() {
             std::thread::spawn(move || { let _ = start_inner(&handle.state::<AppState>()); });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_runtime_status, get_stats, start_wallis, stop_wallis, get_config, save_config, get_secret_status, save_discord_token, get_profile, generate_wallis, lobotomize_wallis, get_progress, check_update, install_update, get_voice_options, get_jobs, retry_job, codex::codex_signed_in, codex::codex_sign_in, codex::codex_sign_out, codex::codex_models, codex::get_roles, codex::save_roles, codex::get_provider, codex::save_provider, codex::refresh_provider_models]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_runtime_status, get_stats, get_audit_log, start_wallis, stop_wallis, get_config, save_config, get_secret_status, save_discord_token, get_profile, generate_wallis, lobotomize_wallis, get_progress, check_update, install_update, get_voice_options, get_jobs, retry_job, codex::codex_signed_in, codex::codex_sign_in, codex::codex_sign_out, codex::codex_models, codex::get_roles, codex::save_roles, codex::get_provider, codex::save_provider, codex::refresh_provider_models]).run(tauri::generate_context!()).expect("error while running Wallis");
 }
 
 #[cfg(test)]
