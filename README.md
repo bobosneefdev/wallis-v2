@@ -33,7 +33,7 @@ Enter comma-separated channel IDs for reading and writing in the app. Empty list
 
 ## Security model
 
-The realtime agent has no shell or file tools. The worker runs in an AppContainer inside a Job Object (kill-on-close, process and memory caps), with write access only to its scratch folder and Pi config, outbound network allowed, and a bundled busybox-w32 shell. This is below VM-grade isolation and is not a boundary against hostile code. On Windows 11 the sandbox smoke test (scratch write allowed, outside read/write denied, Pi RPC works inside it) and full provisioning (Pi, whisper, Piper, Python venv, models, Piper to whisper round trip) pass. Not yet exercised on real Windows: Discord, Codex sign-in and catalog, the Tauri app build.
+The realtime agent has no shell or file tools. The worker runs in an AppContainer inside a Job Object (kill-on-close, process and memory caps), with write access only to its scratch folder and Pi config, outbound network allowed, and a bundled busybox-w32 shell. This is below VM-grade isolation and is not a boundary against hostile code. On Windows 11 the sandbox smoke test (scratch write allowed, outside read/write denied, Pi RPC works inside it) and full provisioning (Pi, whisper, Piper, Python venv, models, Piper to whisper round trip) pass. The cross-built Tauri app launches and renders on Windows 11 (the WebView2 loader DLL must sit beside a gnu-built exe; the MSVC release build in CI links it in). Not yet exercised on real Windows: Discord and the Codex sign-in/catalog, which need live credentials.
 
 ## Stack
 
