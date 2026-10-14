@@ -33,7 +33,7 @@ Enter comma-separated channel IDs for reading and writing in the app. Empty list
 
 ## Security model
 
-The realtime agent has no shell or file tools. The worker runs in an AppContainer inside a Job Object (kill-on-close, process and memory caps), with write access only to its scratch folder and Pi config, outbound network allowed, and a bundled MinGit shell. This is below VM-grade isolation and is not a boundary against hostile code. It has not yet been run on a real Windows machine.
+The realtime agent has no shell or file tools. The worker runs in an AppContainer inside a Job Object (kill-on-close, process and memory caps), with write access only to its scratch folder and Pi config, outbound network allowed, and a bundled busybox-w32 shell. This is below VM-grade isolation and is not a boundary against hostile code. The sandbox smoke test (scratch write allowed, outside read/write denied, Pi starts) passes on Windows 11.
 
 ## Stack
 

@@ -8,16 +8,17 @@ fn main() -> Result<(), String> {
     let layout = Layout(data.clone());
     println!("install pi");
     provision::install(&provision::PI, &layout.tools(), "pi.exe")?;
-    println!("install mingit");
-    provision::install(&provision::MINGIT, &layout.tools(), "usr/bin/sh.exe")?;
+    println!("install shell");
+    provision::download_verified(provision::BUSYBOX_URL, provision::BUSYBOX_SHA256, &layout.shell())?;
+    let shell = layout.shell();
     let scratch = data.join("scratch");
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     let secret = data.join("outside.txt");
     std::fs::write(&secret, "secret").map_err(|e| e.to_string())?;
     let access = Access { read: vec![layout.tools()], write: vec![scratch.clone()], path: vec![] };
     let script = format!("exec 2>{s}/err.txt; echo inside > {s}/ok.txt && echo WRITE_SCRATCH_OK; cat '{o}' && echo READ_OUTSIDE_LEAKED; echo x > '{o}.new' && echo WRITE_OUTSIDE_LEAKED; echo DONE", s = scratch.to_string_lossy().replace('\\', "/"), o = secret.to_string_lossy().replace('\\', "/"));
-    let env = vec![("SystemRoot".to_string(), std::env::var("SystemRoot").unwrap_or_default()), ("PATH".to_string(), format!(r"{}\usr\bin;{}\System32", layout.mingit().display(), std::env::var("SystemRoot").unwrap_or_default()))];
-    let mut child = Some(wallis_core::sandbox::spawn(&layout.shell(), &["-c".to_string(), script.clone()], &scratch, &env, &access)?);
+    let env = vec![("SystemRoot".to_string(), std::env::var("SystemRoot").unwrap_or_default()), ("PATH".to_string(), format!(r"{}\System32", std::env::var("SystemRoot").unwrap_or_default()))];
+    let mut child = Some(wallis_core::sandbox::spawn(&shell, &["-c".to_string(), script.clone()], &scratch, &env, &access)?);
     let mut child = child.ok_or("no variant started")?;
     let sysroot = std::env::var("SystemRoot").unwrap_or_default();
     let copy = layout.tools().join("cmd-copy.exe");
@@ -28,7 +29,7 @@ fn main() -> Result<(), String> {
         ("system cmd".into(), format!(r"{sysroot}\System32\cmd.exe").into(), vec!["/c".into(), "echo CMD_OK".into()]),
         ("whoami".into(), format!(r"{sysroot}\System32\whoami.exe").into(), vec![]),
         ("tools cmd copy".into(), copy, vec!["/c".into(), "echo CMD_OK".into()]),
-        ("sh".into(), layout.shell(), vec!["-c".into(), "echo SH_OK".into()]),
+        ("sh".into(), shell.clone(), vec!["-c".into(), "echo SH_OK".into()]),
         ("pi".into(), layout.pi(), vec!["--version".into()]),
     ];
     for (label, environment) in [("min", &env), ("basic", &basic)] {
