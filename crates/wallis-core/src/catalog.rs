@@ -39,6 +39,7 @@ pub fn parse_codex_catalog(json: &str) -> Result<Vec<CodexModel>, String> {
     let mut raw: RawCatalog = serde_json::from_str(json).map_err(|error| format!("Codex returned an invalid model catalog: {error}"))?;
     raw.models.retain(|model| model.visibility == "list");
     raw.models.sort_by_key(|model| model.priority);
+    if raw.models.is_empty() { return Err("Codex listed no models for this account.".into()); }
     Ok(raw.models.into_iter().map(|model| {
         let efforts: Vec<String> = model.supported_reasoning_levels.into_iter().map(|level| level.effort).collect();
         let default_effort = model.default_reasoning_level.filter(|level| efforts.contains(level)).or_else(|| efforts.first().cloned()).unwrap_or_default();
@@ -73,5 +74,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_garbage() { assert!(parse_codex_catalog("{}").is_err()); }
+    fn rejects_garbage_and_empty_catalogs() {
+        assert!(parse_codex_catalog("{}").is_err());
+        assert!(parse_codex_catalog(r#"{"models":[]}"#).is_err());
+    }
 }
