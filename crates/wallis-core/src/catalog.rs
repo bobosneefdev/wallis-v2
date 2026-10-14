@@ -65,5 +65,13 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_upstream_codex_models_file() {
+        // openai/codex codex-rs/models-manager/models.json, the same shape the backend serves.
+        let models = parse_codex_catalog(include_str!("../tests/fixtures/codex-models-upstream.json")).unwrap();
+        assert!(!models.is_empty() && models.iter().all(|model| !model.efforts.is_empty() && model.efforts.contains(&model.default_effort)));
+        assert!(models.iter().any(|model| model.supports_fast));
+    }
+
+    #[test]
     fn rejects_garbage() { assert!(parse_codex_catalog("{}").is_err()); }
 }
