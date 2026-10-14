@@ -19,7 +19,7 @@ You have no memory and no access to the conversation beyond what the task says. 
 
 /// Pi `mcp.json` for the realtime role: the Mnemosyne stdio server. `python` is the embedded interpreter.
 pub fn realtime_mcp(python: &str, data_dir: &str) -> Value {
-    json!({ "mcpServers": { "mnemosyne": { "command": python, "args": ["-m", "mnemosyne", "mcp"], "env": { "MNEMOSYNE_DATA_DIR": data_dir } } } })
+    json!({ "mcpServers": { "mnemosyne": { "command": python, "args": ["-m", "mnemosyne.mcp_server"], "env": { "MNEMOSYNE_DATA_DIR": data_dir } } } })
 }
 
 #[cfg(test)]
@@ -41,7 +41,7 @@ mod tests {
     #[test]
     fn memory_server_is_configured_for_the_realtime_role_only() {
         let config = realtime_mcp("py.exe", "C:/data");
-        assert_eq!(config["mcpServers"]["mnemosyne"]["args"], json!(["-m", "mnemosyne", "mcp"]));
+        assert_eq!(config["mcpServers"]["mnemosyne"]["args"], json!(["-m", "mnemosyne.mcp_server"]));
         assert_eq!(config["mcpServers"]["mnemosyne"]["env"]["MNEMOSYNE_DATA_DIR"], "C:/data");
     }
 }
