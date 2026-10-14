@@ -9,4 +9,5 @@ pub mod pi;
 pub mod prompts;
 pub mod role;
 pub mod speech;
+pub mod utterance;
 pub mod worker;
