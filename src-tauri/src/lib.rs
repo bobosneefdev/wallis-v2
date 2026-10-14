@@ -1,3 +1,4 @@
+mod codex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
@@ -1171,5 +1172,5 @@ pub fn run() {
             std::thread::spawn(move || { let _ = start_wallis_impl(&handle.state::<AppState>()); });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_wallis, stop_wallis, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, save_background_inference, generate_wallis, get_stage, get_progress, get_voice_options, get_voice_cycles]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_setup_status, get_runtime_status, import_wallis, start_wallis, stop_wallis, reset_wallis, get_config, save_config, get_secret_status, save_discord_token, run_in_distro, open_terminal, get_providers, get_profile, save_inference, save_background_inference, generate_wallis, get_stage, get_progress, get_voice_options, get_voice_cycles, codex::codex_signed_in, codex::codex_sign_in, codex::codex_sign_out, codex::codex_models]).run(tauri::generate_context!()).expect("error while running Wallis");
 }

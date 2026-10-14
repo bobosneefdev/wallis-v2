@@ -3996,6 +3996,7 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "wallis-core",
  "windows-sys 0.59.0",
 ]
 
