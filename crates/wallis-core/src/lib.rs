@@ -7,6 +7,7 @@ pub mod jobs;
 pub mod participation;
 pub mod pi;
 pub mod prompts;
+pub mod provision;
 pub mod role;
 pub mod speech;
 pub mod utterance;
