@@ -114,12 +114,15 @@ impl Brain {
                 if self.consider(Mode::Text, user, direct) { self.respond(Mode::Text, guild, channel, user, turn_prompt(Mode::Text, channel, &speaker, &said)); }
             }
             Incoming::Voice { guild, channel, user, speaker, pcm } => {
+                // Talking over Wallis cuts him off.
+                self.out.stop_speaking(guild);
                 let said = match speech::transcribe(&pcm) { Ok(text) if !text.is_empty() => text, Ok(_) => return, Err(error) => return eprintln!("wallis: {error}") };
                 let direct = names_wallis(&said);
                 if self.consider(Mode::Voice, user, direct) { self.respond(Mode::Voice, guild, channel, user, turn_prompt(Mode::Voice, channel, &speaker, &said)); }
             }
             Incoming::Joined { guild, .. } => self.respond(Mode::Voice, guild, 0, 0, "[system] You just joined the voice call. Greet everyone with one short line.".into()),
-            Incoming::Ready { .. } | Incoming::Left { .. } => {}
+            Incoming::Left { guild } => self.out.stop_speaking(guild),
+            Incoming::Ready { .. } => {}
         }
     }
 }
@@ -129,6 +132,18 @@ pub struct Bot { pub sender: Sender<Incoming>, stop: Arc<AtomicBool> }
 
 impl Drop for Bot {
     fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); }
+}
+
+/// Merges back-to-back voice utterances from one speaker (a thought spoken in two breaths) into a single turn.
+pub fn coalesce(events: Vec<Incoming>) -> Vec<Incoming> {
+    let mut merged: Vec<Incoming> = Vec::new();
+    for event in events {
+        if let (Some(Incoming::Voice { guild: g, user: u, pcm: previous, .. }), Incoming::Voice { guild, user, pcm, .. }) = (merged.last_mut(), &event) {
+            if g == guild && u == user { previous.extend_from_slice(pcm); continue; }
+        }
+        merged.push(event);
+    }
+    merged
 }
 
 /// Starts the brain and worker threads. Feed Discord events into `Bot::sender`.
@@ -144,7 +159,11 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
         let Ok(jobs) = Jobs::open(&brain_db) else { return };
         let now = Instant::now();
         let mut brain = Brain { config: brain_config, out: brain_out, jobs, agent: None, last_reply_at: None, last_reply_user: None, next_consider_at: now, started: now };
-        while let Ok(event) = receiver.recv() { brain.handle(event); }
+        while let Ok(first) = receiver.recv() {
+            let mut events = vec![first];
+            events.extend(receiver.try_iter());
+            for event in coalesce(events) { brain.handle(event); }
+        }
     });
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -174,5 +193,13 @@ mod tests {
     fn prompts_tell_the_agent_where_the_message_came_from() {
         assert_eq!(turn_prompt(Mode::Voice, 1, "Jake", "hi"), "[voice call] Jake: hi");
         assert_eq!(turn_prompt(Mode::Text, 42, "Jake", "hi"), "[text channel 42] Jake: hi");
+    }
+
+    #[test]
+    fn merges_consecutive_utterances_from_the_same_speaker_only() {
+        let voice = |user: u64, pcm: Vec<i16>| Incoming::Voice { guild: 1, channel: 2, user, speaker: "x".into(), pcm };
+        let out = coalesce(vec![voice(7, vec![1, 2]), voice(7, vec![3]), voice(8, vec![4]), voice(7, vec![5])]);
+        let pcms: Vec<_> = out.iter().map(|event| match event { Incoming::Voice { pcm, .. } => pcm.clone(), _ => vec![] }).collect();
+        assert_eq!(pcms, vec![vec![1, 2, 3], vec![4], vec![5]]);
     }
 }

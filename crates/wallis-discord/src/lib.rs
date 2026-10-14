@@ -20,6 +20,8 @@ pub struct Settings {
     pub token: String,
     pub allowed_users: Vec<String>,
     pub read_channels: Vec<String>,
+    /// Shown by `/profile`.
+    pub profile: String,
 }
 
 #[derive(Debug)]
@@ -156,6 +158,7 @@ impl EventHandler for Handler {
                 };
                 let _ = command.edit_response(&ctx.http, serenity::all::EditInteractionResponse::new().content(text)).await;
             }
+            "profile" => { let _ = command.create_response(&ctx.http, reply(&self.settings.profile, false)).await; }
             _ => {}
         }
     }
