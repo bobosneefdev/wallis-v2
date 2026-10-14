@@ -24,6 +24,7 @@ const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
 const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
 const CREATE_SUSPENDED: u32 = 4;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 const JOB_EXTENDED_LIMITS: i32 = 9;
 const LIMIT_ACTIVE_PROCESS: u32 = 0x8;
 const LIMIT_JOB_MEMORY: u32 = 0x200;
@@ -72,13 +73,22 @@ fn grant(access: &Access, sid: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub struct Sandboxed { pub stdin: File, pub stdout: File, job: HANDLE }
+pub struct Sandboxed { pub stdin: File, pub stdout: File, job: HANDLE, process: HANDLE }
 
 // The job handle is only ever used to terminate and close it.
 unsafe impl Send for Sandboxed {}
 
+impl Sandboxed {
+    /// The worker's exit code once it has exited, `None` while it runs.
+    pub fn exit_code(&self) -> Option<u32> {
+        let mut code = 0u32;
+        let ok = unsafe { windows_sys::Win32::System::Threading::GetExitCodeProcess(self.process, &mut code) } != 0;
+        (ok && code != 259).then_some(code)
+    }
+}
+
 impl Drop for Sandboxed {
-    fn drop(&mut self) { unsafe { TerminateJobObject(self.job, 1); CloseHandle(self.job); } }
+    fn drop(&mut self) { unsafe { TerminateJobObject(self.job, 1); CloseHandle(self.job); CloseHandle(self.process); } }
 }
 
 fn quote(argument: &str) -> String { format!("\"{}\"", argument.replace('"', "\\\"")) }
@@ -121,11 +131,18 @@ pub fn spawn(program: &Path, args: &[String], cwd: &Path, env: &[(String, String
     startup.lpAttributeList = list_ptr;
 
     let mut command = wide(&std::iter::once(program.to_string_lossy().into_owned()).chain(args.iter().cloned()).map(|a| quote(&a)).collect::<Vec<_>>().join(" "));
-    let mut block: Vec<u16> = env.iter().flat_map(|(key, value)| wide(&format!("{key}={value}"))).collect();
+    // Windows wants the block sorted case-insensitively by name; an empty list inherits the parent's environment.
+    // An AppContainer process fails to start (error 203) without LOCALAPPDATA, so default it to the writable cwd.
+    let fallback = ("LOCALAPPDATA".to_string(), cwd.to_string_lossy().into_owned());
+    let mut sorted: Vec<&(String, String)> = env.iter().collect();
+    if !env.iter().any(|(key, _)| key.eq_ignore_ascii_case("LOCALAPPDATA")) { sorted.push(&fallback); }
+    sorted.sort_by_key(|(key, _)| key.to_uppercase());
+    let mut block: Vec<u16> = sorted.iter().flat_map(|(key, value)| wide(&format!("{key}={value}"))).collect();
     block.push(0);
+    let environment = if sorted.is_empty() { std::ptr::null() } else { block.as_ptr() as *const c_void };
     let (program_w, cwd_w) = (wide(&program.to_string_lossy()), wide(&cwd.to_string_lossy()));
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let created = unsafe { CreateProcessW(program_w.as_ptr(), command.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | CREATE_NO_WINDOW, block.as_ptr() as *const c_void, cwd_w.as_ptr(), &startup.StartupInfo as *const STARTUPINFOW as *const _, &mut info) };
+    let created = unsafe { CreateProcessW(program_w.as_ptr(), command.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | DETACHED_PROCESS, environment, cwd_w.as_ptr(), &startup.StartupInfo as *const STARTUPINFOW as *const _, &mut info) };
     let error = std::io::Error::last_os_error();
     unsafe {
         DeleteProcThreadAttributeList(list_ptr);
@@ -149,8 +166,8 @@ pub fn spawn(program: &Path, args: &[String], cwd: &Path, env: &[(String, String
         unsafe { terminate_process(info.hProcess); CloseHandle(info.hProcess); CloseHandle(info.hThread); CloseHandle(job); CloseHandle(stdin_write); CloseHandle(stdout_read); }
         return Err("Unable to place the worker in its job object.".into());
     }
-    unsafe { ResumeThread(info.hThread); CloseHandle(info.hThread); CloseHandle(info.hProcess); }
-    Ok(Sandboxed { stdin: unsafe { File::from_raw_handle(stdin_write as _) }, stdout: unsafe { File::from_raw_handle(stdout_read as _) }, job })
+    unsafe { ResumeThread(info.hThread); CloseHandle(info.hThread); }
+    Ok(Sandboxed { stdin: unsafe { File::from_raw_handle(stdin_write as _) }, stdout: unsafe { File::from_raw_handle(stdout_read as _) }, job, process: info.hProcess })
 }
 
 unsafe fn terminate_process(process: HANDLE) { windows_sys::Win32::System::Threading::TerminateProcess(process, 1); }
