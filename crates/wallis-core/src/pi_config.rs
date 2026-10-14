@@ -55,9 +55,9 @@ pub fn install_packages(pi_program: &str, dir: &Path, packages: &[String]) -> Re
     })
 }
 
-/// `GET {base}/models` as OpenAI-compatible servers answer it: model ids plus, when the server exposes them, reasoning levels.
+/// `GET {base}/models` as OpenAI-compatible servers answer it: model ids plus, per model and only when the server exposes them, reasoning levels.
 #[derive(Debug, Default, PartialEq, serde::Serialize)]
-pub struct ProviderModels { pub models: Vec<String>, pub efforts: Vec<String> }
+pub struct ProviderModels { pub models: Vec<String>, pub efforts: std::collections::BTreeMap<String, Vec<String>> }
 
 pub fn parse_models(body: &str) -> Result<ProviderModels, String> {
     let root: Value = serde_json::from_str(body).map_err(|_| "The provider did not return JSON from /models.".to_string())?;
@@ -67,7 +67,8 @@ pub fn parse_models(body: &str) -> Result<ProviderModels, String> {
     for item in items {
         let Some(id) = item.get("id").and_then(Value::as_str) else { continue };
         out.models.push(id.into());
-        for effort in strings(item.get("reasoning_efforts").or_else(|| item.get("supported_reasoning_efforts"))) { if !out.efforts.contains(&effort) { out.efforts.push(effort); } }
+        let levels = strings(item.get("reasoning_efforts").or_else(|| item.get("supported_reasoning_efforts")));
+        if !levels.is_empty() { out.efforts.insert(id.into(), levels); }
     }
     out.models.sort();
     Ok(out)
@@ -94,9 +95,9 @@ mod tests {
     #[test]
     fn reads_models_and_reasoning_levels_only_when_the_provider_exposes_them() {
         let plain = parse_models(r#"{"data":[{"id":"b"},{"id":"a"}]}"#).unwrap();
-        assert_eq!((plain.models, plain.efforts), (vec!["a".to_string(), "b".into()], vec![]));
+        assert_eq!((plain.models, plain.efforts.is_empty()), (vec!["a".to_string(), "b".into()], true));
         let rich = parse_models(r#"{"data":[{"id":"m","reasoning_efforts":["low","high"]},{"id":"n","reasoning_efforts":["high"]}]}"#).unwrap();
-        assert_eq!(rich.efforts, vec!["low", "high"]);
+        assert_eq!((rich.efforts["m"].clone(), rich.efforts["n"].clone()), (vec!["low".to_string(), "high".into()], vec!["high".to_string()]));
         assert!(parse_models("<html>").is_err() && parse_models("{}").is_err());
     }
 

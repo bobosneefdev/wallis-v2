@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { CodexModel } from "./invoke";
-import { chooseModel, packageError, parsePackages, selectedModel } from "./roles";
+import { chooseCustomModel, chooseModel, packageError, parsePackages, selectedModel } from "./roles";
 
 const sol: CodexModel = { id: "gpt-6.1-sol", label: "Sol", description: "", efforts: ["low", "medium", "high", "ultra"], defaultEffort: "medium", supportsFast: true };
 const luna: CodexModel = { id: "gpt-6-luna", label: "Luna", description: "", efforts: ["low", "medium"], defaultEffort: "low", supportsFast: false };
@@ -12,6 +12,15 @@ describe("chooseModel", () => {
   });
   test("keeps supported settings and switches a custom provider to Codex", () => {
     expect(chooseModel({ ...role, provider: "custom" }, sol)).toEqual(role);
+  });
+});
+
+describe("chooseCustomModel", () => {
+  test("keeps a level the model lists, otherwise takes its first, and leaves unlisted models alone", () => {
+    const efforts = { a: ["low", "high"], b: ["medium"] };
+    expect(chooseCustomModel({ ...role, effort: "high" }, "a", efforts).effort).toBe("high");
+    expect(chooseCustomModel({ ...role, effort: "high" }, "b", efforts).effort).toBe("medium");
+    expect(chooseCustomModel({ ...role, effort: "high" }, "c", efforts).effort).toBe("high");
   });
 });
 

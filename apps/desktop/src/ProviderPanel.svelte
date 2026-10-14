@@ -31,7 +31,7 @@
   const refresh = () => run("Asking the provider for its models…", async () => {
     if (signedIn) codex = await invoke("codex_models");
     if (provider.baseUrl) provider = await invoke("refresh_provider_models");
-    note = provider.models.length ? `${provider.models.length} models found${provider.efforts.length ? " with reasoning levels" : "; the provider lists no reasoning levels, so those stay text fields"}.` : "Refreshed. The provider lists no models, so model fields stay text inputs.";
+    note = provider.models.length ? `${provider.models.length} models found${Object.keys(provider.efforts).length ? `, ${Object.keys(provider.efforts).length} with reasoning levels` : "; the provider lists no reasoning levels, so those stay text fields"}.` : "Refreshed. The provider lists no models, so model fields stay text inputs.";
   });
 </script>
 

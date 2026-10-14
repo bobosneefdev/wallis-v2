@@ -9,7 +9,7 @@
   let tab = $state<(typeof tabs)[number][0]>("realtime");
   let signedIn = $state(false);
   let codex = $state<CodexModel[]>([]);
-  let provider = $state<Provider>({ baseUrl: "", models: [], efforts: [], hasKey: false });
+  let provider = $state<Provider>({ baseUrl: "", models: [], efforts: {}, hasKey: false });
   let roles = $state<Roles>({ realtime: empty(), worker: empty() });
   let message = $state("");
 

@@ -41,8 +41,8 @@ export type CodexModel = { id: string; label: string; description: string; effor
 
 export type RoleConfig = { provider: string; model: string; effort: string; fast: boolean; packages: string[] };
 
-/** The OpenAI-compatible endpoint. `models`/`efforts` are whatever the provider's /models exposed (empty: use text inputs). */
-export type Provider = { baseUrl: string; models: string[]; efforts: string[]; hasKey: boolean };
+/** The OpenAI-compatible endpoint. `models` and per-model `efforts` are whatever the provider's /models exposed (missing: use text inputs). */
+export type Provider = { baseUrl: string; models: string[]; efforts: Record<string, string[]>; hasKey: boolean };
 
 export type Stats = { turns: number; steers: number; errors: number; lastTurnMs: number; averageTurnMs: number };
 
