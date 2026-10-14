@@ -7,3 +7,4 @@ pub mod jobs;
 pub mod pi;
 pub mod prompts;
 pub mod role;
+pub mod worker;
