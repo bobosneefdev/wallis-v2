@@ -66,7 +66,19 @@ export type WallisConfig = {
   silenceMs: number;
 };
 
+export type CodexModel = { id: string; label: string; description: string; efforts: string[]; defaultEffort: string; supportsFast: boolean };
+
+export type RoleConfig = { provider: string; model: string; effort: string; fast: boolean };
+
+export type Roles = { realtime: RoleConfig; worker: RoleConfig };
+
 type Commands = {
+  codex_signed_in: boolean;
+  codex_sign_in: boolean;
+  codex_sign_out: boolean;
+  codex_models: CodexModel[];
+  get_roles: Roles;
+  save_roles: Roles;
   get_setup_status: SetupStatus;
   get_runtime_status: RuntimeStatus;
   get_stage: Stage;

@@ -68,3 +68,30 @@ pub async fn codex_models(app: tauri::AppHandle) -> Result<Vec<catalog::CodexMod
         catalog::parse_codex_catalog(&codex_auth::fetch_catalog(&credentials, env!("CARGO_PKG_VERSION"))?)
     }).await.map_err(|error| error.to_string())?
 }
+
+const ROLES_FILE: &str = "roles.json";
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Roles { pub realtime: wallis_core::role::RoleConfig, pub worker: wallis_core::role::RoleConfig }
+
+#[tauri::command]
+pub fn get_roles(state: State<'_, AppState>) -> Result<Roles, String> {
+    let path = app_data(&state)?.join(ROLES_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|error| format!("{} is invalid: {error}", path.display())),
+        Err(_) => Ok(Roles::default()),
+    }
+}
+
+/// Each role is configured on its own; an unset role stays empty rather than failing the save.
+#[tauri::command]
+pub fn save_roles(roles: Roles, state: State<'_, AppState>) -> Result<Roles, String> {
+    for (name, role) in [("Realtime", &roles.realtime), ("Worker", &roles.worker)] {
+        if role.is_configured() { role.validate().map_err(|error| format!("{name}: {error}"))?; }
+    }
+    let dir = app_data(&state)?;
+    std::fs::create_dir_all(&dir).map_err(|error| format!("Unable to create the Wallis data folder: {error}"))?;
+    std::fs::write(dir.join(ROLES_FILE), serde_json::to_string_pretty(&roles).map_err(|error| error.to_string())?).map_err(|error| format!("Unable to save roles: {error}"))?;
+    Ok(roles)
+}

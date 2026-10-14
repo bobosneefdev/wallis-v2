@@ -1,8 +1,11 @@
 import "./styles.css";
+import { mount } from "svelte";
+import RoleSettings from "./RoleSettings.svelte";
 import { validateConfig } from "./config";
 import { Chart } from "chart.js/auto";
 import { EFFORTS, EFFORT_LABELS, invoke, type VoiceCycle, type VoiceOption, type Profile, type ProviderOption, type RuntimeStatus, type SecretStatus, type SetupStatus, type WallisConfig } from "./invoke";
 
+// ponytail: roles panel is the first Svelte piece; the rest of this file is ported over in the UI rewrite.
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("Wallis mount is missing");
 
@@ -74,6 +77,7 @@ app.innerHTML = `
     <div id="pane-profile" role="tabpanel" aria-labelledby="tab-profile" hidden><div id="profile-host"></div></div>
 
     <div id="pane-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <div id="roles-host"></div>
       <div id="inference-home"><section aria-labelledby="inference-title"><h2 id="inference-title">AI models</h2><form id="inference-form">
         <div id="model-purpose-field"><label for="model-purpose">Purpose</label><select id="model-purpose"><option value="realtime">Realtime — conversation</option><option value="background">Background — coding and substantial work</option></select></div>
         <p id="model-purpose-hint" class="hint">Realtime keeps conversation responsive. Background work can finish while you keep talking.</p>
@@ -522,4 +526,5 @@ openTerminalButton.addEventListener("click", async () => {
   try { await invoke("open_terminal"); } catch (error) { appendTerminal("open shell window", error instanceof Error ? error.message : String(error)); }
 });
 
+mount(RoleSettings, { target: pick("#roles-host") });
 void load();
