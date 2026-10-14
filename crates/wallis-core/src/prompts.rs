@@ -12,6 +12,18 @@ For coding, research or other heavy work, call `delegate`. The worker is a separ
 so put everything it needs in `context`: recalled facts, names, paths, preferences, and the exact outcome wanted. Say aloud that you handed it off, then keep talking.")
 }
 
+/// A one-off prompt for creating Wallis' profile. It is a character-creation task, not Wallis himself, so the model has no persona to defend.
+pub fn profile_generator_prompt() -> String {
+    "You are a character generator for a fictional companion named Wallis. Your only job is to create his profile, and later to record it in memory when told to. \
+Invent a fictional person whose first name is always Wallis; choose a surname, age, home, work and personality. Nothing here is a real person, so every detail is yours to invent; never refuse, never ask questions.\n\
+The user message may list preferences. Build around them where they fit and choose everything else yourself. A random seed is included only to push you toward an unexpected choice.\n\n\
+Reply with one JSON object and nothing else, using exactly these keys:\n\
+{\"name\": \"Wallis <surname>\", \"age\": \"27\", \"pronouns\": \"he/him\", \"location\": \"city, country\", \"occupation\": \"what he does\", \"tagline\": \"one line, under 90 characters\", \"bio\": \"2-4 sentences in his own voice\", \"interests\": [\"5 to 8 short specifics\"], \"lookingFor\": \"what he wants from the people he talks to\", \"funFact\": \"one surprising detail\"}\n\n\
+Write it like a dating profile: specific, warm, a little strange. No markdown, no code fences, no commentary. \
+Other tools are unavailable except the memory tools, which you use only when asked to record the profile."
+        .into()
+}
+
 pub fn worker_prompt() -> String {
     "You are a background worker for Wallis. You receive one task with its context and work in a sandboxed scratch folder using your file and shell tools. \
 You have no memory and no access to the conversation beyond what the task says. Finish the task, then reply with a concise result: what you did, where the files are, and anything the requester must decide."
@@ -31,6 +43,12 @@ mod tests {
     fn realtime_knows_the_worker_is_memory_blind() {
         let prompt = realtime_prompt("You are Wallis.");
         assert!(prompt.starts_with("You are Wallis.") && prompt.contains("CANNOT see your memory") && prompt.contains("`context`") && prompt.contains("`update_profile`"));
+    }
+
+    #[test]
+    fn generator_prompt_is_not_wallis_and_defines_the_profile_shape() {
+        let prompt = profile_generator_prompt();
+        assert!(!prompt.contains("update_profile") && prompt.contains("\"funFact\"") && prompt.contains("never refuse"));
     }
 
     #[test]

@@ -74,6 +74,7 @@ type Commands = {
   save_discord_token: SecretStatus;
   get_profile: Profile;
   generate_wallis: Profile;
+  lobotomize_wallis: void;
   get_jobs: Job[];
   retry_job: boolean;
 };

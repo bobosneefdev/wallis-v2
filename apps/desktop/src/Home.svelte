@@ -1,17 +1,11 @@
 <script lang="ts">
-  import { validateConfig } from "./config";
-  import { defaultConfig, invoke, type Job, type RuntimeStatus, type Stats, type UpdateCheck, type VoiceOption, type WallisConfig } from "./invoke";
+  import { invoke, type Job, type RuntimeStatus, type Stats, type UpdateCheck } from "./invoke";
 
-  let { runtime = $bindable(), onboarded, refreshConfig }: { runtime: RuntimeStatus; onboarded: boolean; refreshConfig: () => void } = $props();
+  let { runtime = $bindable(), hasProfile, hasToken }: { runtime: RuntimeStatus; hasProfile: boolean; hasToken: boolean } = $props();
 
   const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
   const seconds = (ms: number) => (ms ? `${(ms / 1000).toFixed(1)} s` : "—");
 
-  let config = $state<WallisConfig>(defaultConfig());
-  let hasToken = $state(false);
-  let token = $state("");
-  let sttOptions = $state<VoiceOption[]>([]);
-  let ttsOptions = $state<VoiceOption[]>([]);
   let jobs = $state<Job[]>([]);
   let stats = $state<Stats | null>(null);
   let progress = $state("");
@@ -22,13 +16,6 @@
   async function poll() {
     runtime = await invoke("get_runtime_status");
     [jobs, stats] = await Promise.all([invoke("get_jobs").catch(() => []), invoke("get_stats").catch(() => null)]);
-  }
-
-  async function load() {
-    try {
-      [config, hasToken, [sttOptions, ttsOptions]] = await Promise.all([invoke("get_config"), invoke("get_secret_status").then((s) => s.hasToken), invoke("get_voice_options")]);
-      await poll();
-    } catch (error) { note = message(error); }
   }
 
   /** Runs a long command while polling Rust for the current install step. */
@@ -43,23 +30,9 @@
   const checkUpdate = async () => { update = (await work("Checking for updates…", () => invoke("check_update"))) ?? null; if (update) note = ""; };
   const installUpdate = () => work("Updating Wallis…", () => invoke("install_update"));
 
-  async function save(event: SubmitEvent) {
-    event.preventDefault();
-    const clean = { ...config, discordReadChannels: config.discordReadChannels.replace(/\s/g, ""), discordWriteChannels: config.discordWriteChannels.replace(/\s/g, ""), discordVoiceTextChannel: config.discordVoiceTextChannel.trim() };
-    const problem = validateConfig(clean);
-    if (problem) { note = problem; return; }
-    try {
-      config = await invoke("save_config", { config: clean });
-      if (token) hasToken = (await invoke("save_discord_token", { token })).hasToken;
-      token = "";
-      note = "Saved. Restart Wallis to apply Discord and voice changes.";
-      refreshConfig();
-    } catch (error) { note = message(error); }
-  }
-
   async function retry(id: number) { await invoke("retry_job", { id }).catch((error) => (note = message(error))); await poll(); }
 
-  void load();
+  void poll().catch((error) => (note = message(error)));
   setInterval(() => { if (!busy) void poll().catch(() => {}); }, 5000);
 </script>
 
@@ -68,10 +41,10 @@
   <h2 id="run-title">Status</h2>
   <p role="status" aria-live="polite">{progress || note || runtime.message}</p>
   <div class="actions">
-    <button type="button" disabled={busy || runtime.state === "running" || !onboarded || !hasToken} onclick={start}>Bring online</button>
+    <button type="button" disabled={busy || runtime.state === "running" || !hasProfile || !hasToken} onclick={start}>Bring online</button>
     <button type="button" class="secondary" disabled={runtime.state !== "running"} onclick={stop}>Take offline</button>
   </div>
-  {#if !hasToken}<p class="hint">Add your Discord bot token below to start.</p>{:else if !onboarded}<p class="hint">Choose models on the Inference page, then create Wallis on the Profile page.</p>{/if}
+  {#if !hasProfile}<p class="hint">Choose models on the Inference page, then generate Wallis on the Profile page.</p>{:else if !hasToken}<p class="hint">Add your Discord bot token on the Discord page to start.</p>{/if}
 </section>
 
 <section aria-labelledby="perf-title">
@@ -106,38 +79,4 @@
     <button type="button" class="secondary" disabled={busy} onclick={checkUpdate}>Check for updates</button>
     {#if update?.available}<button type="button" disabled={busy} onclick={installUpdate}>Update and restart</button>{/if}
   </div>
-</section>
-
-<section aria-labelledby="discord-title">
-  <h2 id="discord-title">Discord and voice</h2>
-  <form onsubmit={save}>
-    <label for="token">Bot token</label>
-    <input id="token" type="password" bind:value={token} placeholder={hasToken ? "Stored securely — type to replace" : "Paste the bot token"} autocomplete="off" />
-    <label for="app-id">Application ID <span>(optional)</span></label>
-    <input id="app-id" bind:value={config.discordApplicationId} autocomplete="off" />
-    <label for="users">Allowed user IDs <span>(comma separated, or *)</span></label>
-    <input id="users" bind:value={config.discordAllowedUsers} autocomplete="off" required />
-    <label for="read">Channels Wallis reads <span>(IDs)</span></label>
-    <input id="read" bind:value={config.discordReadChannels} autocomplete="off" />
-    <label for="write">Channels Wallis may write to <span>(IDs)</span></label>
-    <input id="write" bind:value={config.discordWriteChannels} autocomplete="off" />
-    <label for="voice-text">Voice call text channel <span>(one of the write channels)</span></label>
-    <input id="voice-text" bind:value={config.discordVoiceTextChannel} autocomplete="off" />
-    <label for="voice-mode">Voice participation</label>
-    <select id="voice-mode" bind:value={config.voiceParticipation}><option value="natural">Join in naturally</option><option value="mentions">Only when addressed</option></select>
-    <label for="text-mode">Text participation</label>
-    <select id="text-mode" bind:value={config.textParticipation}><option value="natural">Join in naturally</option><option value="mentions">Only when mentioned</option></select>
-    <label for="cooldown">Seconds between unprompted contributions</label>
-    <input id="cooldown" type="number" min="5" max="300" bind:value={config.participationCooldownSecs} />
-    <label for="stt">Speech recognition</label>
-    <select id="stt" bind:value={config.sttModel}>{#each sttOptions as option (option.id)}<option value={option.id}>{option.label} · {option.megabytes} MB</option>{/each}</select>
-    <label for="threads">Recognition threads</label>
-    <input id="threads" type="number" min="1" max="64" bind:value={config.sttThreads} />
-    <label for="tts">Voice</label>
-    <select id="tts" bind:value={config.ttsVoice}>{#each ttsOptions as option (option.id)}<option value={option.id}>{option.label} · {option.megabytes} MB</option>{/each}</select>
-    <label for="speed">Speaking speed <span>(lower is faster; also changes pitch)</span></label>
-    <input id="speed" type="number" min="0.5" max="2" step="0.05" bind:value={config.ttsSpeed} />
-    <label class="check"><input type="checkbox" bind:checked={config.autoStart} /> Start Wallis when the app opens</label>
-    <button type="submit">Save</button>
-  </form>
 </section>
