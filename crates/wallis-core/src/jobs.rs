@@ -31,6 +31,18 @@ impl Jobs {
         self.0.execute("UPDATE jobs SET status=?2, result=?3 WHERE id=?1", params![id, if ok { "done" } else { "failed" }, result]).map(|_| ()).map_err(|error| error.to_string())
     }
 
+    /// Manual retry of a failed job: back to the queue, same task.
+    pub fn retry(&self, id: i64) -> Result<bool, String> {
+        self.0.execute("UPDATE jobs SET status='queued', result=NULL WHERE id=?1 AND status='failed'", params![id]).map(|changed| changed == 1).map_err(|error| error.to_string())
+    }
+
+    /// Oldest queued job, marked running so nothing else picks it up.
+    pub fn claim(&self) -> Result<Option<Job>, String> {
+        let Some(job) = self.with_status(&["queued"])?.into_iter().next() else { return Ok(None) };
+        self.0.execute("UPDATE jobs SET status='running' WHERE id=?1", params![job.id]).map_err(|error| error.to_string())?;
+        Ok(Some(Job { status: "running".into(), ..job }))
+    }
+
     pub fn with_status(&self, statuses: &[&str]) -> Result<Vec<Job>, String> {
         let mut statement = self.0.prepare("SELECT id, task, channel_id, status FROM jobs ORDER BY id").map_err(|error| error.to_string())?;
         let rows = statement.query_map([], |row| Ok(Job { id: row.get(0)?, task: row.get(1)?, channel_id: row.get(2)?, status: row.get(3)? })).map_err(|error| error.to_string())?;
@@ -51,5 +63,8 @@ mod tests {
         assert_eq!(interrupted.iter().map(|job| job.id).collect::<Vec<_>>(), vec![b, c]);
         assert_eq!(jobs.with_status(&["failed"]).unwrap().len(), 2);
         assert!(jobs.fail_interrupted().unwrap().is_empty(), "idempotent");
+        assert!(jobs.retry(b).unwrap() && !jobs.retry(a).unwrap(), "only failed jobs can be retried");
+        assert_eq!(jobs.claim().unwrap().map(|job| (job.id, job.status)), Some((b, "running".into())));
+        assert!(jobs.claim().unwrap().is_none(), "a claimed job is not handed out twice");
     }
 }

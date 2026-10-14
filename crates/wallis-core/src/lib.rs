@@ -2,6 +2,7 @@
 pub mod agent;
 pub mod catalog;
 pub mod codex_auth;
+pub mod host;
 pub mod jobs;
 pub mod pi;
 pub mod prompts;
