@@ -35,6 +35,36 @@ impl LineSplitter {
     }
 }
 
+/// The extension embedded in the app; written next to Pi's per-role config and loaded with `-e`.
+pub const EXTENSION: &str = include_str!("../pi/wallis.ts");
+
+/// Environment that tells the extension which role it serves and how to shape Codex requests.
+pub fn role_env(role: Role, config: &RoleConfig) -> Vec<(&'static str, String)> {
+    vec![
+        ("WALLIS_ROLE", if role == Role::Realtime { "realtime" } else { "worker" }.into()),
+        ("WALLIS_EFFORT", config.effort.clone()),
+        ("WALLIS_FAST", if config.fast { "1" } else { "0" }.into()),
+    ]
+}
+
+/// A tool call the extension forwards to the host through an `input` dialog.
+#[derive(Debug, PartialEq)]
+pub struct HostCall { pub request_id: String, pub tool: String, pub args: Value }
+
+const HOST_PREFIX: &str = "wallis-host:";
+
+pub fn parse_host_call(line: &str) -> Option<HostCall> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("type")?.as_str()? != "extension_ui_request" || value.get("method")?.as_str()? != "input" { return None; }
+    let payload: Value = serde_json::from_str(value.get("title")?.as_str()?.strip_prefix(HOST_PREFIX)?).ok()?;
+    Some(HostCall { request_id: value.get("id")?.as_str()?.into(), tool: payload.get("tool")?.as_str()?.into(), args: payload.get("args").cloned().unwrap_or(Value::Null) })
+}
+
+/// Answers a host call; the string becomes the tool result the model sees.
+pub fn host_reply(request_id: &str, result: &str) -> Value {
+    serde_json::json!({ "type": "extension_ui_response", "id": request_id, "value": result })
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Event {
     TextDelta(String),
@@ -94,6 +124,24 @@ mod tests {
         assert_eq!(parse_event(r#"{"type":"agent_settled","aborted":false}"#).unwrap(), Event::Settled { aborted: false });
         assert_eq!(parse_event(r#"{"type":"turn_end"}"#).unwrap(), Event::Other);
         assert!(parse_event("not json").is_err());
+    }
+
+    #[test]
+    fn routes_extension_tool_calls_to_the_host_and_ignores_other_dialogs() {
+        let line = json!({"type":"extension_ui_request","id":"u1","method":"input","title":"wallis-host:{\"tool\":\"say\",\"args\":{\"text\":\"hi\"}}"}).to_string();
+        let call = parse_host_call(&line).unwrap();
+        assert_eq!((call.request_id.as_str(), call.tool.as_str(), &call.args), ("u1", "say", &json!({"text":"hi"})));
+        assert_eq!(host_reply("u1", "ok")["value"], "ok");
+        assert!(parse_host_call(r#"{"type":"extension_ui_request","id":"u2","method":"input","title":"Enter a value"}"#).is_none());
+        assert!(parse_host_call(r#"{"type":"extension_ui_request","id":"u3","method":"notify","title":"wallis-host:{}"}"#).is_none());
+    }
+
+    #[test]
+    fn extension_ships_with_the_tools_and_the_role_gate() {
+        for tool in ["\"say\"", "\"message\"", "\"file\"", "\"skip\"", "\"delegate\""] { assert!(EXTENSION.contains(tool), "{tool}"); }
+        assert!(EXTENSION.contains("WALLIS_ROLE") && EXTENSION.contains("service_tier"));
+        let env = role_env(Role::Worker, &RoleConfig { fast: true, ..RoleConfig::default() });
+        assert!(env.contains(&("WALLIS_ROLE", "worker".to_string())) && env.contains(&("WALLIS_FAST", "1".to_string())));
     }
 
     #[test]
