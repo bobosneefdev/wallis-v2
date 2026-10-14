@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/wallis-core", "src-tauri"]
+members = ["crates/wallis-core", "crates/wallis-discord", "src-tauri"]
 resolver = "2"
 
 [profile.release]
