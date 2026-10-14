@@ -2,7 +2,9 @@
 //! a second thread runs delegated jobs on the sandbox-free worker agent (sandboxing wraps `worker_program`).
 use crate::{Incoming, Out};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wallis_core::agent::Agent;
 use wallis_core::host::{Discord, Host};
@@ -54,21 +56,24 @@ pub fn turn_prompt(mode: Mode, channel: u64, speaker: &str, said: &str) -> Strin
     }
 }
 
+/// The realtime Pi: memory (Mnemosyne over MCP) plus Wallis' own tools, no shell or files.
+pub fn spawn_realtime(config: &BotConfig) -> Result<Agent, String> {
+    let dir = config.data_dir.join("pi").join("realtime");
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let mcp = prompts::realtime_mcp(&config.python, &config.data_dir.join("memory").to_string_lossy());
+    std::fs::write(dir.join("mcp.json"), mcp.to_string()).map_err(|error| error.to_string())?;
+    let cwd = config.data_dir.join("realtime-cwd");
+    std::fs::create_dir_all(&cwd).map_err(|error| error.to_string())?;
+    Agent::spawn(&config.pi_program, Role::Realtime, &config.realtime, &dir, &prompts::realtime_prompt(&config.persona), &cwd)
+}
+
 struct Brain { config: BotConfig, out: Out, jobs: Jobs, agent: Option<Agent>, last_reply_at: Option<Instant>, last_reply_user: Option<u64>, next_consider_at: Instant, started: Instant }
 
 impl Brain {
     fn ms(&self, at: Instant) -> u64 { at.duration_since(self.started).as_millis() as u64 }
 
     fn agent(&mut self) -> Result<&mut Agent, String> {
-        if self.agent.is_none() {
-            let dir = self.config.data_dir.join("pi").join("realtime");
-            std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-            let mcp = prompts::realtime_mcp(&self.config.python, &self.config.data_dir.join("memory").to_string_lossy());
-            std::fs::write(dir.join("mcp.json"), mcp.to_string()).map_err(|error| error.to_string())?;
-            let cwd = self.config.data_dir.join("realtime-cwd");
-            std::fs::create_dir_all(&cwd).map_err(|error| error.to_string())?;
-            self.agent = Some(Agent::spawn(&self.config.pi_program, Role::Realtime, &self.config.realtime, &dir, &prompts::realtime_prompt(&self.config.persona), &cwd)?);
-        }
+        if self.agent.is_none() { self.agent = Some(spawn_realtime(&self.config)?); }
         Ok(self.agent.as_mut().expect("agent just created"))
     }
 
@@ -119,8 +124,15 @@ impl Brain {
     }
 }
 
-/// Starts the brain and worker threads. Returns the sender to feed Discord events into.
-pub fn start(config: BotConfig, out: Out) -> Result<Sender<Incoming>, String> {
+/// The running brain and worker threads. Dropping it stops them (the worker after its current job).
+pub struct Bot { pub sender: Sender<Incoming>, stop: Arc<AtomicBool> }
+
+impl Drop for Bot {
+    fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); }
+}
+
+/// Starts the brain and worker threads. Feed Discord events into `Bot::sender`.
+pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
     std::fs::create_dir_all(&config.data_dir).map_err(|error| error.to_string())?;
     let db = config.data_dir.join("jobs.sqlite").to_string_lossy().to_string();
     let interrupted = Jobs::open(&db)?.fail_interrupted()?;
@@ -135,11 +147,13 @@ pub fn start(config: BotConfig, out: Out) -> Result<Sender<Incoming>, String> {
         while let Ok(event) = receiver.recv() { brain.handle(event); }
     });
 
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = stop.clone();
     std::thread::spawn(move || {
         let Ok(jobs) = Jobs::open(&db) else { return };
         let scratch = config.data_dir.join("worker-scratch");
         let dir = config.data_dir.join("pi").join("worker");
-        loop {
+        while !worker_stop.load(Ordering::Relaxed) {
             let mut sink = WorkerSink(&out);
             let mut start = || { std::fs::create_dir_all(&scratch).map_err(|error| error.to_string())?; Agent::spawn(&config.worker_program, Role::Worker, &config.worker, &dir, &prompts::worker_prompt(), &scratch) };
             match worker::run_next(&jobs, &mut sink, &mut start, Duration::from_secs(300)) {
@@ -149,7 +163,7 @@ pub fn start(config: BotConfig, out: Out) -> Result<Sender<Incoming>, String> {
             }
         }
     });
-    Ok(sender)
+    Ok(Bot { sender, stop })
 }
 
 #[cfg(test)]

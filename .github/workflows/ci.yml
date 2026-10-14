@@ -41,7 +41,10 @@ jobs:
       - name: Cache Rust build artifacts
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
+          workspaces: . -> target
 
       - name: Cargo check
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+        run: cargo check --workspace
+
+      - name: Cargo test
+        run: cargo test -p wallis-core -p wallis-discord

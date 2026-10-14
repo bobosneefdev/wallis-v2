@@ -4,7 +4,8 @@ use rusqlite::{params, Connection};
 
 pub struct Jobs(Connection);
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Job { pub id: i64, pub task: String, pub channel_id: String, pub status: String }
 
 impl Jobs {

@@ -69,7 +69,7 @@ pub async fn codex_models(app: tauri::AppHandle) -> Result<Vec<catalog::CodexMod
     }).await.map_err(|error| error.to_string())?
 }
 
-const ROLES_FILE: &str = "roles.json";
+pub const ROLES_FILE: &str = "roles.json";
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]

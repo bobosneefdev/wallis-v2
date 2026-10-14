@@ -6643,7 +6643,9 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "tokio",
  "wallis-core",
+ "wallis-discord",
  "windows-sys 0.59.0",
 ]
 
