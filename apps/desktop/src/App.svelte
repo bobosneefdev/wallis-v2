@@ -1,7 +1,7 @@
 <script lang="ts">
   import RoleSettings from "./RoleSettings.svelte";
   import { validateConfig } from "./config";
-  import { defaultConfig, invoke, type Job, type Profile, type RuntimeStatus, type VoiceOption, type WallisConfig } from "./invoke";
+  import { defaultConfig, invoke, type Job, type Profile, type RuntimeStatus, type UpdateCheck, type VoiceOption, type WallisConfig } from "./invoke";
 
   const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 
@@ -16,6 +16,7 @@
   let progress = $state("");
   let busy = $state(false);
   let note = $state("");
+  let update = $state<UpdateCheck | null>(null);
 
   async function refresh() {
     runtime = await invoke("get_runtime_status");
@@ -40,6 +41,9 @@
   const generate = async () => { const next = await work("Wallis is inventing himself…", () => invoke("generate_wallis")); if (next) { profile = next; config = await invoke("get_config"); note = ""; } };
   const start = async () => { const next = await work("Starting Wallis…", () => invoke("start_wallis")); if (next) { runtime = next; note = ""; } };
   const stop = async () => { runtime = await invoke("stop_wallis"); };
+
+  const checkUpdate = async () => { update = (await work("Checking for updates…", () => invoke("check_update"))) ?? null; if (update) note = ""; };
+  const installUpdate = () => work("Updating Wallis…", () => invoke("install_update"));
 
   async function save(event: SubmitEvent) {
     event.preventDefault();
@@ -92,6 +96,15 @@
 </section>
 
 <RoleSettings />
+
+<section aria-labelledby="update-title">
+  <h2 id="update-title">Updates</h2>
+  <p class="hint">{#if !update}Wallis updates itself from the latest GitHub release.{:else if update.available}Wallis {update.latest} is available (you have {update.current}).{:else}Wallis {update.current} is up to date.{/if}</p>
+  <div class="actions">
+    <button type="button" class="secondary" disabled={busy} onclick={checkUpdate}>Check for updates</button>
+    {#if update?.available}<button type="button" disabled={busy} onclick={installUpdate}>Update and restart</button>{/if}
+  </div>
+</section>
 
 <section aria-labelledby="discord-title">
   <h2 id="discord-title">Discord and voice</h2>

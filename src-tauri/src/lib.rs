@@ -7,12 +7,14 @@ use tauri::{Manager, State};
 use wallis_core::jobs::{Job, Jobs};
 use wallis_core::participation::Participation;
 use wallis_core::provision::{self, Layout, SpeechServers, STT_MODELS, TTS_VOICES};
+use wallis_core::update;
 use wallis_discord::bot::{self, Bot, BotConfig};
 
 const FIRST_NAME: &str = "Wallis";
 const CONFIG_FILE: &str = "config.json";
 const TOKEN_FILE: &str = "discord-token.dpapi";
 const PROFILE_FILE: &str = "profile.json";
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// What the bot needs while it runs. Dropping it stops speech servers and the bot; the gateway dies with the runtime.
 struct Running { bot: Arc<Mutex<Option<Bot>>>, _servers: SpeechServers, runtime: Option<tokio::runtime::Runtime>, failure: Arc<Mutex<Option<String>>> }
@@ -330,6 +332,36 @@ fn get_runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> WallisConfig { state.config.lock().expect("config state poisoned").clone() }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheck { current: String, latest: String, available: bool }
+
+#[tauri::command]
+async fn check_update() -> Result<UpdateCheck, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let latest = update::latest()?;
+        Ok(UpdateCheck { current: CURRENT_VERSION.into(), available: update::newer(CURRENT_VERSION, &latest.version), latest: latest.version })
+    }).await.map_err(|error| error.to_string())?
+}
+
+/// Downloads the latest installer, then hands over to it: it closes Wallis, upgrades in place and relaunches.
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = app_data(&app.state::<AppState>())?.join("updates");
+    tauri::async_runtime::spawn_blocking(move || {
+        let latest = update::latest()?;
+        if !update::newer(CURRENT_VERSION, &latest.version) { return Err("Wallis is already up to date.".to_string()); }
+        let state = app.state::<AppState>();
+        set_progress(&state, &format!("Downloading Wallis {}…", latest.version));
+        let setup = dir.join("Wallis-setup.exe");
+        provision::download_verified(&latest.url, &latest.sha256, &setup)?;
+        state.running.lock().expect("running state poisoned").take();
+        std::process::Command::new(&setup).args(["/P", "/R"]).spawn().map_err(|error| format!("Unable to start the installer: {error}"))?;
+        app.exit(0);
+        Ok(())
+    }).await.map_err(|error| error.to_string())?
+}
+
 #[tauri::command]
 fn get_progress(state: State<'_, AppState>) -> String { state.progress.lock().expect("progress state poisoned").clone() }
 
@@ -424,7 +456,7 @@ pub fn run() {
             std::thread::spawn(move || { let _ = start_inner(&handle.state::<AppState>()); });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_runtime_status, start_wallis, stop_wallis, get_config, save_config, get_secret_status, save_discord_token, get_profile, generate_wallis, get_progress, get_voice_options, get_jobs, retry_job, codex::codex_signed_in, codex::codex_sign_in, codex::codex_sign_out, codex::codex_models, codex::get_roles, codex::save_roles]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_runtime_status, start_wallis, stop_wallis, get_config, save_config, get_secret_status, save_discord_token, get_profile, generate_wallis, get_progress, check_update, install_update, get_voice_options, get_jobs, retry_job, codex::codex_signed_in, codex::codex_sign_in, codex::codex_sign_out, codex::codex_models, codex::get_roles, codex::save_roles]).run(tauri::generate_context!()).expect("error while running Wallis");
 }
 
 #[cfg(test)]

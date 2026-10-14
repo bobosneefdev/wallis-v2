@@ -43,6 +43,8 @@ export type RoleConfig = { provider: string; model: string; effort: string; fast
 
 export type Roles = { realtime: RoleConfig; worker: RoleConfig };
 
+export type UpdateCheck = { current: string; latest: string; available: boolean };
+
 type Commands = {
   codex_signed_in: boolean;
   codex_sign_in: boolean;
@@ -52,6 +54,8 @@ type Commands = {
   save_roles: Roles;
   get_runtime_status: RuntimeStatus;
   get_progress: string;
+  check_update: UpdateCheck;
+  install_update: void;
   get_voice_options: [VoiceOption[], VoiceOption[]];
   start_wallis: RuntimeStatus;
   stop_wallis: RuntimeStatus;

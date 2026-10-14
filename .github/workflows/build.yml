@@ -1,4 +1,4 @@
-name: Build
+name: Release
 
 on:
   push:
@@ -7,13 +7,28 @@ on:
 permissions:
   contents: read
 
-env:
-  TARGET: x86_64-pc-windows-gnullvm
-  MINGW: llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64
-
 jobs:
-  release:
-    runs-on: [self-hosted, Linux, X64]
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      new: ${{ steps.v.outputs.new }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" >/dev/null 2>&1; then echo "new=false" >> "$GITHUB_OUTPUT"; else echo "new=true" >> "$GITHUB_OUTPUT"; fi
+
+  installer:
+    needs: version
+    if: needs.version.outputs.new == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -23,33 +38,22 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
-      - run: bun run build
+      - run: bun run check
+
+      - run: bun run lint
+
+      - run: bun run test
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ env.TARGET }}
 
-      - name: Install the Windows cross toolchain
-        run: |
-          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/$MINGW.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/$MINGW/bin" >> "$GITHUB_PATH"
+      - uses: swatinem/rust-cache@v2
 
-      - name: Build the Windows release
+      - run: cargo test -p wallis-core
+
+      - run: bun run installer
+
+      - name: Publish release
+        shell: bash
         env:
-          RUSTFLAGS: -C target-feature=+crt-static -C link-arg=-static
-          CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER: x86_64-w64-mingw32-clang
-          CC_x86_64_pc_windows_gnullvm: x86_64-w64-mingw32-clang
-          AR_x86_64_pc_windows_gnullvm: llvm-ar
-        run: cargo build -p wallis --release --features custom-protocol --target "$TARGET"
-
-      - name: Collect
-        run: |
-          mkdir dist
-          cp "target/$TARGET/release/wallis.exe" dist/
-          cp "$(find "target/$TARGET/release/build" -path '*webview2-com-sys-*/out/x64/WebView2Loader.dll' | head -1)" dist/
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wallis-windows
-          path: dist/*
-          if-no-files-found: error
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v${{ needs.version.outputs.version }}" target/release/bundle/nsis/*-setup.exe --title "Wallis ${{ needs.version.outputs.version }}" --generate-notes

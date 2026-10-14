@@ -12,5 +12,6 @@ pub mod role;
 #[cfg(windows)]
 pub mod sandbox;
 pub mod speech;
+pub mod update;
 pub mod utterance;
 pub mod worker;
