@@ -266,6 +266,7 @@ fn bot_config(app_data: &Path, config: &WallisConfig, layout: &Layout) -> Result
         persona: persona(app_data), realtime: roles.realtime, worker: roles.worker, write_channels: list(&config.discord_write_channels),
         python: layout.python().to_string_lossy().into(), voice_participation: mode(&config.voice_participation), text_participation: mode(&config.text_participation),
         cooldown: Duration::from_secs(config.participation_cooldown_secs.into()), speech_speed: config.tts_speed,
+        sandbox_read: vec![layout.tools()], shell: layout.shell(),
     })
 }
 

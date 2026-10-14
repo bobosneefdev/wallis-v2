@@ -9,6 +9,8 @@ pub struct Artifact { pub name: &'static str, pub url: &'static str, pub sha256:
 pub const PI: Artifact = Artifact { name: "pi", url: "https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-windows-x64.zip", sha256: "bd272b508657ad8d0ac6176e7751913c848a89cfb8cbe21ff319941e6ca140be", strip: "" };
 pub const WHISPER: Artifact = Artifact { name: "whisper", url: "https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-x64.zip", sha256: "c2a4b60edb11f7e11a9191ffb50929535527d4d91c9903dbe3e554583bbbc63d", strip: "Release/" };
 pub const UV: Artifact = Artifact { name: "uv", url: "https://github.com/astral-sh/uv/releases/download/0.13.0/uv-x86_64-pc-windows-msvc.zip", sha256: "088962f9e7b7bd9ea740c04c650b2a21c8928c345bd99ac24350dc924dba656c", strip: "" };
+/// Git for Windows without the installer: its `usr/bin/sh.exe` (MSYS bash) is the worker's shell.
+pub const MINGIT: Artifact = Artifact { name: "mingit", url: "https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.2/MinGit-2.56.0.2-64-bit.zip", sha256: "da35e72aa21c005a5a0d298cfbae110bc1609a815730ea0dde84b01a1b3cd3be", strip: "" };
 /// Python packages installed into the app's own virtual environment (voice and realtime memory).
 pub const PIPER_PACKAGE: &str = "piper-tts==1.8.0";
 pub const MEMORY_PACKAGE: &str = "mnemosyne-memory[all]==3.15.1";
@@ -137,6 +139,8 @@ impl Layout {
     pub fn tools(&self) -> PathBuf { self.0.join("tools") }
     pub fn pi(&self) -> PathBuf { self.tools().join("pi").join(Self::exe("pi")) }
     pub fn whisper(&self) -> PathBuf { self.tools().join("whisper").join(Self::exe("whisper-server")) }
+    pub fn mingit(&self) -> PathBuf { self.tools().join("mingit") }
+    pub fn shell(&self) -> PathBuf { self.mingit().join("usr").join("bin").join(Self::exe("sh")) }
     pub fn uv(&self) -> PathBuf { self.tools().join("uv").join(Self::exe("uv")) }
     pub fn venv(&self) -> PathBuf { self.tools().join("venv") }
     pub fn python(&self) -> PathBuf { if cfg!(windows) { self.venv().join("Scripts").join("python.exe") } else { self.venv().join("bin").join("python") } }
@@ -165,6 +169,8 @@ pub fn ensure_all(layout: &Layout, stt: &str, tts: &str, progress: &dyn Fn(&str)
     progress("Installing speech recognition…");
     install(&WHISPER, &tools, &Layout::exe("whisper-server"))?;
     install(&UV, &tools, &Layout::exe("uv"))?;
+    progress("Installing the worker shell…");
+    install(&MINGIT, &tools, "usr/bin/sh.exe")?;
     if !layout.python().is_file() {
         progress("Setting up Python for voice and memory…");
         run(&layout.uv(), &["venv", "--python", PYTHON_VERSION, &layout.venv().to_string_lossy()], "create the Python environment")?;

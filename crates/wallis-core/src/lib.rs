@@ -9,6 +9,8 @@ pub mod pi;
 pub mod prompts;
 pub mod provision;
 pub mod role;
+#[cfg(windows)]
+pub mod sandbox;
 pub mod speech;
 pub mod utterance;
 pub mod worker;

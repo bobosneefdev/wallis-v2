@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use wallis_core::agent::Agent;
+use wallis_core::agent::{Access, Agent};
 use wallis_core::host::{Discord, Host};
 use wallis_core::jobs::Jobs;
 use wallis_core::participation::{names_wallis, should_consider, Mode, Participation, State, Turn};
@@ -28,6 +28,9 @@ pub struct BotConfig {
     pub text_participation: Participation,
     pub cooldown: Duration,
     pub speech_speed: f32,
+    /// Folders the confined worker needs to run from (Pi, the shell), and the shell itself.
+    pub sandbox_read: Vec<PathBuf>,
+    pub shell: PathBuf,
 }
 
 /// Speaks and posts for one guild on behalf of the host tools.
@@ -64,7 +67,7 @@ pub fn spawn_realtime(config: &BotConfig) -> Result<Agent, String> {
     std::fs::write(dir.join("mcp.json"), mcp.to_string()).map_err(|error| error.to_string())?;
     let cwd = config.data_dir.join("realtime-cwd");
     std::fs::create_dir_all(&cwd).map_err(|error| error.to_string())?;
-    Agent::spawn(&config.pi_program, Role::Realtime, &config.realtime, &dir, &prompts::realtime_prompt(&config.persona), &cwd)
+    Agent::spawn(&config.pi_program, Role::Realtime, &config.realtime, &dir, &prompts::realtime_prompt(&config.persona), &cwd, None)
 }
 
 struct Brain { config: BotConfig, out: Out, jobs: Jobs, agent: Option<Agent>, last_reply_at: Option<Instant>, last_reply_user: Option<u64>, next_consider_at: Instant, started: Instant }
@@ -174,7 +177,14 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
         let dir = config.data_dir.join("pi").join("worker");
         while !worker_stop.load(Ordering::Relaxed) {
             let mut sink = WorkerSink(&out);
-            let mut start = || { std::fs::create_dir_all(&scratch).map_err(|error| error.to_string())?; Agent::spawn(&config.worker_program, Role::Worker, &config.worker, &dir, &prompts::worker_prompt(), &scratch) };
+            let mut start = || {
+                std::fs::create_dir_all(&scratch).map_err(|error| error.to_string())?;
+                std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+                std::fs::write(dir.join("settings.json"), serde_json::json!({ "shellPath": config.shell }).to_string()).map_err(|error| error.to_string())?;
+                let shell_bin = config.shell.parent().map(PathBuf::from).unwrap_or_default();
+                let access = Access { read: config.sandbox_read.clone(), write: vec![scratch.clone(), dir.clone()], path: vec![shell_bin] };
+                Agent::spawn(&config.worker_program, Role::Worker, &config.worker, &dir, &prompts::worker_prompt(), &scratch, Some(&access))
+            };
             match worker::run_next(&jobs, &mut sink, &mut start, Duration::from_secs(300)) {
                 Ok(Some(_)) => {}
                 Ok(None) => std::thread::sleep(Duration::from_secs(1)),
