@@ -4,3 +4,4 @@ apps/desktop/dist/
 **/*.tsbuildinfo
 src-tauri/target/
 *.rs.bk
+target/
