@@ -8,4 +8,5 @@ pub mod participation;
 pub mod pi;
 pub mod prompts;
 pub mod role;
+pub mod speech;
 pub mod worker;
