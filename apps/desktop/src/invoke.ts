@@ -39,7 +39,12 @@ export type Job = { id: number; task: string; channelId: string; status: string 
 
 export type CodexModel = { id: string; label: string; description: string; efforts: string[]; defaultEffort: string; supportsFast: boolean };
 
-export type RoleConfig = { provider: string; model: string; effort: string; fast: boolean };
+export type RoleConfig = { provider: string; model: string; effort: string; fast: boolean; packages: string[] };
+
+/** The OpenAI-compatible endpoint. `models`/`efforts` are whatever the provider's /models exposed (empty: use text inputs). */
+export type Provider = { baseUrl: string; models: string[]; efforts: string[]; hasKey: boolean };
+
+export type Stats = { turns: number; steers: number; errors: number; lastTurnMs: number; averageTurnMs: number };
 
 export type Roles = { realtime: RoleConfig; worker: RoleConfig };
 
@@ -50,6 +55,10 @@ type Commands = {
   codex_sign_in: boolean;
   codex_sign_out: boolean;
   codex_models: CodexModel[];
+  get_provider: Provider;
+  save_provider: Provider;
+  refresh_provider_models: Provider;
+  get_stats: Stats | null;
   get_roles: Roles;
   save_roles: Roles;
   get_runtime_status: RuntimeStatus;

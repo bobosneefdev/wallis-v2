@@ -242,10 +242,11 @@ fn profile_summary(app_data: &Path) -> String {
     }
 }
 
-fn generation_prompt() -> String {
+fn generation_prompt(hint: &str) -> String {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_nanos()).unwrap_or_default();
     format!(
-        "Invent yourself. You are a fictional person whose first name is always {FIRST_NAME}; pick your own surname, age, home, work and personality. Randomness seed {seed:x} — let it push you somewhere unexpected, not the safest choice.\n\nReply with one JSON object and nothing else, using exactly these keys:\n{{\"name\": \"{FIRST_NAME} <surname>\", \"age\": \"27\", \"pronouns\": \"he/him\", \"location\": \"city, country\", \"occupation\": \"what you do\", \"tagline\": \"one line, under 90 characters\", \"bio\": \"2-4 sentences in your own voice\", \"interests\": [\"5 to 8 short specifics\"], \"lookingFor\": \"what you want from the people you talk to\", \"funFact\": \"one surprising detail\"}}\n\nWrite it like a dating profile: specific, warm, a little strange. No markdown, no code fences, no commentary.",
+        "Invent yourself. You are a fictional person whose first name is always {FIRST_NAME}; pick your own surname, age, home, work and personality. Randomness seed {seed:x} — let it push you somewhere unexpected, not the safest choice.\n\nReply with one JSON object and nothing else, using exactly these keys:\n{{\"name\": \"{FIRST_NAME} <surname>\", \"age\": \"27\", \"pronouns\": \"he/him\", \"location\": \"city, country\", \"occupation\": \"what you do\", \"tagline\": \"one line, under 90 characters\", \"bio\": \"2-4 sentences in your own voice\", \"interests\": [\"5 to 8 short specifics\"], \"lookingFor\": \"what you want from the people you talk to\", \"funFact\": \"one surprising detail\"}}\n\nWrite it like a dating profile: specific, warm, a little strange. No markdown, no code fences, no commentary.{hint}",
+        hint = if hint.trim().is_empty() { String::new() } else { format!("\n\nThe person setting you up asked for this baseline. Build the profile around it where it fits and stay yourself otherwise:\n{}", hint.trim()) },
         seed = nanos ^ u128::from(std::process::id()).wrapping_mul(0x9E37_79B9_7F4A_7C15),
     )
 }
@@ -272,6 +273,15 @@ fn bot_config(app_data: &Path, config: &WallisConfig, layout: &Layout) -> Result
     })
 }
 
+/// Pi runs offline, so each role's packages are fetched here, once per start, into that role's own Pi dir.
+fn install_packages(layout: &Layout, app_data: &Path) -> Result<(), String> {
+    let roles = roles(app_data)?;
+    for (name, role) in [("realtime", &roles.realtime), ("worker", &roles.worker)] {
+        wallis_core::pi_config::install_packages(&layout.pi().to_string_lossy(), &codex::role_dir(app_data, name), &role.packages)?;
+    }
+    Ok(())
+}
+
 fn status(state: &str, message: impl Into<String>) -> RuntimeStatus { RuntimeStatus { state: state.into(), message: message.into() } }
 
 fn start_inner(state: &AppState) -> Result<RuntimeStatus, String> {
@@ -283,6 +293,7 @@ fn start_inner(state: &AppState) -> Result<RuntimeStatus, String> {
     let layout = Layout(app_data.clone());
     let bot_config = bot_config(&app_data, &config, &layout)?;
     provision::ensure_all(&layout, &config.stt_model, &config.tts_voice, &|message| set_progress(state, message))?;
+    install_packages(&layout, &app_data)?;
     set_progress(state, "Starting speech…");
     let servers = SpeechServers::start(&layout, &config.stt_model, config.stt_threads, &config.tts_voice)?;
     set_progress(state, "");
@@ -330,6 +341,14 @@ fn get_runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
 }
 
 #[tauri::command]
+fn get_stats(state: State<'_, AppState>) -> Option<wallis_core::stats::Snapshot> {
+    let running = state.running.lock().expect("running state poisoned");
+    let bot = running.as_ref()?.bot.lock().expect("bot state poisoned");
+    let snapshot = bot.as_ref().map(|bot| bot.stats.snapshot());
+    snapshot
+}
+
+#[tauri::command]
 fn get_config(state: State<'_, AppState>) -> WallisConfig { state.config.lock().expect("config state poisoned").clone() }
 
 #[derive(Serialize)]
@@ -370,15 +389,19 @@ fn get_profile(state: State<'_, AppState>) -> Result<Profile, String> { read_pro
 
 /// Long-running: has the realtime agent invent itself, stores that identity, then has it commit the identity to memory.
 #[tauri::command]
-async fn generate_wallis(app: tauri::AppHandle) -> Result<Profile, String> {
+async fn generate_wallis(app: tauri::AppHandle, hint: Option<String>) -> Result<Profile, String> {
+    let hint: String = hint.unwrap_or_default().chars().take(2000).collect();
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let (app_data, config) = (app_data(&state)?, state.config.lock().expect("config state poisoned").clone());
+        // Once created, only Wallis changes the profile (his `update_profile` tool); nobody regenerates it.
+        if read_profile(&app_data).is_ok() { return Err("Wallis already has a profile. Only he can change it.".into()); }
         let layout = Layout(app_data.clone());
         provision::ensure_all(&layout, &config.stt_model, &config.tts_voice, &|message| set_progress(&state, message))?;
+        install_packages(&layout, &app_data)?;
         set_progress(&state, "Generating Wallis…");
         let mut agent = bot::spawn_realtime(&bot_config(&app_data, &config, &layout)?)?;
-        let answer = agent.turn(&generation_prompt(), Duration::from_secs(120), &mut |_| "Not available while inventing yourself.".into(), &mut |_| {})?;
+        let answer = agent.turn(&generation_prompt(&hint), Duration::from_secs(120), &mut |_| "Not available while inventing yourself.".into(), &mut |_| {})?;
         let json = extract_json(&answer).ok_or_else(|| format!("The model did not return a profile. It said: {}", answer.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(200).collect::<String>()))?;
         let profile = sanitize_profile(serde_json::from_str(json).map_err(|error| format!("The model returned a profile Wallis could not read: {error}"))?);
         let stored = serde_json::to_string_pretty(&profile).map_err(|error| error.to_string())?;
@@ -456,7 +479,7 @@ pub fn run() {
             std::thread::spawn(move || { let _ = start_inner(&handle.state::<AppState>()); });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_runtime_status, start_wallis, stop_wallis, get_config, save_config, get_secret_status, save_discord_token, get_profile, generate_wallis, get_progress, check_update, install_update, get_voice_options, get_jobs, retry_job, codex::codex_signed_in, codex::codex_sign_in, codex::codex_sign_out, codex::codex_models, codex::get_roles, codex::save_roles]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_runtime_status, get_stats, start_wallis, stop_wallis, get_config, save_config, get_secret_status, save_discord_token, get_profile, generate_wallis, get_progress, check_update, install_update, get_voice_options, get_jobs, retry_job, codex::codex_signed_in, codex::codex_sign_in, codex::codex_sign_out, codex::codex_models, codex::get_roles, codex::save_roles, codex::get_provider, codex::save_provider, codex::refresh_provider_models]).run(tauri::generate_context!()).expect("error while running Wallis");
 }
 
 #[cfg(test)]
@@ -500,6 +523,12 @@ mod tests {
         assert!(validate_secret("token\nwith-newline", "Discord token").is_err());
         assert!(validate_secret("", "Discord token").is_err());
         assert!(validate_secret("token-value", "Discord token").is_ok());
+    }
+
+    #[test]
+    fn the_optional_generation_hint_reaches_the_prompt_only_when_given() {
+        assert!(!generation_prompt("  ").contains("baseline"));
+        assert!(generation_prompt("a retired lighthouse keeper").contains("baseline") && generation_prompt("a retired lighthouse keeper").contains("lighthouse keeper"));
     }
 
     #[test]

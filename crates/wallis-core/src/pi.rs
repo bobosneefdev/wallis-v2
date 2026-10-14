@@ -5,7 +5,7 @@ use serde_json::Value;
 /// Realtime Pi: no shell or file tools, only Wallis' own tools plus MCP (Mnemosyne).
 /// Worker Pi: coding tools, and `--no-mcp` so it can never reach memory.
 pub fn launch_args(role: Role, config: &RoleConfig, extension: &str, system_prompt: &str) -> Vec<String> {
-    let mut args: Vec<String> = ["--mode", "rpc", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--offline"].map(String::from).to_vec();
+    let mut args: Vec<String> = ["--mode", "rpc", "--no-session", "--no-approve", "--no-skills", "--no-prompt-templates", "--no-context-files", "--offline"].map(String::from).to_vec();
     args.extend(["-e", extension, "--provider", &config.provider, "--model", &config.model, "--thinking", &config.effort, "--system-prompt", system_prompt].map(String::from));
     match role {
         Role::Realtime => args.extend(["--no-builtin-tools"].map(String::from)),
@@ -96,7 +96,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn config() -> RoleConfig { RoleConfig { provider: "openai-codex".into(), model: "gpt-6-sol".into(), effort: "low".into(), fast: true } }
+    fn config() -> RoleConfig { RoleConfig { provider: "openai-codex".into(), model: "gpt-6-sol".into(), effort: "low".into(), fast: true, packages: vec![] } }
 
     #[test]
     fn worker_cannot_reach_memory_and_realtime_cannot_run_shell() {
@@ -106,6 +106,8 @@ mod tests {
         let realtime = launch_args(Role::Realtime, &config(), "ext.ts", "p");
         assert!(!realtime.contains(&"--no-mcp".to_string()), "realtime needs MCP for memory");
         assert!(realtime.contains(&"--no-builtin-tools".to_string()) && !realtime.iter().any(|arg| arg.contains("bash")));
+        // `--no-extensions` would also switch off Pi's built-in MCP (memory) and installed packages.
+        assert!(!realtime.contains(&"--no-extensions".to_string()) && realtime.contains(&"--no-approve".to_string()));
     }
 
     #[test]
@@ -138,7 +140,7 @@ mod tests {
 
     #[test]
     fn extension_ships_with_the_tools_and_the_role_gate() {
-        for tool in ["\"say\"", "\"message\"", "\"file\"", "\"skip\"", "\"delegate\""] { assert!(EXTENSION.contains(tool), "{tool}"); }
+        for tool in ["\"say\"", "\"message\"", "\"file\"", "\"skip\"", "\"delegate\"", "\"update_profile\""] { assert!(EXTENSION.contains(tool), "{tool}"); }
         assert!(EXTENSION.contains("WALLIS_ROLE") && EXTENSION.contains("service_tier"));
         let env = role_env(Role::Worker, &RoleConfig { fast: true, ..RoleConfig::default() });
         assert!(env.contains(&("WALLIS_ROLE", "worker".to_string())) && env.contains(&("WALLIS_FAST", "1".to_string())));

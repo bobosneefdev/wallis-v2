@@ -10,8 +10,9 @@ use wallis_core::agent::{Access, Agent};
 use wallis_core::host::{Discord, Host};
 use wallis_core::jobs::Jobs;
 use wallis_core::participation::{names_wallis, should_consider, Mode, Participation, State, Turn};
-use wallis_core::prompts;
+use wallis_core::{pi_config, prompts};
 use wallis_core::role::{Role, RoleConfig};
+use wallis_core::stats::Stats;
 use wallis_core::{speech, worker};
 
 #[derive(Clone)]
@@ -65,12 +66,17 @@ pub fn spawn_realtime(config: &BotConfig) -> Result<Agent, String> {
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let mcp = prompts::realtime_mcp(&config.python, &config.data_dir.join("memory").to_string_lossy());
     std::fs::write(dir.join("mcp.json"), mcp.to_string()).map_err(|error| error.to_string())?;
+    pi_config::write_settings(&dir, &config.realtime.packages, serde_json::json!({}))?;
     let cwd = config.data_dir.join("realtime-cwd");
     std::fs::create_dir_all(&cwd).map_err(|error| error.to_string())?;
     Agent::spawn(&config.pi_program, Role::Realtime, &config.realtime, &dir, &prompts::realtime_prompt(&config.persona), &cwd, None)
 }
 
-struct Brain { config: BotConfig, out: Out, jobs: Jobs, agent: Option<Agent>, last_reply_at: Option<Instant>, last_reply_user: Option<u64>, next_consider_at: Instant, started: Instant }
+struct Brain { config: BotConfig, out: Out, jobs: Jobs, stats: Arc<Stats>, agent: Option<Agent>, last_reply_at: Option<Instant>, last_reply_user: Option<u64>, next_consider_at: Instant, started: Instant }
+
+/// A new voice transcript is delivered by whether the agent is busy: `steer` into the running turn, or a fresh `prompt`.
+/// `rx` is read between Pi's events while it works; events that are not speech wait in `later` until the turn ends.
+struct Queue<'a> { rx: &'a Receiver<Incoming>, later: Vec<Incoming> }
 
 impl Brain {
     fn ms(&self, at: Instant) -> u64 { at.duration_since(self.started).as_millis() as u64 }
@@ -89,15 +95,35 @@ impl Brain {
         should_consider(&turn, &state, self.ms(now))
     }
 
-    fn respond(&mut self, mode: Mode, guild: u64, channel: u64, user: u64, prompt: String) {
+    fn respond(&mut self, guild: u64, user: u64, prompt: String, queue: &mut Queue) {
         // Take the agent out for the turn so the host can borrow the job store at the same time.
         let mut agent = match self.agent() { Ok(_) => self.agent.take().expect("agent present"), Err(error) => return eprintln!("wallis: realtime agent unavailable: {error}") };
         let (out, speed, write_channels) = (self.out.clone(), self.config.speech_speed, self.config.write_channels.clone());
         let mut sink = Sink { out: &out, guild, speed };
-        let mut host = Host { discord: &mut sink, jobs: &self.jobs, write_channels, skipped: false };
-        let result = agent.turn(&prompt, Duration::from_secs(60), &mut |call| host.handle(call), &mut |_| {});
+        let mut host = Host { discord: &mut sink, jobs: &self.jobs, write_channels, skipped: false, profile: self.config.data_dir.join("profile.json") };
+        let (stats, started) = (self.stats.clone(), Instant::now());
+        let mut steer = || {
+            let mut steers = Vec::new();
+            for event in queue.rx.try_iter().collect::<Vec<_>>() {
+                match event {
+                    Incoming::Voice { guild, user, speaker, pcm, .. } => {
+                        // Talking over Wallis cuts him off, then what they said steers the turn already underway.
+                        out.stop_speaking(guild);
+                        match speech::transcribe(&pcm) {
+                            Ok(said) if !said.is_empty() => { stats.steered(); steers.push(turn_prompt(Mode::Voice, 0, &speaker, &said)); let _ = user; }
+                            Ok(_) => {}
+                            Err(error) => eprintln!("wallis: {error}"),
+                        }
+                    }
+                    other => queue.later.push(other),
+                }
+            }
+            steers
+        };
+        let result = agent.turn_steered(&prompt, Duration::from_secs(60), &mut steer, &mut |call| host.handle(call), &mut |_| {});
         let spoke = !host.skipped;
         drop(host);
+        stats.turn(started.elapsed().as_millis() as u64, result.is_ok());
         match result {
             Ok(_) => { self.agent = Some(agent); }
             Err(error) => { eprintln!("wallis: realtime turn failed: {error}"); }
@@ -108,22 +134,19 @@ impl Brain {
             self.last_reply_user = Some(user);
             self.next_consider_at = now + self.config.cooldown;
         }
-        let _ = (mode, channel);
     }
 
-    fn handle(&mut self, event: Incoming) {
+    fn handle(&mut self, event: Incoming, queue: &mut Queue) {
         match event {
             Incoming::Text { guild, channel, user, speaker, said, direct, .. } => {
-                if self.consider(Mode::Text, user, direct) { self.respond(Mode::Text, guild, channel, user, turn_prompt(Mode::Text, channel, &speaker, &said)); }
+                if self.consider(Mode::Text, user, direct) { self.respond(guild, user, turn_prompt(Mode::Text, channel, &speaker, &said), queue); }
             }
             Incoming::Voice { guild, channel, user, speaker, pcm } => {
-                // Talking over Wallis cuts him off.
                 self.out.stop_speaking(guild);
                 let said = match speech::transcribe(&pcm) { Ok(text) if !text.is_empty() => text, Ok(_) => return, Err(error) => return eprintln!("wallis: {error}") };
-                let direct = names_wallis(&said);
-                if self.consider(Mode::Voice, user, direct) { self.respond(Mode::Voice, guild, channel, user, turn_prompt(Mode::Voice, channel, &speaker, &said)); }
+                if self.consider(Mode::Voice, user, names_wallis(&said)) { self.respond(guild, user, turn_prompt(Mode::Voice, channel, &speaker, &said), queue); }
             }
-            Incoming::Joined { guild, .. } => self.respond(Mode::Voice, guild, 0, 0, "[system] You just joined the voice call. Greet everyone with one short line.".into()),
+            Incoming::Joined { guild, .. } => self.respond(guild, 0, "[system] You just joined the voice call. Greet everyone with one short line.".into(), queue),
             Incoming::Left { guild } => self.out.stop_speaking(guild),
             Incoming::Ready { .. } => {}
         }
@@ -131,22 +154,10 @@ impl Brain {
 }
 
 /// The running brain and worker threads. Dropping it stops them (the worker after its current job).
-pub struct Bot { pub sender: Sender<Incoming>, stop: Arc<AtomicBool> }
+pub struct Bot { pub sender: Sender<Incoming>, pub stats: Arc<Stats>, stop: Arc<AtomicBool> }
 
 impl Drop for Bot {
     fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); }
-}
-
-/// Merges back-to-back voice utterances from one speaker (a thought spoken in two breaths) into a single turn.
-pub fn coalesce(events: Vec<Incoming>) -> Vec<Incoming> {
-    let mut merged: Vec<Incoming> = Vec::new();
-    for event in events {
-        if let (Some(Incoming::Voice { guild: g, user: u, pcm: previous, .. }), Incoming::Voice { guild, user, pcm, .. }) = (merged.last_mut(), &event) {
-            if g == guild && u == user { previous.extend_from_slice(pcm); continue; }
-        }
-        merged.push(event);
-    }
-    merged
 }
 
 /// Starts the brain and worker threads. Feed Discord events into `Bot::sender`.
@@ -158,14 +169,16 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
 
     let (sender, receiver): (Sender<Incoming>, Receiver<Incoming>) = channel();
     let (brain_config, brain_out, brain_db) = (config.clone(), out.clone(), db.clone());
+    let stats = Arc::new(Stats::default());
+    let brain_stats = stats.clone();
     std::thread::spawn(move || {
         let Ok(jobs) = Jobs::open(&brain_db) else { return };
         let now = Instant::now();
-        let mut brain = Brain { config: brain_config, out: brain_out, jobs, agent: None, last_reply_at: None, last_reply_user: None, next_consider_at: now, started: now };
-        while let Ok(first) = receiver.recv() {
-            let mut events = vec![first];
-            events.extend(receiver.try_iter());
-            for event in coalesce(events) { brain.handle(event); }
+        let mut brain = Brain { config: brain_config, out: brain_out, jobs, stats: brain_stats, agent: None, last_reply_at: None, last_reply_user: None, next_consider_at: now, started: now };
+        let mut queue = Queue { rx: &receiver, later: Vec::new() };
+        while let Ok(event) = receiver.recv() {
+            brain.handle(event, &mut queue);
+            while !queue.later.is_empty() { let next = queue.later.remove(0); brain.handle(next, &mut queue); }
         }
     });
 
@@ -180,7 +193,7 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
             let mut start = || {
                 std::fs::create_dir_all(&scratch).map_err(|error| error.to_string())?;
                 std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-                std::fs::write(dir.join("settings.json"), serde_json::json!({ "shellPath": config.shell }).to_string()).map_err(|error| error.to_string())?;
+                pi_config::write_settings(&dir, &config.worker.packages, serde_json::json!({ "shellPath": config.shell }))?;
                 let shell_bin = config.shell.parent().map(PathBuf::from).unwrap_or_default();
                 let access = Access { read: config.sandbox_read.clone(), write: vec![scratch.clone(), dir.clone()], path: vec![shell_bin] };
                 Agent::spawn(&config.worker_program, Role::Worker, &config.worker, &dir, &prompts::worker_prompt(), &scratch, Some(&access))
@@ -192,7 +205,7 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
             }
         }
     });
-    Ok(Bot { sender, stop })
+    Ok(Bot { sender, stats, stop })
 }
 
 #[cfg(test)]
@@ -203,13 +216,5 @@ mod tests {
     fn prompts_tell_the_agent_where_the_message_came_from() {
         assert_eq!(turn_prompt(Mode::Voice, 1, "Jake", "hi"), "[voice call] Jake: hi");
         assert_eq!(turn_prompt(Mode::Text, 42, "Jake", "hi"), "[text channel 42] Jake: hi");
-    }
-
-    #[test]
-    fn merges_consecutive_utterances_from_the_same_speaker_only() {
-        let voice = |user: u64, pcm: Vec<i16>| Incoming::Voice { guild: 1, channel: 2, user, speaker: "x".into(), pcm };
-        let out = coalesce(vec![voice(7, vec![1, 2]), voice(7, vec![3]), voice(8, vec![4]), voice(7, vec![5])]);
-        let pcms: Vec<_> = out.iter().map(|event| match event { Incoming::Voice { pcm, .. } => pcm.clone(), _ => vec![] }).collect();
-        assert_eq!(pcms, vec![vec![1, 2, 3], vec![4], vec![5]]);
     }
 }

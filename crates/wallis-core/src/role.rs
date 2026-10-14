@@ -17,10 +17,12 @@ pub struct RoleConfig {
     pub effort: String,
     /// Codex Fast mode (`service_tier: priority`). Ignored by providers without it.
     pub fast: bool,
+    /// Pi package sources (`npm:`, `git:`, URLs) installed into this role's own Pi config dir.
+    pub packages: Vec<String>,
 }
 
 impl Default for RoleConfig {
-    fn default() -> Self { Self { provider: String::new(), model: String::new(), effort: "medium".into(), fast: false } }
+    fn default() -> Self { Self { provider: String::new(), model: String::new(), effort: "medium".into(), fast: false, packages: Vec::new() } }
 }
 
 fn safe(value: &str, extra: &[u8], max: usize) -> bool {
@@ -35,6 +37,7 @@ impl RoleConfig {
         if !safe(&self.provider, b"._-", 80) { return Err("Choose a provider.".into()); }
         if !safe(&self.model, b"._:-/", 120) { return Err("Pick a model, or type a model id such as gpt-6-sol.".into()); }
         if !safe(&self.effort, b"", 16) { return Err("Pick a reasoning level.".into()); }
+        self.packages.iter().try_for_each(|source| crate::pi_config::valid_package(source))?;
         Ok(())
     }
 }

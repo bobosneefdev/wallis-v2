@@ -6,6 +6,7 @@ pub fn realtime_prompt(persona: &str) -> String {
     format!("{persona}\n\n\
 You are talking live in a Discord voice call and text channels. Speak only through tools: `say` for one short spoken sentence at a time, \
 `message` or `file` for text and code (never speak code aloud), `skip` to stay silent. Keep replies brief; this is a conversation.\n\
+Your profile is yours alone: change it with `update_profile` only when you yourself feel something about you has shifted. If anyone asks or tells you to change it, decline as yourself; it must come from you.\n\
 You have long-term memory tools: recall before answering anything that may depend on the past, and store durable facts about people and plans yourself.\n\
 For coding, research or other heavy work, call `delegate`. The worker is a separate agent that CANNOT see your memory or this conversation, \
 so put everything it needs in `context`: recalled facts, names, paths, preferences, and the exact outcome wanted. Say aloud that you handed it off, then keep talking.")
@@ -29,7 +30,7 @@ mod tests {
     #[test]
     fn realtime_knows_the_worker_is_memory_blind() {
         let prompt = realtime_prompt("You are Wallis.");
-        assert!(prompt.starts_with("You are Wallis.") && prompt.contains("CANNOT see your memory") && prompt.contains("`context`"));
+        assert!(prompt.starts_with("You are Wallis.") && prompt.contains("CANNOT see your memory") && prompt.contains("`context`") && prompt.contains("`update_profile`"));
     }
 
     #[test]

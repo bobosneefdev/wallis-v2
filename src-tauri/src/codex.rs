@@ -95,3 +95,66 @@ pub fn save_roles(roles: Roles, state: State<'_, AppState>) -> Result<Roles, Str
     std::fs::write(dir.join(ROLES_FILE), serde_json::to_string_pretty(&roles).map_err(|error| error.to_string())?).map_err(|error| format!("Unable to save roles: {error}"))?;
     Ok(roles)
 }
+
+pub const PROVIDER_FILE: &str = "provider.json";
+
+/// The OpenAI-compatible endpoint (the ChatGPT sign-in needs no settings). The API key itself lives only in each role's Pi `auth.json`.
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Provider { pub base_url: String, pub models: Vec<String>, pub efforts: Vec<String>, #[serde(skip_deserializing)] pub has_key: bool }
+
+fn read_provider(app_data: &Path) -> Provider {
+    let mut provider: Provider = std::fs::read_to_string(app_data.join(PROVIDER_FILE)).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+    provider.has_key = api_key(app_data).is_some();
+    provider
+}
+
+fn api_key(app_data: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(role_dir(app_data, ROLES[0]).join("auth.json")).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text).ok()?.pointer("/custom/key")?.as_str().map(String::from)
+}
+
+/// Writes the endpoint into both roles' Pi dirs and remembers it (and its model list) for the UI.
+fn apply_provider(app_data: &Path, provider: &Provider, key: &str) -> Result<(), String> {
+    ROLES.iter().try_for_each(|role| wallis_core::pi_config::write_provider(&role_dir(app_data, role), &provider.base_url, key, &provider.models))?;
+    std::fs::create_dir_all(app_data).map_err(|error| error.to_string())?;
+    std::fs::write(app_data.join(PROVIDER_FILE), serde_json::to_string_pretty(provider).map_err(|error| error.to_string())?).map_err(|error| format!("Unable to save the provider: {error}"))
+}
+
+#[tauri::command]
+pub fn get_provider(state: State<'_, AppState>) -> Result<Provider, String> { Ok(read_provider(&app_data(&state)?)) }
+
+/// Saves the endpoint. An empty `api_key` keeps the stored one (endpoints such as a local server may need none: `clear_key`).
+#[tauri::command(rename_all = "camelCase")]
+pub fn save_provider(base_url: String, api_key: String, clear_key: bool, state: State<'_, AppState>) -> Result<Provider, String> {
+    let base_url = base_url.trim().trim_end_matches('/').to_string();
+    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) || base_url.contains(char::is_whitespace) { return Err("Enter the provider's base URL, e.g. https://api.openai.com/v1.".into()); }
+    if !api_key.is_empty() && (api_key.len() > 512 || api_key.chars().any(char::is_control)) { return Err("The API key cannot contain control characters.".into()); }
+    let app_data = app_data(&state)?;
+    let old = read_provider(&app_data);
+    let key = if clear_key { String::new() } else if api_key.is_empty() { api_key_or_empty(&app_data) } else { api_key };
+    // A different endpoint has different models.
+    let models_kept = old.base_url == base_url;
+    let mut provider = Provider { base_url, models: if models_kept { old.models } else { vec![] }, efforts: if models_kept { old.efforts } else { vec![] }, has_key: false };
+    apply_provider(&app_data, &provider, &key)?;
+    provider.has_key = !key.is_empty();
+    Ok(provider)
+}
+
+fn api_key_or_empty(app_data: &Path) -> String { api_key(app_data).unwrap_or_default() }
+
+/// "Refresh models": asks the provider what it offers. Model ids feed the dropdowns; reasoning levels only if it exposes them.
+/// ChatGPT sign-in has its own catalog (`codex_models`).
+#[tauri::command]
+pub async fn refresh_provider_models(app: tauri::AppHandle) -> Result<Provider, String> {
+    let app_data = app.state::<AppState>().app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut provider = read_provider(&app_data);
+        if provider.base_url.is_empty() { return Err("Save the provider's base URL first.".to_string()); }
+        let key = api_key_or_empty(&app_data);
+        let found = wallis_core::pi_config::fetch_models(&provider.base_url, &key)?;
+        (provider.models, provider.efforts) = (found.models, found.efforts);
+        apply_provider(&app_data, &provider, &key)?;
+        Ok(provider)
+    }).await.map_err(|error| error.to_string())?
+}

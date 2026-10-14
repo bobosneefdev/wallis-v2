@@ -12,7 +12,7 @@ fn main() -> Result<(), String> {
     provision::download_verified(provision::BUSYBOX_URL, provision::BUSYBOX_SHA256, &layout.shell())?;
     let (scratch, dir) = (data.join("worker-scratch"), data.join("pi").join("worker"));
     for path in [&scratch, &dir] { std::fs::create_dir_all(path).map_err(|e| e.to_string())?; }
-    std::fs::write(dir.join("settings.json"), serde_json::json!({ "shellPath": layout.shell() }).to_string()).map_err(|e| e.to_string())?;
+    wallis_core::pi_config::write_settings(&dir, &[], serde_json::json!({ "shellPath": layout.shell() }))?;
     let access = Access { read: vec![layout.tools()], write: vec![scratch.clone(), dir.clone()], path: vec![layout.shell().parent().unwrap().into()] };
     let config = RoleConfig { provider: "openai-codex".into(), model: "gpt-5.5".into(), ..Default::default() };
     let mut agent = Agent::spawn(&layout.pi().to_string_lossy(), Role::Worker, &config, &dir, "You are a test worker.", &scratch, Some(&access))?;
