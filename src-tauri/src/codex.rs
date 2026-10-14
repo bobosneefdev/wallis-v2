@@ -101,7 +101,13 @@ pub const PROVIDER_FILE: &str = "provider.json";
 /// The OpenAI-compatible endpoint (the ChatGPT sign-in needs no settings). The API key itself lives only in each role's Pi `auth.json`.
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-pub struct Provider { pub base_url: String, pub models: Vec<String>, pub efforts: Vec<String>, #[serde(skip_deserializing)] pub has_key: bool }
+pub struct Provider { pub base_url: String, pub models: Vec<String>, #[serde(deserialize_with = "efforts_or_empty")] pub efforts: std::collections::BTreeMap<String, Vec<String>>, #[serde(skip_deserializing)] pub has_key: bool }
+
+/// Older builds stored one flat list of levels; that carries no per-model information, so it reads as "none listed".
+fn efforts_or_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<std::collections::BTreeMap<String, Vec<String>>, D::Error> {
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
 
 fn read_provider(app_data: &Path) -> Provider {
     let mut provider: Provider = std::fs::read_to_string(app_data.join(PROVIDER_FILE)).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
@@ -135,7 +141,7 @@ pub fn save_provider(base_url: String, api_key: String, clear_key: bool, state: 
     let key = if clear_key { String::new() } else if api_key.is_empty() { api_key_or_empty(&app_data) } else { api_key };
     // A different endpoint has different models.
     let models_kept = old.base_url == base_url;
-    let mut provider = Provider { base_url, models: if models_kept { old.models } else { vec![] }, efforts: if models_kept { old.efforts } else { vec![] }, has_key: false };
+    let mut provider = Provider { base_url, models: if models_kept { old.models } else { vec![] }, efforts: if models_kept { old.efforts } else { Default::default() }, has_key: false };
     apply_provider(&app_data, &provider, &key)?;
     provider.has_key = !key.is_empty();
     Ok(provider)
@@ -143,7 +149,7 @@ pub fn save_provider(base_url: String, api_key: String, clear_key: bool, state: 
 
 fn api_key_or_empty(app_data: &Path) -> String { api_key(app_data).unwrap_or_default() }
 
-/// "Refresh models": asks the provider what it offers. Model ids feed the dropdowns; reasoning levels only if it exposes them.
+/// "Refresh models": asks the provider what it offers. Model ids feed the dropdowns; reasoning levels per model only if it exposes them.
 /// ChatGPT sign-in has its own catalog (`codex_models`).
 #[tauri::command]
 pub async fn refresh_provider_models(app: tauri::AppHandle) -> Result<Provider, String> {
