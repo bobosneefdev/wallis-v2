@@ -65,7 +65,7 @@ pub async fn codex_models(app: tauri::AppHandle) -> Result<Vec<catalog::CodexMod
         let credentials = codex_auth::fresh(&role_dir(&app_data, ROLES[0]))?;
         // The second role shares the account; keep its copy as current as the first.
         codex_auth::store(&role_dir(&app_data, ROLES[1]), &credentials)?;
-        catalog::parse_codex_catalog(&codex_auth::fetch_catalog(&credentials, env!("CARGO_PKG_VERSION"))?)
+        catalog::parse_codex_catalog(&codex_auth::fetch_catalog(&credentials)?)
     }).await.map_err(|error| error.to_string())?
 }
 

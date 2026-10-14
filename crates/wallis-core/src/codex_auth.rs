@@ -150,8 +150,12 @@ pub fn signed_in(auth_json: &str) -> bool {
 }
 
 /// Live model list for this ChatGPT account, in the shape `catalog::parse_codex_catalog` reads.
-pub fn fetch_catalog(credentials: &Credentials, client_version: &str) -> Result<String, String> {
-    ureq::get(CATALOG_URL).query("client_version", client_version)
+/// The backend hides every model whose `minimal_client_version` exceeds `client_version`, so this must be a Codex CLI
+/// version (not Wallis's own, which hides them all). Raise it when new models stop appearing.
+const CODEX_CLIENT_VERSION: &str = "0.160.1";
+
+pub fn fetch_catalog(credentials: &Credentials) -> Result<String, String> {
+    ureq::get(CATALOG_URL).query("client_version", CODEX_CLIENT_VERSION)
         .header("Authorization", format!("Bearer {}", credentials.access)).header("chatgpt-account-id", &credentials.account_id)
         .call().map_err(|error| format!("Unable to fetch the Codex model list: {error}"))?
         .body_mut().read_to_string().map_err(|error| format!("Unable to read the Codex model list: {error}"))
