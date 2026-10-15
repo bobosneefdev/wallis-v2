@@ -23,8 +23,27 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if gh release view "v$version" >/dev/null 2>&1; then echo "new=false" >> "$GITHUB_OUTPUT"; else echo "new=true" >> "$GITHUB_OUTPUT"; fi
 
-  installer:
+  runtime:
     needs: version
+    if: needs.version.outputs.new == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p wallis-core -p wallis-discord -p wallis-bot
+      - run: cargo build --release -p wallis-bot
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: sudo scripts/rootfs/build.sh target/release/wallis-bot "$RUNNER_TEMP/runtime" '${{ needs.version.outputs.version }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-runtime
+          path: |
+            ${{ runner.temp }}/runtime/wallis-rootfs.tar.gz
+            ${{ runner.temp }}/runtime/wallis-rootfs.tar.gz.sha256
+
+  installer:
+    needs: [version, runtime]
     if: needs.version.outputs.new == 'true'
     runs-on: windows-latest
     permissions:
@@ -52,8 +71,13 @@ jobs:
 
       - run: bun run installer
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-runtime
+          path: runtime
+
       - name: Publish release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "v${{ needs.version.outputs.version }}" target/release/bundle/nsis/*-setup.exe --title "Wallis ${{ needs.version.outputs.version }}" --generate-notes
+        run: gh release create "v${{ needs.version.outputs.version }}" target/release/bundle/nsis/*-setup.exe runtime/* --title "Wallis ${{ needs.version.outputs.version }}" --generate-notes

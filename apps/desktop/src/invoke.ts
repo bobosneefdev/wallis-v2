@@ -52,7 +52,12 @@ export type Roles = { realtime: RoleConfig; worker: RoleConfig };
 
 export type UpdateCheck = { current: string; latest: string; available: boolean };
 
+export type Mod = { name: string; description: string; enabled: boolean; options: { name: string; description: string; type: string; required: boolean }[] };
+
 type Commands = {
+  get_mods: Mod[];
+  set_mod_enabled: Mod[];
+  delete_mod: Mod[];
   codex_signed_in: boolean;
   codex_sign_in: boolean;
   codex_sign_out: boolean;

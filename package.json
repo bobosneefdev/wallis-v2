@@ -2,7 +2,7 @@
   "name": "wallis-v2",
   "private": true,
   "packageManager": "bun@1.4.0",
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": ["apps/*", "packages/*", "mods"],
   "scripts": {
     "build": "turbo build",
     "check": "turbo check",

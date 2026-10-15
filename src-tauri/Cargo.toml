@@ -1,6 +1,6 @@
 [package]
 name = "wallis"
-version = "0.3.10"
+version = "0.4.0"
 description = "Wallis desktop application"
 authors = ["Wallis contributors"]
 edition = "2021"
@@ -17,8 +17,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 wallis-core = { path = "../crates/wallis-core" }
-wallis-discord = { path = "../crates/wallis-discord" }
-tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

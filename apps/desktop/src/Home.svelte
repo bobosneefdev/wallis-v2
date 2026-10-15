@@ -41,6 +41,7 @@
 <h1>Home</h1>
 <section aria-labelledby="run-title">
   <h2 id="run-title">Status</h2>
+  <p class="hint">Requires WSL2. First setup downloads the Linux environment. If WSL2 is missing, run <code>wsl --install --no-distribution</code> as administrator, restart Windows, then retry.</p>
   <p role="status" aria-live="polite">{progress || note || runtime.message}</p>
   <div class="actions">
     <button type="button" disabled={busy || runtime.state === "running" || !hasProfile || !hasToken} onclick={start}>Bring online</button>

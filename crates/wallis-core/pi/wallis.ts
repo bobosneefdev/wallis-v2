@@ -83,8 +83,23 @@ const tools = [
   }),
 ];
 
+const workerTools = [
+  ...tools.filter((tool) => ["message", "file"].includes(tool.name)),
+  ...["queue_list", "skip_audio", "stop_audio"].map((name) => defineTool({
+    name, label: name, description: "Manage the current guild's music: " + name,
+    parameters: Type.Object({}),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, name, params)); },
+  })),
+  defineTool({ name: "volume", label: "Volume", description: "Set music volume from 0 to 100.", parameters: Type.Object({ percent: Type.Number() }),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "volume", params)); }, }),
+  defineTool({ name: "run_mod", label: "Run mod", description: "Run an enabled slash-command mod. Music uses play with options {query: artist song}.", parameters: Type.Object({ name: Type.String(), options: Type.Record(Type.String(), Type.Union([Type.String(), Type.Number(), Type.Boolean()])) }),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "run_mod", params)); }, }),
+];
+
 export default function (pi: ExtensionAPI) {
   if (process.env.WALLIS_ROLE === "realtime") for (const tool of tools) pi.registerTool(tool);
+
+  if (process.env.WALLIS_ROLE === "worker") for (const tool of workerTools) pi.registerTool(tool);
 
   // Pi's thinking levels stop at "max"; the Codex catalog also offers levels such as "ultra", so the exact
   // catalog value overrides the request. Fast mode is the "priority" service tier.
