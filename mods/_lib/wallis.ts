@@ -8,8 +8,9 @@ const Input = Schema.Struct({
 });
 export const decodeInput = Schema.decodeUnknownSync(Input);
 let lines: AsyncIterableIterator<string> | undefined;
+let reader: ReturnType<typeof createInterface> | undefined;
 const line = Effect.tryPromise(async () => {
-  lines ??= createInterface({ input: process.stdin })[Symbol.asyncIterator]();
+  lines ??= (reader = createInterface({ input: process.stdin }))[Symbol.asyncIterator]();
   const next = await lines.next();
   if (next.done) throw new Error("Host closed stdin.");
   return next.value;
@@ -25,4 +26,4 @@ export const emit = Effect.fn("wallis.emit")(function* (tool: string, args: Reco
 });
 export const reply = (text: string) => emit("reply", { text });
 export const mediaDirectory = Config.String("WALLIS_MEDIA");
-export const runMod = <A, E>(effect: Effect.Effect<A, E>) => BunRuntime.runMain(effect.pipe(Effect.tapCause((cause) => Effect.sync(() => console.error(Cause.pretty(cause))))), { disableErrorReporting: true });
+export const runMod = <A, E>(effect: Effect.Effect<A, E>) => BunRuntime.runMain(effect.pipe(Effect.ensuring(Effect.sync(() => reader?.close())), Effect.tapCause((cause) => Effect.sync(() => console.error(Cause.pretty(cause))))), { disableErrorReporting: true });

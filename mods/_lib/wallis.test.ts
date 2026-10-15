@@ -12,7 +12,7 @@ import { Effect } from "effect";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
-test("a stock command exchanges actions and results without corrupting JSON lines", () => Effect.runPromise(Effect.tryPromise(async () => {
+test("a stock command exchanges JSON lines and exits while host stdin remains open", () => Effect.runPromise(Effect.tryPromise(async () => {
   const child = Bun.spawn([process.execPath, fileURLToPath(new URL("../volume/index.ts", import.meta.url))], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   const lines = createInterface({ input: Readable.from(child.stdout) })[Symbol.asyncIterator]();
   try {
@@ -21,7 +21,6 @@ test("a stock command exchanges actions and results without corrupting JSON line
     child.stdin.write(JSON.stringify({ result: "Set to 40%.\nReady." }) + "\n");
     assert.deepEqual(JSON.parse((await lines.next()).value!), { tool: "reply", args: { text: "Set to 40%.\nReady." } });
     child.stdin.write(JSON.stringify({ result: "Replied." }) + "\n");
-    child.stdin.end();
     assert.equal(await child.exited, 0, await new Response(child.stderr).text());
   } finally { child.kill(); }
 })), 5000);
@@ -33,7 +32,6 @@ test("host failures fail the mod instead of reporting success", async () => {
     child.stdin.write(JSON.stringify({ options: { percent: 40 }, user: "1", guild: "2", channel: "3" }) + "\n");
     assert.equal(JSON.parse((await lines.next()).value!).tool, "volume");
     child.stdin.write(JSON.stringify({ result: "Failed: No voice channel." }) + "\n");
-    child.stdin.end();
     assert.equal((await lines.next()).done, true);
     assert.notEqual(await child.exited, 0);
     assert.match(await new Response(child.stderr).text(), /No voice channel/);
