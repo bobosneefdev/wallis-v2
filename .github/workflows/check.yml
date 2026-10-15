@@ -56,6 +56,9 @@ jobs:
             $imported = $true
             wsl -d Wallis -u root -- /opt/wallis/bin/wallis-bot --self-check
             if ($LASTEXITCODE -ne 0) { throw 'WSL2 sandbox, browser or mod check failed' }
+            $env:WALLIS_WSL_ARCHIVE = "$pwd\runtime\wallis-rootfs.tar.gz"
+            cargo test -p wallis-core --lib upgrade_preserves_data_and_failed_import_rolls_back -- --ignored --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'WSL2 upgrade or rollback failed' }
             cargo test -p wallis-core --test wsl_runtime -- --ignored --nocapture
             if ($LASTEXITCODE -ne 0) { throw 'Windows manager integration failed' }
           } finally {

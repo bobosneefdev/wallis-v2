@@ -49,10 +49,14 @@ pub fn ensure(data: &Path, version: &str, progress: &dyn Fn(&str)) -> Result<(),
     let hash = asset["digest"].as_str().and_then(|s|s.strip_prefix("sha256:")).filter(|s|s.len()==64).ok_or("Runtime checksum missing.")?;
     let archive = data.join("downloads").join(format!("wallis-rootfs-{version}.tar.gz"));
     crate::provision::download_verified(asset["browser_download_url"].as_str().ok_or("Missing runtime URL.")?,hash,&archive)?;
+    import_runtime(data, &archive, exists, progress)
+}
+
+fn import_runtime(data: &Path, archive: &Path, exists: bool, progress: &dyn Fn(&str)) -> Result<(), String> {
     let install = data.join("wsl"); std::fs::create_dir_all(&install).map_err(|e|e.to_string())?;
     let import = |archive: &Path| run(&["--import","Wallis",&install.to_string_lossy(),&archive.to_string_lossy(),"--version","2"]);
     if !exists {
-        progress("Importing Wallis into WSL2…"); import(&archive)?;
+        progress("Importing Wallis into WSL2…"); import(archive)?;
     } else {
         // Keep a full recoverable export before replacing a distro. Never delete the only copy of user data.
         progress("Backing up the existing Wallis environment…");
@@ -66,7 +70,7 @@ pub fn ensure(data: &Path, version: &str, progress: &dyn Fn(&str)) -> Result<(),
         if !status.success() { return Err(format!("Unable to save runtime data. Full backup kept at {}.",backup.display())); }
         run(&["--terminate","Wallis"])?; run(&["--unregister","Wallis"])?;
         let upgrade = (|| {
-            import(&archive)?;
+            import(archive)?;
             let status = wsl().args(["-d","Wallis","-u","root","--","tar","-xf","-","-C","/"]).stdin(std::fs::File::open(&saved).map_err(|e|e.to_string())?).status().map_err(|e|e.to_string())?;
             if !status.success() { return Err("Unable to restore user data.".to_string()); }
             Ok(())
@@ -149,6 +153,39 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the disposable Wallis distro and image from the CI workflow"]
+    fn upgrade_preserves_data_and_failed_import_rolls_back() {
+        assert_eq!(std::env::var("WALLIS_WSL_TEST").as_deref(), Ok("1"));
+        let archive = PathBuf::from(std::env::var_os("WALLIS_WSL_ARCHIVE").expect("CI runtime image"));
+        let data = std::env::temp_dir().join(format!("wallis-upgrade-test-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        run(&["-d","Wallis","-u","root","--","python3","-c","from pathlib import Path; Path('/var/lib/wallis/upgrade-probe').write_text('persistent'); Path('/var/lib/wallis/worker-scratch/upgrade-probe').write_text('workspace')"]).unwrap();
+        let probe = || {
+            run(&["-d","Wallis","-u","root","--","/opt/wallis/bin/wallis-bot","--self-check"]).unwrap();
+            let output = wsl().args(["-d","Wallis","-u","root","--","cat","/var/lib/wallis/upgrade-probe","/var/lib/wallis/worker-scratch/upgrade-probe"]).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"persistentworkspace");
+        };
+        import_runtime(&data, &archive, true, &|_| {}).unwrap();
+        probe();
+        let backup = data.join("wallis-before-upgrade.tar");
+        assert!(backup.is_file());
+        assert!(import_runtime(&data, &archive, true, &|_| {}).unwrap_err().contains("earlier upgrade backup exists"));
+        probe();
+        // The successful upgrade is verified; make room for the next recovery export.
+        std::fs::remove_file(backup).unwrap();
+        let corrupt = data.join("corrupt.tar.gz");
+        std::fs::write(&corrupt, "invalid runtime archive").unwrap();
+        let error = import_runtime(&data, &corrupt, true, &|_| {}).unwrap_err();
+        assert!(error.contains("original distro was restored"), "{error}");
+        probe();
+        run(&["--terminate","Wallis"]).unwrap();
+        // Keep the imported distro's virtual disk until workflow cleanup unregisters it.
+        for name in ["wallis-before-upgrade.tar", "wallis-user-data.tar", "corrupt.tar.gz"] { std::fs::remove_file(data.join(name)).unwrap(); }
+    }
+
     #[test]
     fn wsl_output_handles_utf16_and_utf8() {
         let utf16: Vec<u8> = "Wallis\r\nOther".encode_utf16().flat_map(u16::to_le_bytes).collect();
