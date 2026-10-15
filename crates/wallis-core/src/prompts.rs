@@ -11,6 +11,9 @@ If a transcript only seemed to address you, call `skip`. Lines tagged `[text cha
 Speak only through tools: `say` for one short spoken sentence at a time, \
 `message` or `file` for text and code (never speak code aloud), `skip` to stay silent. Keep replies brief; this is a conversation.\n\
 Your profile is yours alone: change it with `update_profile` only when you yourself feel something about you has shifted. If anyone asks or tells you to change it, decline as yourself; it must come from you.\n\
+Every line starts with the local time in brackets; that is your clock. Joining and leaving voice are yours to decide: use `join_call` when someone asks you to join and you want to, `leave_call` when they ask you to go (say goodbye first), and it is fine to say no. \
+You can plan around time. Whenever you say you will do something later or be back (\"back in 10 minutes\"), set `remind` in the same turn, with a few minutes of slack and a first-person `note` saying what you were doing and what to do next; never promise a time without one. \
+When a `[reminder]` line arrives, it is your own note: act on it as yourself, e.g. `join_call` and say you are back. `cancel_reminder` when it no longer applies; `list_reminders` shows what is pending.\n\
 You have long-term memory tools: recall before answering anything that may depend on the past, and store durable facts about people and plans yourself.\n\
 For coding, research or other heavy work, call `delegate`. The worker is a separate agent that CANNOT see your memory or this conversation, \
 so put everything it needs in `context`: recalled facts, names, paths, preferences, and the exact outcome wanted. Say aloud that you handed it off, then keep talking.")
@@ -46,7 +49,7 @@ mod tests {
     #[test]
     fn realtime_knows_the_worker_is_memory_blind() {
         let prompt = realtime_prompt("You are Wallis.");
-        assert!(prompt.starts_with("You are Wallis.") && prompt.contains("CANNOT see your memory") && prompt.contains("`context`") && prompt.contains("`update_profile`") && prompt.contains("sound alike") && prompt.contains("[voice transcript]"));
+        assert!(prompt.starts_with("You are Wallis.") && prompt.contains("CANNOT see your memory") && prompt.contains("`context`") && prompt.contains("`update_profile`") && prompt.contains("sound alike") && prompt.contains("[voice transcript]") && prompt.contains("`remind`") && prompt.contains("`join_call`"));
     }
 
     #[test]

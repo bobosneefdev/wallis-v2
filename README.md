@@ -32,3 +32,11 @@ The release workflow runs on pushes to `master`. Merging the 0.3.0 version bump 
 - [NVIDIA Parakeet TDT-CTC 110M](https://huggingface.co/nvidia/parakeet-tdt_ctc-110m): CC BY 4.0, exported and INT8 quantized by [Sherpa-ONNX](https://github.com/k2-fsa/sherpa-onnx) (Apache 2.0). Wallis uses the TDT transducer export.
 - [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts): MIT code and CC BY 4.0 [ungated preset-only weights](https://huggingface.co/kyutai/pocket-tts-without-voice-cloning).
 - [Preset recordings](https://huggingface.co/kyutai/tts-voices): Alba MacKenna's casual voice is CC BY 4.0; Marius (Selfie) and Javert (Butter) are CC0 volunteer voice donations. Their preset states are supplied by Kyutai. Attribution is retained here; no changes are made to the source recordings.
+
+## Discord
+
+Wallis has one slash command, `/profile`, which shows his profile as an embed. There are no `/join` or `/leave` commands: ask him, in a text channel or in the call, and he decides. He may say no.
+
+## Time
+
+Every turn starts with the local time, and Wallis has `remind`, `cancel_reminder` and `list_reminders` tools. When he says he'll be back in ten minutes he sets a reminder with a first-person note to himself; when it falls due it arrives as a normal turn (`[reminder] …`) and he acts on it, for example by rejoining the call. Reminders live in `jobs.sqlite`, fire once, and survive restarts (an overdue one fires late and says so).

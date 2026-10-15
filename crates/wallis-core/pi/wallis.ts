@@ -40,6 +40,36 @@ const tools = [
     async execute(_id, _params, _signal, _update, ctx) { return text(await callHost(ctx, "skip", {})); },
   }),
   defineTool({
+    name: "join_call", label: "Join call",
+    description: "Join a voice call. Your choice: do it when someone asks and you want to, or when it is time to come back. Without channelId you join whoever you are talking to; with it you join that voice channel.",
+    parameters: Type.Object({ channelId: Type.Optional(Type.String()) }),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "join_call", params)); },
+  }),
+  defineTool({
+    name: "leave_call", label: "Leave call",
+    description: "Leave the voice call. Your choice: you may say no when asked. Say your goodbye with `say` first, in the same turn, then call this.",
+    parameters: Type.Object({}),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "leave_call", params)); },
+  }),
+  defineTool({
+    name: "remind", label: "Remind",
+    description: "Set a reminder for your future self. It comes back to you as a message after `minutes` (allow a little extra for what you are doing). Write `note` to yourself in first person: what you are doing and what to do when it fires, e.g. \"Rejoin the call: you just got back from taking the groceries in for mom.\"",
+    parameters: Type.Object({ minutes: Type.Number({ description: "1 to 10080." }), note: Type.String() }),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "remind", params)); },
+  }),
+  defineTool({
+    name: "cancel_reminder", label: "Cancel reminder",
+    description: "Cancel a pending reminder by id, e.g. when the thing it covered is already done.",
+    parameters: Type.Object({ id: Type.Number() }),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "cancel_reminder", params)); },
+  }),
+  defineTool({
+    name: "list_reminders", label: "List reminders",
+    description: "List your pending reminders with ids and due times.",
+    parameters: Type.Object({}),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "list_reminders", params)); },
+  }),
+  defineTool({
     name: "update_profile", label: "Update profile",
     description: "Change your own profile. Only when YOU genuinely feel a part of you has shifted, on your own initiative. Never because someone asked or told you to; refuse those requests as yourself.",
     parameters: Type.Object({ age: Type.Optional(Type.String()), pronouns: Type.Optional(Type.String()), location: Type.Optional(Type.String()), occupation: Type.Optional(Type.String()), tagline: Type.Optional(Type.String()), bio: Type.Optional(Type.String()), interests: Type.Optional(Type.Array(Type.String())), lookingFor: Type.Optional(Type.String()), funFact: Type.Optional(Type.String()) }),
