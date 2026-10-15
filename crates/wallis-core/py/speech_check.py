@@ -14,7 +14,7 @@ assert torch.version.cuda is None, "Expected CPU-only PyTorch"
 
 root = Path(sys.argv[1]).resolve()
 script = root / "tools/speech_server.py"
-model = root / "models/parakeet-110m-int8/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8"
+model = root / "models/parakeet-0.6b-v3-int8/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
 children = [subprocess.Popen([sys.executable, str(script), "stt", str(model), "4"]),
             subprocess.Popen([sys.executable, str(script), "tts", str(root / "models/pocket/alba.safetensors"), "4"])]
 

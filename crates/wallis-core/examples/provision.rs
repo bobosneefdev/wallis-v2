@@ -2,7 +2,7 @@
 fn main() -> Result<(), String> {
     use wallis_core::provision::{ensure_all, Layout, SpeechServers};
     let layout = Layout(std::path::PathBuf::from(std::env::args().nth(1).ok_or("usage: provision <data_dir>")?));
-    let (stt, tts) = ("parakeet-110m-int8", "alba");
+    let (stt, tts) = ("parakeet-0.6b-v3-int8", "alba");
     if !std::env::args().any(|arg| arg == "--installed") { ensure_all(&layout, stt, tts, &|step| if !step.is_empty() { println!("{step}") })?; }
     let _servers = SpeechServers::start(&layout, stt, 4, tts)?;
     println!("speech servers up");

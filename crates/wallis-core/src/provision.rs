@@ -121,7 +121,7 @@ mod tests {
 
 /// Speech models the GUI can choose between: (id, label, sha256, megabytes).
 pub const STT_MODELS: [(&str, &str, &str, u32); 1] = [
-    ("parakeet-110m-int8", "Parakeet 110M INT8 — English, CPU", "f628312e9fdf8686374cb01a69425c41732529d540860311f16f37cbc32cfe9b", 108),
+    ("parakeet-0.6b-v3-int8", "Parakeet 0.6B v3 INT8 — multilingual, CPU", "5793d0fd397c5778d2cf2126994d58e9d56b1be7c04d13c7a15bb1b4eafb16bf", 487),
 ];
 /// Permanent Pocket preset states; no voice cloning or Hugging Face account required.
 pub const TTS_VOICES: [(&str, &str, &str, u32); 3] = [
@@ -129,7 +129,7 @@ pub const TTS_VOICES: [(&str, &str, &str, u32); 3] = [
     ("marius", "Marius", "b05946f39371f8853902b0486231f2d401c8a9570da9978329120d4ecfd009e9", 6),
     ("javert", "Javert", "580e4b72d4065e906c14e580f97da478c9707bead74b0ef9c049e0ca8de997d9", 6),
 ];
-const STT_ARCHIVE: &str = "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8";
+const STT_ARCHIVE: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
 const POCKET_BASE: &str = "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/4e1e0a3e611c51c0b4ed8174fc10f32a54644303/languages/english_2026-09";
 pub const SPEECH_SERVER: &str = include_str!("../py/speech_server.py");
 
@@ -184,7 +184,7 @@ pub fn ensure_all(layout: &Layout, stt: &str, tts: &str, progress: &dyn Fn(&str)
     }
     std::fs::write(layout.speech_script(), SPEECH_SERVER).map_err(|error| format!("Unable to write the speech server: {error}"))?;
     progress("Downloading the local speech models…");
-    let archive = tools.join("downloads/parakeet.tar.bz2");
+    let archive = tools.join("downloads").join(format!("{STT_ARCHIVE}.tar.bz2"));
     download_verified(&format!("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{STT_ARCHIVE}.tar.bz2"), stt_entry.2, &archive)?;
     let stt_dir = layout.stt_model(stt);
     if std::fs::read_to_string(stt_dir.join("installed.txt")).ok().as_deref() != Some(stt_entry.2) {
@@ -248,7 +248,7 @@ mod layout_tests {
     #[test]
     fn layout_keeps_models_and_tools_apart_and_voices_are_pinned() {
         let layout = Layout(PathBuf::from("data"));
-        assert!(layout.stt_model("parakeet-110m-int8").ends_with("models/parakeet-110m-int8") && layout.tts_model("alba").ends_with("models/pocket/alba.safetensors"));
+        assert!(layout.stt_model("parakeet-0.6b-v3-int8").ends_with("models/parakeet-0.6b-v3-int8") && layout.tts_model("alba").ends_with("models/pocket/alba.safetensors"));
         assert!(layout.python().starts_with("data/tools/venv"));
         assert!(STT_MODELS.iter().chain(TTS_VOICES.iter()).all(|m| m.2.len() == 64));
         assert!(SPEECH_SERVER.contains("TTSModel.load_model"));
