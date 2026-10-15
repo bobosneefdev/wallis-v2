@@ -65,7 +65,7 @@ fn prepare(init: &Bootstrap) -> Result<(), String> {
     }
     for (name, role) in [("realtime", &init.roles.realtime), ("worker", &init.roles.worker)] {
         let dir = data.join("pi").join(name);
-        write(&dir.join("settings.json"), &json!({"shellPath":"/bin/bash","packages":role.packages}).to_string())?;
+        write(&dir.join("settings.json"), &json!({"shellPath":"/bin/bash","npmCommand":["/opt/wallis/tools/bun/bun"],"packages":role.packages}).to_string())?;
         write(&dir.join("wallis.ts"), wallis_core::pi::EXTENSION)?;
     }
     // Seed only once: deleted or customized stock commands must stay that way.
@@ -213,6 +213,11 @@ fn self_check() -> Result<(),String> {
     let mut actions = Vec::new();
     let reply = mods::run(data,"volume",json!({"options":{"percent":40},"guild":"1","user":"2","channel":"3"}), &mut |call| { actions.push((call.tool,call.args)); "Volume changed.".into() })?;
     if actions != vec![("volume".into(),json!({"percent":40}))] || reply != "Volume changed." { return Err("Mod protocol roundtrip failed.".into()); }
+    let mut access = access;
+    access.write.push(data.join("pi/worker"));
+    let env = vec![("PI_CODING_AGENT_DIR".into(),data.join("pi/worker").to_string_lossy().into())];
+    let status = wallis_core::sandbox::command(Path::new("/opt/wallis/tools/pi/pi"), &["install".into(),"npm:effect@4.0.5".into()], &data.join("worker-scratch"), &env, &access,false)?.status().map_err(|e|e.to_string())?;
+    if !status.success() { return Err("Pi could not install a package using the bundled Bun runtime.".into()); }
     std::fs::remove_file(data.join("pi/realtime/secret-probe")).map_err(|e|e.to_string())?;
     let _ = std::process::Command::new("sudo").args(["-n","-u","worker","--","rm","-f","/var/lib/wallis/pi/worker/secret-probe"]).status();
     println!("Isolation and stock mod roundtrip passed.");
