@@ -187,7 +187,7 @@ async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
         let setup = dir.join("Wallis-setup.exe");
         provision::download_verified(&latest.url, &latest.sha256, &setup)?;
         state.running.lock().expect("running state poisoned").take();
-        std::process::Command::new(&setup).args(["/P", "/R"]).spawn().map_err(|error| format!("Unable to start the installer: {error}"))?;
+        std::process::Command::new(&setup).args(["/UPDATE", "/P", "/R"]).spawn().map_err(|error| format!("Unable to start the installer: {error}"))?;
         app.exit(0);
         Ok(())
     }).await.map_err(|error| error.to_string())?
