@@ -26,9 +26,20 @@ rm -f "$root/etc/resolv.conf"
 cp -L /etc/resolv.conf "$root/etc/resolv.conf"
 for fs in proc sys dev; do mount --rbind "/$fs" "$root/$fs"; mounted+=("$root/$fs"); mount --make-rslave "$root/$fs"; done
 chroot "$root" /usr/bin/env WALLIS_VERSION="$version" /bin/bash /opt/wallis/source/scripts/rootfs/provision.sh
-chroot "$root" /opt/wallis/bin/wallis-bot --self-check
-chroot "$root" /usr/bin/sudo -n -u wallis -- /opt/wallis/tools/venv/bin/python /opt/wallis/source/crates/wallis-core/py/speech_check.py /var/lib/wallis
-umount "$root/var/lib/wallis/workspace"
+# Creating user namespaces inside chroot is forbidden by Linux. Give the sandbox
+# checks a real mount-namespace root, as they have in WSL, without weakening them.
+unshare --mount --propagation private /bin/bash -euc '
+  mount --rbind "$1" "$1"
+  cd "$1"
+  mkdir .oldroot
+  pivot_root . .oldroot
+  cd /
+  umount -l /.oldroot
+  rmdir /.oldroot
+  /opt/wallis/bin/wallis-bot --self-check
+  sudo -n -u wallis -- /opt/wallis/tools/venv/bin/python /opt/wallis/source/crates/wallis-core/py/speech_check.py /var/lib/wallis
+  umount /var/lib/wallis/workspace
+' -- "$root"
 rm -rf "$root/var/lib/wallis"
 install -d -o 1000 -g 1000 -m 0755 "$root/var/lib/wallis"
 rm -rf "$root/opt/wallis/source"
