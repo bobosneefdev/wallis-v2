@@ -34,6 +34,7 @@ pub fn codex_signed_in(state: State<'_, AppState>) -> Result<bool, String> {
 pub async fn codex_sign_in(app: tauri::AppHandle) -> Result<bool, String> {
     let app_data = app.state::<AppState>().app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
     tauri::async_runtime::spawn_blocking(move || {
+        crate::reset_runtime(&app.state::<AppState>())?;
         let pending = codex_auth::begin()?;
         open_in_browser(&pending.url)?;
         let code = codex_auth::wait_for_code(&pending, Duration::from_secs(300))?;
@@ -44,17 +45,21 @@ pub async fn codex_sign_in(app: tauri::AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn codex_sign_out(state: State<'_, AppState>) -> Result<bool, String> {
-    let app_data = app_data(&state)?;
-    for role in ROLES {
-        let path = role_dir(&app_data, role).join("auth.json");
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-        if root.as_object_mut().and_then(|map| map.remove("openai-codex")).is_some() {
-            std::fs::write(&path, root.to_string()).map_err(|error| format!("Unable to update {}: {error}", path.display()))?;
+pub async fn codex_sign_out(app: tauri::AppHandle) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        crate::reset_runtime(&state)?;
+        let app_data = app_data(&state)?;
+        for role in ROLES {
+            let path = role_dir(&app_data, role).join("auth.json");
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            if root.as_object_mut().and_then(|map| map.remove("openai-codex")).is_some() {
+                std::fs::write(&path, root.to_string()).map_err(|error| format!("Unable to update {}: {error}", path.display()))?;
+            }
         }
-    }
-    Ok(false)
+        Ok(false)
+    }).await.map_err(|e|e.to_string())?
 }
 
 /// Models, reasoning levels and Fast-mode support for this ChatGPT account, straight from Codex.
@@ -62,6 +67,7 @@ pub fn codex_sign_out(state: State<'_, AppState>) -> Result<bool, String> {
 pub async fn codex_models(app: tauri::AppHandle) -> Result<Vec<catalog::CodexModel>, String> {
     let app_data = app.state::<AppState>().app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
     tauri::async_runtime::spawn_blocking(move || {
+        crate::reset_runtime(&app.state::<AppState>())?;
         let credentials = codex_auth::fresh(&role_dir(&app_data, ROLES[0]))?;
         // The second role shares the account; keep its copy as current as the first.
         codex_auth::store(&role_dir(&app_data, ROLES[1]), &credentials)?;
@@ -71,9 +77,7 @@ pub async fn codex_models(app: tauri::AppHandle) -> Result<Vec<catalog::CodexMod
 
 pub const ROLES_FILE: &str = "roles.json";
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct Roles { pub realtime: wallis_core::role::RoleConfig, pub worker: wallis_core::role::RoleConfig }
+pub use wallis_core::settings::Roles;
 
 #[tauri::command]
 pub fn get_roles(state: State<'_, AppState>) -> Result<Roles, String> {
@@ -86,14 +90,18 @@ pub fn get_roles(state: State<'_, AppState>) -> Result<Roles, String> {
 
 /// Each role is configured on its own; an unset role stays empty rather than failing the save.
 #[tauri::command]
-pub fn save_roles(roles: Roles, state: State<'_, AppState>) -> Result<Roles, String> {
-    for (name, role) in [("Realtime", &roles.realtime), ("Worker", &roles.worker)] {
-        if role.is_configured() { role.validate().map_err(|error| format!("{name}: {error}"))?; }
-    }
-    let dir = app_data(&state)?;
-    std::fs::create_dir_all(&dir).map_err(|error| format!("Unable to create the Wallis data folder: {error}"))?;
-    std::fs::write(dir.join(ROLES_FILE), serde_json::to_string_pretty(&roles).map_err(|error| error.to_string())?).map_err(|error| format!("Unable to save roles: {error}"))?;
-    Ok(roles)
+pub async fn save_roles(roles: Roles, app: tauri::AppHandle) -> Result<Roles, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        for (name, role) in [("Realtime", &roles.realtime), ("Worker", &roles.worker)] {
+            if role.is_configured() { role.validate().map_err(|error| format!("{name}: {error}"))?; }
+        }
+        crate::reset_runtime(&state)?;
+        let dir = app_data(&state)?;
+        std::fs::create_dir_all(&dir).map_err(|error| format!("Unable to create the Wallis data folder: {error}"))?;
+        std::fs::write(dir.join(ROLES_FILE), serde_json::to_string_pretty(&roles).map_err(|error| error.to_string())?).map_err(|error| format!("Unable to save roles: {error}"))?;
+        Ok(roles)
+    }).await.map_err(|e|e.to_string())?
 }
 
 pub const PROVIDER_FILE: &str = "provider.json";
@@ -132,19 +140,23 @@ pub fn get_provider(state: State<'_, AppState>) -> Result<Provider, String> { Ok
 
 /// Saves the endpoint. An empty `api_key` keeps the stored one (endpoints such as a local server may need none: `clear_key`).
 #[tauri::command(rename_all = "camelCase")]
-pub fn save_provider(base_url: String, api_key: String, clear_key: bool, state: State<'_, AppState>) -> Result<Provider, String> {
-    let base_url = base_url.trim().trim_end_matches('/').to_string();
-    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) || base_url.contains(char::is_whitespace) { return Err("Enter the provider's base URL, e.g. https://api.openai.com/v1.".into()); }
-    if !api_key.is_empty() && (api_key.len() > 512 || api_key.chars().any(char::is_control)) { return Err("The API key cannot contain control characters.".into()); }
-    let app_data = app_data(&state)?;
-    let old = read_provider(&app_data);
-    let key = if clear_key { String::new() } else if api_key.is_empty() { api_key_or_empty(&app_data) } else { api_key };
-    // A different endpoint has different models.
-    let models_kept = old.base_url == base_url;
-    let mut provider = Provider { base_url, models: if models_kept { old.models } else { vec![] }, efforts: if models_kept { old.efforts } else { Default::default() }, has_key: false };
-    apply_provider(&app_data, &provider, &key)?;
-    provider.has_key = !key.is_empty();
-    Ok(provider)
+pub async fn save_provider(base_url: String, api_key: String, clear_key: bool, app: tauri::AppHandle) -> Result<Provider, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let base_url = base_url.trim().trim_end_matches('/').to_string();
+        if !(base_url.starts_with("https://") || base_url.starts_with("http://")) || base_url.contains(char::is_whitespace) { return Err("Enter the provider's base URL, e.g. https://api.openai.com/v1.".into()); }
+        if !api_key.is_empty() && (api_key.len() > 512 || api_key.chars().any(char::is_control)) { return Err("The API key cannot contain control characters.".into()); }
+        crate::reset_runtime(&state)?;
+        let app_data = app_data(&state)?;
+        let old = read_provider(&app_data);
+        let key = if clear_key { String::new() } else if api_key.is_empty() { api_key_or_empty(&app_data) } else { api_key };
+        // A different endpoint has different models.
+        let models_kept = old.base_url == base_url;
+        let mut provider = Provider { base_url, models: if models_kept { old.models } else { vec![] }, efforts: if models_kept { old.efforts } else { Default::default() }, has_key: false };
+        apply_provider(&app_data, &provider, &key)?;
+        provider.has_key = !key.is_empty();
+        Ok(provider)
+    }).await.map_err(|e|e.to_string())?
 }
 
 fn api_key_or_empty(app_data: &Path) -> String { api_key(app_data).unwrap_or_default() }
@@ -155,6 +167,7 @@ fn api_key_or_empty(app_data: &Path) -> String { api_key(app_data).unwrap_or_def
 pub async fn refresh_provider_models(app: tauri::AppHandle) -> Result<Provider, String> {
     let app_data = app.state::<AppState>().app_data.lock().expect("app data state poisoned").clone().ok_or("Wallis configuration storage is not ready.")?;
     tauri::async_runtime::spawn_blocking(move || {
+        crate::reset_runtime(&app.state::<AppState>())?;
         let mut provider = read_provider(&app_data);
         if provider.base_url.is_empty() { return Err("Save the provider's base URL first.".to_string()); }
         let key = api_key_or_empty(&app_data);

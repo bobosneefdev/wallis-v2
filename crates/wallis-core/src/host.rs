@@ -6,9 +6,15 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 pub trait Discord {
+    fn scope(&mut self, _guild: u64, _user: u64) {}
     fn say(&mut self, text: &str) -> Result<(), String>;
     fn message(&mut self, channel_id: &str, text: &str) -> Result<(), String>;
     fn file(&mut self, channel_id: &str, filename: &str, content: &str, text: &str) -> Result<(), String>;
+    fn queue(&mut self, _path: &Path, _title: &str) -> Result<(), String> { Err("Music unavailable.".into()) }
+    fn queue_list(&mut self) -> Result<String, String> { Err("Music unavailable.".into()) }
+    fn skip_audio(&mut self) -> Result<(), String> { Err("Music unavailable.".into()) }
+    fn stop_audio(&mut self) -> Result<(), String> { Err("Music unavailable.".into()) }
+    fn volume(&mut self, _percent: u32) -> Result<(), String> { Err("Music unavailable.".into()) }
     /// Joins `channel`, or the voice channel of whoever Wallis is talking to. Returns the channel joined.
     fn join(&mut self, _channel: Option<u64>) -> Result<u64, String> { Err("Only the live Wallis can join calls.".into()) }
     /// Leaves the call.
@@ -57,6 +63,22 @@ impl<D: Discord> Host<'_, D> {
         let text = |key: &str| call.args.get(key).and_then(Value::as_str).unwrap_or("").to_string();
         let channel = text("channelId");
         let outcome = match call.tool.as_str() {
+            "run_mod" => {
+                let data = self.profile.parent().unwrap_or(Path::new("."));
+                let input = json!({"options":call.args.get("options").cloned().unwrap_or(json!({})),"guild":self.guild.to_string(),"user":self.user.to_string(),"channel":self.write_channels.first().cloned().unwrap_or_default()});
+                crate::mods::run(&data.to_path_buf(), &text("name"), input, &mut |call| self.handle(call))
+            }
+            "queue" => {
+                let media = self.profile.parent().unwrap_or(Path::new(".")).join("media");
+                crate::mods::confined_path(&media, Path::new(&text("path"))).and_then(|path| {
+                    if !path.is_file() || std::fs::metadata(&path).map_err(|e| e.to_string())?.len() > 50 * 1024 * 1024 { return Err("Audio must be a file of at most 50 MiB.".into()); }
+                    self.discord.queue(&path, &text("title"))
+                }).map(|_| "Queued.".into())
+            }
+            "queue_list" => self.discord.queue_list(),
+            "skip_audio" => self.discord.skip_audio().map(|_| "Skipped track.".into()),
+            "stop_audio" => self.discord.stop_audio().map(|_| "Music stopped.".into()),
+            "volume" => call.args.get("percent").and_then(Value::as_u64).filter(|p| *p <= 100).ok_or_else(|| "Volume must be 0–100.".to_string()).and_then(|p| self.discord.volume(p as u32)).map(|_| "Volume changed.".into()),
             "say" => self.discord.say(&text("text")).map(|_| "Spoken.".to_string()),
             "update_profile" => update_profile(&self.profile, &call.args),
             "join_call" => match call.args.get("channelId").filter(|value| !value.is_null()) {
@@ -83,7 +105,7 @@ impl<D: Discord> Host<'_, D> {
             "delegate" => {
                 let (task, context) = (text("task"), text("context"));
                 if task.is_empty() { Err("`task` is required.".into()) } else {
-                    self.jobs.enqueue(&format!("{task}\n\nContext:\n{context}"), &channel).map(|id| format!("Queued as job {id}. Tell the user it is underway."))
+                    self.jobs.enqueue_scoped(&format!("{task}\n\nContext:\n{context}"), &channel, self.guild, self.user).map(|id| format!("Queued as job {id}. Tell the user it is underway."))
                 }
             }
             other => Err(format!("Unknown tool {other:?}.")),

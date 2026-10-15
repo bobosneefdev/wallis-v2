@@ -9,9 +9,18 @@ const MESSAGE_LIMIT: usize = 1900;
 
 /// Claims and runs at most one job. Returns the job when one ran. `start` builds a fresh worker agent per job,
 /// so a stuck or poisoned worker never leaks into the next task.
-pub fn run_next(jobs: &Jobs, discord: &mut impl Discord, start: &mut dyn FnMut() -> Result<Agent, String>, idle_timeout: Duration) -> Result<Option<Job>, String> {
+pub fn run_next(jobs: &Jobs, discord: &mut impl Discord, start: &mut dyn FnMut() -> Result<Agent, String>, idle_timeout: Duration, data: &std::path::Path) -> Result<Option<Job>, String> {
     let Some(job) = jobs.claim()? else { return Ok(None) };
-    let outcome = start().and_then(|mut agent| agent.turn(&job.task, idle_timeout, &mut |_| "The worker has no host tools.".into(), &mut |_| {}));
+    discord.scope(job.guild, job.user);
+    let outcome = (|| {
+        crate::mods::check_budget(data)?;
+        let reminders = crate::schedule::Reminders::open(&data.join("jobs.sqlite").to_string_lossy())?;
+        let mut host = crate::host::Host { discord, jobs, reminders: &reminders, guild: job.guild, user: job.user, write_channels: vec![job.channel_id.clone()], skipped: false, profile: data.join("profile.json") };
+        let mut agent = start()?;
+        agent.turn(&format!("Guild: {}. Requester: {}. Reply channel: {}.\n{}", job.guild, job.user, job.channel_id, job.task), idle_timeout, &mut |call| {
+            if matches!(call.tool.as_str(), "message" | "file" | "queue_list" | "skip_audio" | "stop_audio" | "volume" | "run_mod") { host.handle(call) } else { "Failed: This tool is unavailable to the worker.".into() }
+        }, &mut |_| {})
+    })();
     let (ok, result) = match outcome { Ok(text) if !text.trim().is_empty() => (true, text), Ok(_) => (false, "The worker finished without a result.".into()), Err(error) => (false, error) };
     jobs.finish(job.id, ok, &result)?;
     let heading = if ok { format!("Job {} finished.", job.id) } else { format!("Job {} failed: {}", job.id, result.lines().next().unwrap_or("")) };
@@ -36,10 +45,10 @@ mod tests {
     fn a_failed_start_marks_the_job_failed_and_tells_the_channel() {
         let (jobs, mut fake) = (Jobs::open(":memory:").unwrap(), Fake::default());
         let id = jobs.enqueue("do it", "10").unwrap();
-        let ran = run_next(&jobs, &mut fake, &mut || Err("Pi missing".into()), Duration::from_secs(1)).unwrap();
+        let ran = run_next(&jobs, &mut fake, &mut || Err("Pi missing".into()), Duration::from_secs(1), &std::env::temp_dir()).unwrap();
         assert_eq!(ran.map(|job| job.id), Some(id));
         assert_eq!(jobs.with_status(&["failed"]).unwrap().len(), 1);
         assert_eq!(fake.messages, vec![format!("Job {id} failed: Pi missing")]);
-        assert!(run_next(&jobs, &mut fake, &mut || Err("x".into()), Duration::from_secs(1)).unwrap().is_none());
+        assert!(run_next(&jobs, &mut fake, &mut || Err("x".into()), Duration::from_secs(1), &std::env::temp_dir()).unwrap().is_none());
     }
 }

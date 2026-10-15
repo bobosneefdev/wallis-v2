@@ -1,0 +1,1 @@
+{"name":"wallis-runtime-tools","private":true,"dependencies":{"effect":"4.0.5","@effect/platform-bun":"4.0.5","typescript":"5.9.3","@types/bun":"1.4.1","oxlint":"1.16.0","agent-browser":"0.39.1"}}

@@ -1,0 +1,12 @@
+{
+  "name": "volume",
+  "description": "Set music volume",
+  "options": [
+    {
+      "name": "percent",
+      "description": "Volume from 0 to 100",
+      "type": "integer",
+      "required": true
+    }
+  ]
+}

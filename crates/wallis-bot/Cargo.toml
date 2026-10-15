@@ -1,0 +1,12 @@
+[package]
+name = "wallis-bot"
+version = "0.4.0"
+edition = "2021"
+[dependencies]
+wallis-core = { path = "../wallis-core" }
+wallis-discord = { path = "../wallis-discord" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

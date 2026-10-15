@@ -1,0 +1,12 @@
+{
+  "name": "play",
+  "description": "Play music from a search or URL",
+  "options": [
+    {
+      "name": "query",
+      "description": "Song name or URL",
+      "type": "string",
+      "required": true
+    }
+  ]
+}
