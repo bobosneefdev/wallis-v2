@@ -99,16 +99,18 @@ impl Out {
             None => Id::new_checked(user).and_then(|user| self.cache.voice_state(user, guild).map(|state| state.channel_id())).ok_or("They are not in a voice channel. Ask them to join one, or pass `channelId`.")?,
         };
         self.runtime.block_on(async {
-            if let Some(call) = self.songbird.get(guild) {
-                if call.lock().await.current_channel().is_some_and(|current| current.0.get() == channel.get()) { return Ok(channel.get()) }
+            let call = self.songbird.get_or_insert(guild);
+            {
+                let mut call = call.lock().await;
+                if call.current_channel().is_some_and(|current| current.0.get() == channel.get()) { return Ok(channel.get()) }
+                let receive = Arc::new(Receive { guild: guild.get(), channel: channel.get(), settings: self.settings.clone(), send: self.send.clone(), ssrc: Mutex::default(), segmenter: Mutex::default(), cache: self.cache.clone() });
+                // Speaking announcements arrive during the handshake; listen before joining or their SSRCs are lost.
+                // Moving between channels keeps the call, so replace its old listeners.
+                call.remove_all_global_events();
+                call.add_global_event(CoreEvent::SpeakingStateUpdate.into(), SharedReceive(receive.clone()));
+                call.add_global_event(CoreEvent::VoiceTick.into(), SharedReceive(receive));
             }
-            let call = self.songbird.join(guild, channel).await.map_err(|error| format!("Could not join that channel: {error}"))?;
-            let receive = Arc::new(Receive { guild: guild.get(), channel: channel.get(), settings: self.settings.clone(), send: self.send.clone(), ssrc: Mutex::default(), segmenter: Mutex::default(), cache: self.cache.clone() });
-            let mut call = call.lock().await;
-            // Moving between channels keeps the call, so drop the old listeners rather than hearing everyone twice.
-            call.remove_all_global_events();
-            call.add_global_event(CoreEvent::SpeakingStateUpdate.into(), SharedReceive(receive.clone()));
-            call.add_global_event(CoreEvent::VoiceTick.into(), SharedReceive(receive));
+            self.songbird.join(guild, channel).await.map_err(|error| format!("Could not join that channel: {error}"))?;
             Ok(channel.get())
         })
     }
@@ -294,6 +296,25 @@ mod profile_tests {
 mod speech_tests {
     use super::*;
     use std::io::Write;
+
+    #[tokio::test]
+    async fn speaker_announcements_identify_later_utterances() {
+        let receive = Arc::new(Receive {
+            guild: 1, channel: 2,
+            settings: Settings { token: String::new(), allowed_users: vec!["42".into()], read_channels: vec![], profile: Arc::new(|| None) },
+            send: Arc::new(|_| {}), ssrc: Mutex::default(), segmenter: Mutex::default(), cache: Arc::new(DefaultInMemoryCache::new()),
+        });
+        let speaking = serde_json::from_value(serde_json::json!({ "speaking": 1, "ssrc": 7, "user_id": "42" })).unwrap();
+        SharedReceive(receive.clone()).act(&EventContext::SpeakingStateUpdate(speaking)).await;
+        let mut segmenter = receive.segmenter.lock().unwrap();
+        for _ in 0..20 { assert!(segmenter.tick(&[(7, &[2000; 1920])], &[]).is_empty()); }
+        let utterances: Vec<_> = (0..8).flat_map(|_| segmenter.tick(&[], &[7])).collect();
+        assert_eq!(utterances.len(), 1);
+        let user = receive.ssrc.lock().unwrap()[&utterances[0].speaker];
+        assert_eq!(user, 42);
+        assert!(allowed(&receive.settings.allowed_users, user));
+        assert!(!allowed(&receive.settings.allowed_users, 43));
+    }
 
     #[test]
     fn songbird_decodes_live_pocket_pcm_before_the_stream_ends() {
