@@ -70,16 +70,18 @@ pub fn confined_path(root: &Path, path: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn check_budget(data: &Path) -> Result<(), String> {
-    fn size(path: &Path) -> Result<u64, String> {
-        let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-        if meta.is_symlink() { return Ok(0); }
-        if !meta.is_dir() { return Ok(meta.len()); }
-        std::fs::read_dir(path).map_err(|e| e.to_string())?.try_fold(0u64, |sum, e| Ok(sum.saturating_add(size(&e.map_err(|e| e.to_string())?.path())?)))
+    #[cfg(target_os = "linux")]
+    {
+        // The fixed ext4 filesystem enforces the cap, including private browser
+        // and provider folders the bot must not traverse as another uid.
+        let space = std::process::Command::new("/usr/bin/stat").args(["--file-system", "--format=%a", "--"]).arg(data.join("workspace")).output().map_err(|e| format!("Unable to check workspace space: {e}"))?;
+        if !space.status.success() { return Err(format!("Unable to check workspace space: {}", String::from_utf8_lossy(&space.stderr).trim())); }
+        let available = String::from_utf8_lossy(&space.stdout).trim().parse::<u64>().map_err(|e| format!("Invalid workspace space: {e}"))?;
+        if available == 0 { return Err("The 3 GiB workspace budget is exhausted. Delete unused downloads and mods.".into()); }
     }
-    let bytes = ["worker-scratch", "mods", "media"].into_iter().try_fold(0u64, |sum, name| {
-        let p = data.join(name); Ok::<_, String>(sum + if p.exists() { size(&p.canonicalize().map_err(|e|e.to_string())?)? } else { 0 })
-    })?;
-    if bytes > 3 * 1024 * 1024 * 1024 { Err("The 3 GiB workspace budget is exhausted. Delete unused downloads and mods.".into()) } else { Ok(()) }
+    #[cfg(not(target_os = "linux"))]
+    let _ = data; // Workers and mods cannot run outside the Linux runtime.
+    Ok(())
 }
 
 pub fn action(line: &str) -> Result<HostCall, String> {
@@ -144,6 +146,20 @@ pub fn run(data: &Path, name: &str, input: Value, on_action: &mut dyn FnMut(Host
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn budget_checks_the_filesystem_without_reading_private_worker_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("wallis-budget-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("workspace")).unwrap();
+        let private = root.join("worker-scratch/private");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = check_budget(&root);
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
     #[test]
     fn validates_manifests_inputs_actions_and_paths() {
         let mut m: Mod = serde_json::from_value(json!({"name":"play","description":"Play music","options":[{"name":"query","description":"Song","type":"string","required":true}]})).unwrap();

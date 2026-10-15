@@ -211,7 +211,7 @@ fn self_check() -> Result<(),String> {
     if !output.status.success() { return Err(format!("Isolation check failed: {}",String::from_utf8_lossy(&output.stderr))); }
     std::fs::remove_file(data.join("media/probe")).map_err(|e|format!("The bot cannot clean downloaded media: {e}"))?;
     let mut actions = Vec::new();
-    let reply = mods::run(data,"volume",json!({"options":{"percent":40},"guild":"1","user":"2","channel":"3"}), &mut |call| { actions.push((call.tool,call.args)); "Volume changed.".into() })?;
+    let reply = mods::run(data,"volume",json!({"options":{"percent":40},"guild":"1","user":"2","channel":"3"}), &mut |call| { actions.push((call.tool,call.args)); "Volume changed.".into() }).map_err(|e|format!("Stock mod check failed: {e}"))?;
     if actions != vec![("volume".into(),json!({"percent":40}))] || reply != "Volume changed." { return Err("Mod protocol roundtrip failed.".into()); }
     let mut access = access;
     access.write.push(data.join("pi/worker"));

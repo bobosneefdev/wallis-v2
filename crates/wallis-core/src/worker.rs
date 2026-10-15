@@ -45,10 +45,13 @@ mod tests {
     fn a_failed_start_marks_the_job_failed_and_tells_the_channel() {
         let (jobs, mut fake) = (Jobs::open(":memory:").unwrap(), Fake::default());
         let id = jobs.enqueue("do it", "10").unwrap();
-        let ran = run_next(&jobs, &mut fake, &mut || Err("Pi missing".into()), Duration::from_secs(1), &std::env::temp_dir()).unwrap();
+        let data = std::env::temp_dir().join(format!("wallis-worker-{}", std::process::id()));
+        std::fs::create_dir_all(data.join("workspace")).unwrap();
+        let ran = run_next(&jobs, &mut fake, &mut || Err("Pi missing".into()), Duration::from_secs(1), &data).unwrap();
         assert_eq!(ran.map(|job| job.id), Some(id));
         assert_eq!(jobs.with_status(&["failed"]).unwrap().len(), 1);
         assert_eq!(fake.messages, vec![format!("Job {id} failed: Pi missing")]);
-        assert!(run_next(&jobs, &mut fake, &mut || Err("x".into()), Duration::from_secs(1), &std::env::temp_dir()).unwrap().is_none());
+        assert!(run_next(&jobs, &mut fake, &mut || Err("x".into()), Duration::from_secs(1), &data).unwrap().is_none());
+        std::fs::remove_dir_all(data).unwrap();
     }
 }
