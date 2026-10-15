@@ -161,6 +161,8 @@ mod tests {
         let archive = PathBuf::from(std::env::var_os("WALLIS_WSL_ARCHIVE").expect("CI runtime image"));
         let data = std::env::temp_dir().join(format!("wallis-upgrade-test-{}", std::process::id()));
         std::fs::create_dir_all(&data).unwrap();
+        // WSL may stop while Windows compiles this test, unmounting the workspace.
+        run(&["-d","Wallis","-u","root","--","/opt/wallis/bin/wallis-bot","--self-check"]).unwrap();
         run(&["-d","Wallis","-u","root","--","python3","-c","from pathlib import Path; Path('/var/lib/wallis/upgrade-probe').write_text('persistent'); Path('/var/lib/wallis/worker-scratch/upgrade-probe').write_text('workspace')"]).unwrap();
         let probe = || {
             run(&["-d","Wallis","-u","root","--","/opt/wallis/bin/wallis-bot","--self-check"]).unwrap();
