@@ -129,9 +129,9 @@ impl Session {
                 if !SYNC_FILES.contains(&name.as_str()) { return Err("Unexpected runtime file.".into()); }
                 let path = self.data.join(name);
                 std::fs::create_dir_all(path.parent().ok_or("Invalid sync path.")?).map_err(|e|e.to_string())?;
-                // Atomic replacement on Windows via a temporary + copy preserves the previous file on write failure.
+                // Replace only after the complete credentials/profile have been written.
                 let temporary = path.with_extension("sync.tmp");
-                std::fs::write(&temporary,body.as_str().ok_or("Invalid sync content.")?).and_then(|_|std::fs::copy(&temporary,&path)).map_err(|e|e.to_string())?;
+                std::fs::write(&temporary,body.as_str().ok_or("Invalid sync content.")?).and_then(|_|std::fs::rename(&temporary,&path)).map_err(|e|e.to_string())?;
                 let _ = std::fs::remove_file(temporary);
             }
         }

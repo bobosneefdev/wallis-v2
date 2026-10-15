@@ -23,7 +23,7 @@ Music plays independently of speech and drops to 25% of its set volume while Wal
 
 Anyone on the configured Discord allow-list can request features or use commands in allowed output channels. The desktop **Commands** page lists mods and lets the owner disable or delete them. Deleted stock commands stay deleted. A disabled/deleted command cannot be run through the worker. Discord may take time to propagate global command changes.
 
-The shared `mods`, `media` and `worker-scratch` folders use a **fixed 3 GiB filesystem**, including dependencies and browser data. Individual files cap at 50 MiB, and processes time out after five minutes. Installed runtimes and speech models are outside this workspace allowance. The worker must remove temporary downloads and browser caches. A full workspace refuses new jobs until space is freed.
+The shared `mods`, `media`, `worker-scratch` and worker profile folders use a **fixed 3 GiB filesystem**, including dependencies and browser data. Individual files cap at 50 MiB, and processes time out after five minutes. Installed runtimes and speech models are outside this workspace allowance. The worker must remove temporary downloads and browser caches. A full workspace refuses new jobs until space is freed.
 
 Mod format: `mods/<name>/{mod.json,index.ts}`. See [the mod guide](skills/wallis-mods/SKILL.md) and [the shared Effect library](mods/_lib/wallis.ts). Every mod action uses the same Rust host dispatcher as agent tools; media paths must resolve inside `media/`.
 
@@ -57,7 +57,7 @@ Build the release image on an Ubuntu host with root privileges:
 sudo scripts/rootfs/build.sh target/release/wallis-bot /path/to/output 0.4.0
 ```
 
-This produces `wallis-rootfs.tar.gz` and its checksum. The release workflow builds the Linux image first, then publishes it with the Windows installer under the matching version tag. Inside an imported test distro, run `/opt/wallis/bin/wallis-bot --self-check` as root for uid/filesystem isolation and a real Bun mod roundtrip. This initializes the workspace; use a disposable test distro. `python /opt/wallis/source/crates/wallis-core/py/speech_check.py /var/lib/wallis` can exercise installed speech when the source is staged there.
+This produces `wallis-rootfs.tar.gz` and its checksum after sandbox, browser, mod and real speech roundtrip checks. The release workflow builds the Linux image first, then publishes it with the Windows installer under the matching version tag. Inside an imported test distro, run `/opt/wallis/bin/wallis-bot --self-check` as root for uid/filesystem isolation, browser navigation and a real Bun mod roundtrip. This initializes the workspace; use a disposable test distro. Stage `crates/wallis-core/py/speech_check.py` there and run it with `/opt/wallis/tools/venv/bin/python` as `wallis` to repeat the speech check.
 
 ## Sources and licenses
 

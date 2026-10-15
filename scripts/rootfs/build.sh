@@ -20,12 +20,13 @@ printf '%s  %s\n' 96c7f5fb28a7fe28245331f9bfbe4375f18dd29a4850116ad3c4f60f6700c5
 tar -xf "$output/ubuntu.wsl" -C "$root"
 mkdir -p "$root/opt/wallis/bin" "$root/opt/wallis/source"
 install -m 0755 "$bot" "$root/opt/wallis/bin/wallis-bot"
-tar -C "$repo" --exclude=.git --exclude=node_modules --exclude=target --exclude=dist --exclude=.turbo -cf - mods skills scripts/rootfs | tar -xf - -C "$root/opt/wallis/source"
+tar -C "$repo" --exclude=.git --exclude=node_modules --exclude=target --exclude=dist --exclude=.turbo -cf - mods skills scripts/rootfs crates/wallis-core/py/speech_check.py | tar -xf - -C "$root/opt/wallis/source"
 rm -f "$root/etc/resolv.conf"
 cp -L /etc/resolv.conf "$root/etc/resolv.conf"
 for fs in proc sys dev; do mount --rbind "/$fs" "$root/$fs"; mounted+=("$root/$fs"); mount --make-rslave "$root/$fs"; done
 chroot "$root" /usr/bin/env WALLIS_VERSION="$version" /bin/bash /opt/wallis/source/scripts/rootfs/provision.sh
 chroot "$root" /opt/wallis/bin/wallis-bot --self-check
+chroot "$root" /usr/bin/sudo -n -u wallis -- /opt/wallis/tools/venv/bin/python /opt/wallis/source/crates/wallis-core/py/speech_check.py /var/lib/wallis
 umount "$root/var/lib/wallis/workspace"
 rm -rf "$root/var/lib/wallis"
 install -d -o 1000 -g 1000 -m 0755 "$root/var/lib/wallis"

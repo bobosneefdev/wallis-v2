@@ -31,16 +31,18 @@ fn prepare(init: &Bootstrap) -> Result<(), String> {
         if !std::process::Command::new("mkfs.ext4").args(["-q","-F","-m","0"]).arg(&image).status().map_err(|e|e.to_string())?.success() { return Err("Unable to create the bounded workspace.".into()); }
     }
     if !std::process::Command::new("mountpoint").arg("-q").arg(&workspace).status().map_err(|e|e.to_string())?.success() && !std::process::Command::new("mount").args(["-o","loop,nosuid,nodev"]).arg(&image).arg(&workspace).status().map_err(|e|e.to_string())?.success() { return Err("Unable to mount the 3 GiB workspace.".into()); }
-    for name in ["mods", "media", "worker-scratch"] {
-        std::fs::create_dir_all(workspace.join(name)).map_err(|e|e.to_string())?;
+    for (name, folder) in [("mods","mods"), ("media","media"), ("worker-scratch","worker-scratch"), ("pi/worker","worker-config")] {
+        let target = workspace.join(folder);
         let alias = data.join(name);
-        if !alias.exists() { std::os::unix::fs::symlink(workspace.join(name),&alias).map_err(|e|e.to_string())?; }
-        if alias.canonicalize().map_err(|e|e.to_string())? != workspace.join(name) { return Err("Unexpected workspace path.".into()); }
+        std::fs::create_dir_all(alias.parent().ok_or("Invalid workspace alias.")?).map_err(|e|e.to_string())?;
+        std::fs::create_dir_all(&target).map_err(|e|e.to_string())?;
+        if !alias.exists() { std::os::unix::fs::symlink(&target,&alias).map_err(|e|e.to_string())?; }
+        if alias.canonicalize().map_err(|e|e.to_string())? != target { return Err("Unexpected workspace path.".into()); }
     }
     for name in ["pi/realtime", "pi/worker", "memory", "realtime-cwd", "logs"] {
         std::fs::create_dir_all(data.join(name)).map_err(|e| e.to_string())?;
         for component in [data.join(name), data.join(name).parent().unwrap().into()] {
-            if std::fs::symlink_metadata(&component).map_err(|e|e.to_string())?.is_symlink() { return Err("Runtime directories cannot be symlinks.".into()); }
+            if component != data.join("pi/worker") && std::fs::symlink_metadata(&component).map_err(|e|e.to_string())?.is_symlink() { return Err("Runtime directories cannot be symlinks.".into()); }
         }
         std::fs::set_permissions(data.join(name), std::fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
     }

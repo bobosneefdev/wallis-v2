@@ -60,7 +60,7 @@ pub fn save_config_file(path: &Path, config: &WallisConfig) -> Result<(), String
     let temporary = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(config).map_err(|error| format!("Unable to serialize Wallis configuration: {error}"))?;
     std::fs::write(&temporary, bytes).map_err(|error| format!("Unable to write Wallis configuration: {error}"))?;
-    let result = std::fs::copy(&temporary, path).map(|_| ()).map_err(|error| format!("Unable to replace Wallis configuration: {error}"));
+    let result = std::fs::rename(&temporary, path).map_err(|error| format!("Unable to replace Wallis configuration: {error}"));
     let _ = std::fs::remove_file(temporary);
     result
 }
