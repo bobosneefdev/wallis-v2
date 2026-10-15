@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import socket
 import sys
+import tempfile
 import wave
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -41,9 +42,10 @@ def load(mode, path, threads):
     config["weights_path"] = str(path.parent / "model.safetensors")
     config.pop("weights_path_without_voice_cloning", None)
     config["flow_lm"]["lookup_table"]["tokenizer_path"] = str(path.parent / "tokenizer.json")
-    local_config = path.parent / "local.yaml"
-    local_config.write_text(yaml.safe_dump(config))
-    model = TTSModel.load_model(config=local_config)
+    with tempfile.TemporaryDirectory() as temporary:
+        local_config = Path(temporary) / "local.yaml"
+        local_config.write_text(yaml.safe_dump(config))
+        model = TTSModel.load_model(config=local_config)
     model.has_voice_cloning = False
     state = model.get_state_for_audio_prompt(path)
 
