@@ -6734,7 +6734,7 @@ dependencies = [
 
 [[package]]
 name = "wallis"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -6751,6 +6751,7 @@ name = "wallis-core"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "getrandom 0.3.4",
  "rusqlite",
  "serde",

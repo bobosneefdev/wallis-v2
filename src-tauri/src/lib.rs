@@ -238,12 +238,8 @@ fn persona(app_data: &Path) -> String {
         name = p.name, age = p.age, pronouns = p.pronouns, location = p.location, occupation = p.occupation, tagline = p.tagline, interests = p.interests.join(", "), looking_for = p.looking_for, fun_fact = p.fun_fact, bio = p.bio, first = FIRST_NAME)
 }
 
-fn profile_summary(app_data: &Path) -> String {
-    match read_profile(app_data) {
-        Ok(p) => format!("**{}**{}\n{}\n{}", p.name, if p.tagline.is_empty() { String::new() } else { format!(" — {}", p.tagline) }, p.bio, p.interests.join(" · ")).chars().take(1900).collect(),
-        Err(_) => format!("{FIRST_NAME} has no profile yet."),
-    }
-}
+/// The sanitized profile as JSON, for the `/profile` embed. `None` until one has been generated.
+fn profile_json(app_data: &Path) -> Option<serde_json::Value> { read_profile(app_data).ok().and_then(|profile| serde_json::to_value(profile).ok()) }
 
 /// The user turn of the one-off generator: a random seed plus the optional preferences. The instructions live in `prompts::profile_generator_prompt`.
 fn generation_prompt(preferences: &str) -> String {
@@ -305,7 +301,7 @@ fn start_inner(state: &AppState) -> Result<RuntimeStatus, String> {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|error| error.to_string())?;
     let (bot, failure) = (Arc::new(Mutex::new(None::<Bot>)), Arc::new(Mutex::new(None::<String>)));
     let (on_ready, on_event, on_end) = (bot.clone(), bot.clone(), failure.clone());
-    let settings = wallis_discord::Settings { token, allowed_users: config.discord_allowed_users.split(',').map(String::from).collect(), read_channels: config.discord_read_channels.split(',').filter(|id| !id.is_empty()).map(String::from).collect(), profile: profile_summary(&app_data) };
+    let settings = wallis_discord::Settings { token, allowed_users: config.discord_allowed_users.split(',').map(String::from).collect(), read_channels: config.discord_read_channels.split(',').filter(|id| !id.is_empty()).map(String::from).collect(), profile: { let dir = app_data.clone(); Arc::new(move || profile_json(&dir)) } };
     let startup_failure = failure.clone();
     runtime.spawn(async move {
         let ready = move |out| {
@@ -319,7 +315,7 @@ fn start_inner(state: &AppState) -> Result<RuntimeStatus, String> {
         if let Err(error) = wallis_discord::run(settings, ready, events).await { *on_end.lock().expect("failure state poisoned") = Some(error); }
     });
     *state.running.lock().expect("running state poisoned") = Some(Running { bot, _servers: servers, runtime: Some(runtime), failure });
-    Ok(status("running", "Wallis is online. Use /join in Discord to bring him into a voice channel."))
+    Ok(status("running", "Wallis is online. Ask him to join your voice call, in text or by voice."))
 }
 
 #[tauri::command]

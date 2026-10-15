@@ -10,6 +10,7 @@ pub mod pi_config;
 pub mod prompts;
 pub mod provision;
 pub mod role;
+pub mod schedule;
 #[cfg(windows)]
 pub mod sandbox;
 pub mod speech;
