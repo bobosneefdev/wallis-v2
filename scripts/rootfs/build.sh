@@ -18,6 +18,7 @@ trap cleanup EXIT
 curl --fail --location --retry 3 https://releases.ubuntu.com/26.04/ubuntu-26.04-wsl-amd64.wsl -o "$output/ubuntu.wsl"
 printf '%s  %s\n' 96c7f5fb28a7fe28245331f9bfbe4375f18dd29a4850116ad3c4f60f6700c55c "$output/ubuntu.wsl" | sha256sum -c -
 tar -xf "$output/ubuntu.wsl" -C "$root"
+chmod 0755 "$root"
 mkdir -p "$root/opt/wallis/bin" "$root/opt/wallis/source"
 install -m 0755 "$bot" "$root/opt/wallis/bin/wallis-bot"
 tar -C "$repo" --exclude=.git --exclude=node_modules --exclude=target --exclude=dist --exclude=.turbo -cf - mods skills scripts/rootfs crates/wallis-core/py/speech_check.py | tar -xf - -C "$root/opt/wallis/source"
