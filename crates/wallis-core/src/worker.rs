@@ -25,7 +25,7 @@ pub fn run_next(jobs: &Jobs, discord: &mut impl Discord, start: &mut dyn FnMut()
     jobs.finish(job.id, ok, &result)?;
     let heading = if ok { format!("Job {} finished.", job.id) } else { format!("Job {} failed: {}", job.id, result.lines().next().unwrap_or("")) };
     let sent = if ok && result.len() > MESSAGE_LIMIT { discord.file(&job.channel_id, &format!("job-{}.md", job.id), &result, &heading) } else if ok { discord.message(&job.channel_id, &format!("{heading}\n\n{result}")) } else { discord.message(&job.channel_id, &heading) };
-    sent.map_err(|error| format!("Job {} ran but its result could not be posted: {error}", job.id))?;
+    if let Err(error) = sent { eprintln!("wallis: Job {} ran but its result could not be posted: {error}", job.id); }
     Ok(Some(job))
 }
 
@@ -34,10 +34,10 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
-    struct Fake { messages: Vec<String>, files: Vec<String> }
+    struct Fake { messages: Vec<String>, files: Vec<String>, fail_send: bool }
     impl Discord for Fake {
         fn say(&mut self, _: &str) -> Result<(), String> { Ok(()) }
-        fn message(&mut self, _: &str, text: &str) -> Result<(), String> { self.messages.push(text.into()); Ok(()) }
+        fn message(&mut self, _: &str, text: &str) -> Result<(), String> { self.messages.push(text.into()); if self.fail_send { Err("posting failed".into()) } else { Ok(()) } }
         fn file(&mut self, _: &str, name: &str, _: &str, _: &str) -> Result<(), String> { self.files.push(name.into()); Ok(()) }
     }
 
@@ -52,6 +52,11 @@ mod tests {
         assert_eq!(jobs.with_status(&["failed"]).unwrap().len(), 1);
         assert_eq!(fake.messages, vec![format!("Job {id} failed: Pi missing")]);
         assert!(run_next(&jobs, &mut fake, &mut || Err("x".into()), Duration::from_secs(1), &data).unwrap().is_none());
+        let id = jobs.enqueue("another job", "10").unwrap();
+        fake.fail_send = true;
+        // A posting failure must still report the completed job so commands refresh.
+        assert_eq!(run_next(&jobs, &mut fake, &mut || Err("Pi missing".into()), Duration::from_secs(1), &data).unwrap().unwrap().id, id);
+        assert_eq!(jobs.with_status(&["failed"]).unwrap().len(), 2);
         std::fs::remove_dir_all(data).unwrap();
     }
 }
