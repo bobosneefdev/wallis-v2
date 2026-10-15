@@ -120,7 +120,7 @@ mod tests {
     use serde_json::json;
 
     #[derive(Default)]
-    struct Fake { spoken: Vec<String>, posted: Vec<(String, String)>, joined: Vec<Option<u64>>, left: bool, in_call: Option<u64> }
+    struct Fake { spoken: Vec<String>, posted: Vec<(String, String)>, joined: Vec<Option<u64>>, left: bool, in_call: Option<u64>, music: Vec<String> }
     impl Discord for Fake {
         fn say(&mut self, text: &str) -> Result<(), String> { self.spoken.push(text.into()); Ok(()) }
         fn message(&mut self, channel_id: &str, text: &str) -> Result<(), String> { self.posted.push((channel_id.into(), text.into())); Ok(()) }
@@ -128,9 +128,38 @@ mod tests {
         fn join(&mut self, channel: Option<u64>) -> Result<u64, String> { self.joined.push(channel); self.in_call = Some(channel.unwrap_or(5)); Ok(channel.unwrap_or(5)) }
         fn leave(&mut self) -> Result<(), String> { self.left = true; self.in_call = None; Ok(()) }
         fn voice_channel(&self) -> Option<u64> { self.in_call }
+        fn queue(&mut self, path: &Path, title: &str) -> Result<(), String> { self.music.push(format!("queue:{}:{title}", path.display())); Ok(()) }
+        fn queue_list(&mut self) -> Result<String, String> { Ok(self.music.join("\n")) }
+        fn skip_audio(&mut self) -> Result<(), String> { self.music.push("skip".into()); Ok(()) }
+        fn stop_audio(&mut self) -> Result<(), String> { self.music.push("stop".into()); Ok(()) }
+        fn volume(&mut self, percent: u32) -> Result<(), String> { self.music.push(format!("volume:{percent}")); Ok(()) }
     }
 
     fn call(tool: &str, args: Value) -> HostCall { HostCall { request_id: "1".into(), tool: tool.into(), args } }
+
+    #[test]
+    fn music_routes_controls_and_confines_downloads() {
+        let root = std::env::temp_dir().join(format!("wallis-host-music-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("media")).unwrap();
+        std::fs::write(root.join("media/song.webm"), "audio").unwrap();
+        std::fs::write(root.join("outside.webm"), "private").unwrap();
+        std::fs::File::create(root.join("media/large.webm")).unwrap().set_len(50 * 1024 * 1024 + 1).unwrap();
+        let (mut fake, jobs, reminders) = (Fake::default(), Jobs::open(":memory:").unwrap(), Reminders::open(":memory:").unwrap());
+        let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec!["10".into()], skipped: false, profile: root.join("profile.json") };
+        for path in [root.join("outside.webm"), root.join("media/large.webm"), root.join("media")] {
+            assert!(host.handle(call("queue", json!({"path":path,"title":"bad"}))).starts_with("Failed:"));
+        }
+        assert_eq!(host.handle(call("queue", json!({"path":"song.webm","title":"Song"}))), "Queued.");
+        assert!(host.handle(call("queue_list", json!({}))).ends_with(":Song"));
+        for percent in [json!(-1), json!(101), json!(1.5), json!("40")] {
+            assert!(host.handle(call("volume", json!({"percent":percent}))).starts_with("Failed:"));
+        }
+        assert_eq!(host.handle(call("volume", json!({"percent":40}))), "Volume changed.");
+        assert_eq!(host.handle(call("skip_audio", json!({}))), "Skipped track.");
+        assert_eq!(host.handle(call("stop_audio", json!({}))), "Music stopped.");
+        assert_eq!(fake.music, vec![format!("queue:{}:Song", root.join("media/song.webm").canonicalize().unwrap().display()), "volume:40".into(), "skip".into(), "stop".into()]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn routes_tools_enforces_write_channels_and_queues_delegations() {
