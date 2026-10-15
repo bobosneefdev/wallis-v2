@@ -14,6 +14,9 @@ pub fn command(program: &Path, args: &[String], cwd: &Path, env: &[(String, Stri
         let mut command = Command::new("/usr/bin/sudo");
         command.args(["-n", "-u", "worker", "--", "/usr/bin/timeout", "--signal=KILL", "300", "/usr/bin/prlimit", "--fsize=52428800", "--nproc=256", "--", "/usr/bin/bwrap", "--die-with-parent", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", "/mnt", "--tmpfs", "/var/lib/wallis", "--clearenv", "--setenv", "HOME", &cwd.to_string_lossy(), "--setenv", "PATH", "/opt/wallis/tools/bun:/opt/wallis/tools/pi:/usr/local/bin:/opt/wallis/tools/node/node_modules/.bin:/opt/wallis/tools/venv/bin:/usr/bin:/bin"]);
         command.args(["--setenv","AGENT_BROWSER_EXECUTABLE_PATH","/opt/wallis/tools/clearcote/chrome","--setenv","AGENT_BROWSER_ARGS","--no-sandbox,--disable-dev-shm-usage"]);
+        // WSL links resolv.conf into /mnt/wsl, which is hidden above.
+        let resolver = std::fs::canonicalize("/etc/resolv.conf").map_err(|e| format!("Unable to resolve DNS configuration: {e}"))?;
+        command.arg("--ro-bind").arg(&resolver).arg(&resolver);
         for path in &access.read { command.arg("--ro-bind").arg(path).arg(path); }
         for path in &access.write { command.arg("--bind").arg(path).arg(path); }
         // Mods cannot read the worker's provider credentials either.

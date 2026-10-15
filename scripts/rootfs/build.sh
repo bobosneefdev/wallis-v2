@@ -36,9 +36,14 @@ unshare --mount --propagation private /bin/bash -euc '
   cd /
   umount -l /.oldroot
   rmdir /.oldroot
+  # Exercise resolv.conf pointing into a directory hidden by the sandbox, as on WSL.
+  mv /etc/resolv.conf /run/wallis-self-check-resolv.conf
+  ln -s /run/wallis-self-check-resolv.conf /etc/resolv.conf
   /opt/wallis/bin/wallis-bot --self-check
   sudo -n -u wallis -- /opt/wallis/tools/venv/bin/python /opt/wallis/source/crates/wallis-core/py/speech_check.py /var/lib/wallis
   umount /var/lib/wallis/workspace
+  rm /etc/resolv.conf
+  mv /run/wallis-self-check-resolv.conf /etc/resolv.conf
 ' -- "$root"
 rm -rf "$root/var/lib/wallis"
 install -d -o 1000 -g 1000 -m 0755 "$root/var/lib/wallis"
