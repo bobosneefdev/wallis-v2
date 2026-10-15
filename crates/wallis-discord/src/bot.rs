@@ -14,7 +14,7 @@ use wallis_core::participation::{interrupts, should_consider, sounds_like_wallis
 use wallis_core::{pi_config, prompts};
 use wallis_core::role::{Role, RoleConfig};
 use wallis_core::stats::Stats;
-use wallis_core::{speech, worker};
+use wallis_core::{speech, worker, media};
 
 #[derive(Clone)]
 pub struct BotConfig {
@@ -80,7 +80,7 @@ pub fn spawn_realtime_with(config: &BotConfig, system_prompt: &str) -> Result<Ag
     Agent::spawn(&config.pi_program, Role::Realtime, &config.realtime, &dir, system_prompt, &cwd, None)
 }
 
-struct Brain { config: BotConfig, out: Out, jobs: Jobs, reminders: Reminders, stats: Arc<Stats>, agent: Option<Agent>, last_reply_at: Option<Instant>, last_reply_user: Option<u64>, next_consider_at: Instant, started: Instant }
+struct Brain { config: BotConfig, out: Out, jobs: Jobs, reminders: Reminders, stats: Arc<Stats>, agent: Option<Agent>, last_reply_at: Option<Instant>, last_reply_user: Option<u64>, next_consider_at: Instant, started: Instant, media: media::History, last_text_reply: Option<(u64, u64, Instant)> }
 
 /// A new voice transcript is delivered by whether the agent is busy: `steer` into the running turn, or a fresh `prompt`.
 /// `rx` is read between Pi's events while it works; events that are not speech wait in `later` until the turn ends.
@@ -103,7 +103,7 @@ impl Brain {
         should_consider(&turn, &state, self.ms(now))
     }
 
-    fn respond(&mut self, guild: u64, user: u64, prompt: String, queue: &mut Queue) {
+    fn respond(&mut self, guild: u64, user: u64, prompt: String, images: &[media::Image], queue: &mut Queue) {
         // Take the agent out for the turn so the host can borrow the job store at the same time.
         let mut agent = match self.agent() { Ok(_) => self.agent.take().expect("agent present"), Err(error) => return eprintln!("wallis: realtime agent unavailable: {error}") };
         let (out, speed, write_channels) = (self.out.clone(), self.config.speech_speed, self.config.write_channels.clone());
@@ -133,7 +133,7 @@ impl Brain {
         };
         self.stats.audit("prompt", &prompt);
         let audit = self.stats.clone();
-        let result = agent.turn_steered(&prompt, Duration::from_secs(60), &mut steer, &mut |call| {
+        let result = agent.turn_with_images(&prompt, images, Duration::from_secs(60), &mut steer, &mut |call| {
             if call.tool == "delegate" { audit.audit("delegate", call.args.get("task").and_then(serde_json::Value::as_str).unwrap_or("")); }
             host.handle(call)
         }, &mut |_| {});
@@ -159,21 +159,55 @@ impl Brain {
         for reminder in due {
             self.stats.audit("reminder", &reminder.note);
             let prompt = reminder.prompt(now, self.out.voice_channel(reminder.guild), &self.config.write_channels);
-            self.respond(reminder.guild, reminder.user, prompt, queue);
+            self.respond(reminder.guild, reminder.user, prompt, &[], queue);
         }
     }
 
     fn handle(&mut self, event: Incoming, queue: &mut Queue) {
         match event {
-            Incoming::Text { guild, channel, user, speaker, said, direct, .. } => {
+            Incoming::Text { guild, channel, message, user, speaker, said, direct, mut media, reply } => {
                 self.stats.audit("typed", &format!("{speaker}: {said}"));
-                if self.consider(Mode::Text, user, direct) { self.respond(guild, user, turn_prompt(schedule::now(), Mode::Text, channel, &speaker, &said), queue); }
+                self.media.remember(channel, message, user, &media);
+                // An upload immediately after Wallis answered is a follow-up, including in mentions-only mode.
+                let follow_up = !media.is_empty() && self.last_text_reply.is_some_and(|(last_channel, last_user, at)| last_channel == channel && last_user == user && at.elapsed() < Duration::from_secs(120));
+                if !self.consider(Mode::Text, user, direct || follow_up) { return; }
+                let media_started = Instant::now();
+                if said.contains("https://") {
+                    let refreshed = self.out.media(channel, message);
+                    if !refreshed.is_empty() { media = refreshed; self.media.remember(channel, message, user, &media); }
+                }
+                let (source_message, sources) = if media.is_empty() {
+                    self.media.resolve(channel, user, reply, &said).unwrap_or_else(|| {
+                        reply.map(|id| (id, self.out.media(channel, id))).unwrap_or((message, vec![]))
+                    })
+                } else { (message, media) };
+                let mut prompt = turn_prompt(schedule::now(), Mode::Text, channel, &speaker, &said);
+                let mut images = Vec::new();
+                let frame_limit = (12 / sources.len().max(1)).min(6);
+                for (index, source) in sources.iter().enumerate() {
+                    let remaining = Duration::from_secs(20).saturating_sub(media_started.elapsed());
+                    if remaining.is_zero() { prompt.push_str("\n[remaining media unavailable: the turn's 20 second media budget was exhausted]"); break; }
+                    let first = images.len() + 1;
+                    match media::prepare(&self.config.python, source, frame_limit, remaining) {
+                        Ok(prepared) => {
+                            let status = if prepared.images.is_empty() { "unavailable".to_string() } else { format!("image inputs {first}–{}", first + prepared.images.len() - 1) };
+                            prompt.push_str(&format!("\n[media {} from message {source_message}; {status}] {}", index + 1, prepared.note));
+                            images.extend(prepared.images);
+                        }
+                        Err(error) => prompt.push_str(&format!("\n[media {} from message {source_message} unavailable] {error}", index + 1)),
+                    }
+                }
+                let before = self.last_reply_at;
+                self.respond(guild, user, prompt, &images, queue);
+                if self.last_reply_at != before { self.last_text_reply = self.last_reply_at.map(|at| (channel, user, at)); }
             }
+            Incoming::MediaUpdate { channel, message, user, media } => self.media.remember(channel, message, user, &media),
+            Incoming::MediaDelete { channel, messages } => self.media.forget(channel, &messages),
             Incoming::Voice { guild, channel, user, speaker, pcm } => {
                 let said = match speech::transcribe(&pcm) { Ok(text) if !text.is_empty() => text, Ok(_) => return, Err(error) => return eprintln!("wallis: {error}") };
                 if interrupts(&said) { self.out.stop_speaking(guild); }
                 self.stats.audit("heard", &format!("{speaker}: {said}"));
-                if self.consider(Mode::Voice, user, sounds_like_wallis(&said)) { self.respond(guild, user, turn_prompt(schedule::now(), Mode::Voice, channel, &speaker, &said), queue); }
+                if self.consider(Mode::Voice, user, sounds_like_wallis(&said)) { self.respond(guild, user, turn_prompt(schedule::now(), Mode::Voice, channel, &speaker, &said), &[], queue); }
             }
             Incoming::Ready { .. } => {}
         }
@@ -201,7 +235,7 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
     std::thread::spawn(move || {
         let (Ok(jobs), Ok(reminders)) = (Jobs::open(&brain_db), Reminders::open(&brain_db)) else { return };
         let now = Instant::now();
-        let mut brain = Brain { config: brain_config, out: brain_out, jobs, reminders, stats: brain_stats, agent: None, last_reply_at: None, last_reply_user: None, next_consider_at: now, started: now };
+        let mut brain = Brain { config: brain_config, out: brain_out, jobs, reminders, stats: brain_stats, agent: None, last_reply_at: None, last_reply_user: None, next_consider_at: now, started: now, media: media::History::default(), last_text_reply: None };
         let mut queue = Queue { rx: &receiver, later: Vec::new() };
         // Waking once a second is the reminder clock; events still arrive immediately.
         loop {

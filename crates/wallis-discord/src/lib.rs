@@ -22,6 +22,7 @@ use twilight_model::channel::message::Embed;
 use twilight_util::builder::command::CommandBuilder;
 use twilight_util::builder::embed::{EmbedBuilder, EmbedFooterBuilder, EmbedFieldBuilder};
 use wallis_core::utterance::Segmenter;
+use wallis_core::media::MAX_SOURCES;
 
 /// Reads Wallis' profile as JSON each time it is asked for, so changes he makes to himself show up at once.
 pub type ProfileSource = Arc<dyn Fn() -> Option<serde_json::Value> + std::marker::Send + Sync>;
@@ -38,7 +39,9 @@ pub struct Settings {
 #[derive(Debug)]
 pub enum Incoming {
     Ready { bot_id: u64 },
-    Text { guild: u64, channel: u64, message: u64, user: u64, speaker: String, said: String, direct: bool },
+    Text { guild: u64, channel: u64, message: u64, user: u64, speaker: String, said: String, direct: bool, media: Vec<String>, reply: Option<u64> },
+    MediaUpdate { channel: u64, message: u64, user: u64, media: Vec<String> },
+    MediaDelete { channel: u64, messages: Vec<u64> },
     /// A finished utterance of 48 kHz interleaved stereo PCM from an allow-listed speaker.
     Voice { guild: u64, channel: u64, user: u64, speaker: String, pcm: Vec<i16> },
 }
@@ -66,6 +69,24 @@ impl Compose for Pocket {
 }
 
 impl Out {
+    /// Discord may populate GIF embeds after MESSAGE_CREATE. Refresh off the gateway thread.
+    pub fn media(&self, channel: u64, message: u64) -> Vec<String> {
+        if !self.settings.read_channels.contains(&channel.to_string()) { return vec![]; }
+        self.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                for attempt in 0..3 {
+                    let Ok(response) = self.http.message(Id::new(channel), Id::new(message)).await else { return vec![] };
+                    let Ok(message) = response.model().await else { return vec![] };
+                    if message.author.bot || message.webhook_id.is_some() || !allowed(&self.settings.allowed_users, message.author.id.get()) { return vec![]; }
+                    let sources = message_media(&message);
+                    if !message.embeds.is_empty() || !message.attachments.is_empty() || attempt == 2 { return sources; }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                vec![]
+            }).await.unwrap_or_default()
+        })
+    }
+
     pub fn message(&self, channel: u64, text: &str) -> Result<(), String> {
         let none = AllowedMentions::default();
         let request = self.http.create_message(Id::new(channel)).content(text).allowed_mentions(Some(&none));
@@ -205,16 +226,48 @@ fn respond_embed(embed: Embed) -> InteractionResponse {
 
 struct Bot { settings: Settings, send: Send, http: Arc<Client>, cache: Arc<DefaultInMemoryCache>, application: Id<ApplicationMarker> }
 
+/// Prefer Discord's resolved video/image assets over a provider's HTML landing page.
+fn message_media(message: &twilight_model::channel::Message) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut add = |url: &str| {
+        if urls.len() < MAX_SOURCES && !urls.iter().any(|source: &String| source == url) { urls.push(url.to_string()); }
+    };
+    for attachment in &message.attachments { add(&attachment.url); }
+    for embed in &message.embeds {
+        if let Some(video) = &embed.video { if let Some(url) = video.proxy_url.as_ref().or(video.url.as_ref()) { add(url); continue; } }
+        if let Some(image) = &embed.image { add(image.proxy_url.as_deref().unwrap_or(&image.url)); }
+        else if let Some(thumbnail) = &embed.thumbnail { add(thumbnail.proxy_url.as_deref().unwrap_or(&thumbnail.url)); }
+    }
+    // Discord often supplies the embed later. Direct assets can be fetched immediately.
+    for (start, _) in message.content.match_indices("https://") {
+        let url = message.content[start..].split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | ')' | ']' | '"')).next().unwrap_or("").trim_end_matches([',', '.', ';', '!']);
+        if url.starts_with("https://") && !message.embeds.iter().any(|embed| embed.url.as_deref() == Some(url) && (embed.video.is_some() || embed.image.is_some() || embed.thumbnail.is_some())) { add(url); }
+    }
+    urls
+}
+
 impl Bot {
     async fn message(&self, message: &twilight_model::gateway::payload::incoming::MessageCreate) {
         let Some(guild) = message.guild_id else { return };
-        if message.author.bot || message.webhook_id.is_some() || message.content.trim().is_empty() { return; }
+        if message.author.bot || message.webhook_id.is_some() { return; }
         if !allowed(&self.settings.allowed_users, message.author.id.get()) || !self.settings.read_channels.contains(&message.channel_id.to_string()) { return; }
+        let media = message_media(message);
+        if message.content.trim().is_empty() && media.is_empty() { return; }
         let Some(me) = self.cache.current_user().map(|user| user.id) else { return };
         let replied_to_me = message.referenced_message.as_ref().is_some_and(|reference| reference.author.id == me);
         let direct = message.mentions.iter().any(|mention| mention.id == me) || replied_to_me || wallis_core::participation::names_wallis(&message.content);
         let speaker = message.member.as_ref().and_then(|member| member.nick.clone()).unwrap_or_else(|| message.author.name.clone());
-        (self.send)(Incoming::Text { guild: guild.get(), channel: message.channel_id.get(), message: message.id.get(), user: message.author.id.get(), speaker, said: message.content.clone(), direct });
+        if let Some(reference) = &message.referenced_message {
+            if !reference.author.bot && allowed(&self.settings.allowed_users, reference.author.id.get()) && reference.channel_id == message.channel_id {
+                (self.send)(Incoming::MediaUpdate { channel: reference.channel_id.get(), message: reference.id.get(), user: reference.author.id.get(), media: message_media(reference) });
+            }
+        }
+        (self.send)(Incoming::Text { guild: guild.get(), channel: message.channel_id.get(), message: message.id.get(), user: message.author.id.get(), speaker, said: message.content.clone(), direct, media, reply: message.reference.as_ref().and_then(|reference| reference.message_id).map(|id| id.get()) });
+    }
+
+    fn media_update(&self, message: &twilight_model::channel::Message) {
+        if message.author.bot || message.webhook_id.is_some() || !allowed(&self.settings.allowed_users, message.author.id.get()) || !self.settings.read_channels.contains(&message.channel_id.to_string()) { return; }
+        (self.send)(Incoming::MediaUpdate { channel: message.channel_id.get(), message: message.id.get(), user: message.author.id.get(), media: message_media(message) });
     }
 
     async fn command(&self, interaction: &InteractionCreate) {
@@ -260,6 +313,9 @@ pub async fn run(settings: Settings, ready: impl FnOnce(Out) + std::marker::Send
         match event {
             Gateway::Ready(ready) => (bot.send)(Incoming::Ready { bot_id: ready.user.id.get() }),
             Gateway::MessageCreate(message) => bot.message(&message).await,
+            Gateway::MessageUpdate(message) => bot.media_update(&message),
+            Gateway::MessageDelete(message) => (bot.send)(Incoming::MediaDelete { channel: message.channel_id.get(), messages: vec![message.id.get()] }),
+            Gateway::MessageDeleteBulk(message) => (bot.send)(Incoming::MediaDelete { channel: message.channel_id.get(), messages: message.ids.iter().map(|id| id.get()).collect() }),
             Gateway::InteractionCreate(interaction) => { let bot = bot.clone(); tokio::spawn(async move { bot.command(&interaction).await }); }
             _ => {}
         }
@@ -316,5 +372,62 @@ mod speech_tests {
         assert_eq!((audio.spec().rate, audio.spec().channels.count(), audio.frames()), (24_000, 1, 480));
         done.send(()).unwrap();
         producer.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn message(content: &str, attachments: serde_json::Value, embeds: serde_json::Value) -> twilight_model::channel::Message {
+        serde_json::from_value(json!({
+            "id":"10", "guild_id":"1", "channel_id":"2", "type":0,
+            "author":{"id":"3", "username":"Jake", "discriminator":"0", "avatar":null},
+            "content":content, "attachments":attachments, "embeds":embeds,
+            "timestamp":"2026-10-14T00:00:00.000000+00:00", "edited_timestamp":null,
+            "tts":false, "mention_everyone":false, "mentions":[], "mention_roles":[], "pinned":false
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn uploads_gif_embeds_and_pasted_links_survive_discord_intake() {
+        let cache = Arc::new(DefaultInMemoryCache::new());
+        let ready: twilight_model::gateway::payload::incoming::Ready = serde_json::from_value(json!({
+            "application":{"id":"4", "flags":0}, "guilds":[], "resume_gateway_url":"wss://gateway.discord.gg",
+            "session_id":"test", "v":10,
+            "user":{"id":"4", "username":"Wallis", "discriminator":"0", "avatar":null, "bot":true, "mfa_enabled":false}
+        })).unwrap();
+        cache.update(&Gateway::Ready(ready));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let received = events.clone();
+        let bot = Bot {
+            settings: Settings { token: String::new(), allowed_users: vec!["3".into()], read_channels: vec!["2".into()], profile: Arc::new(|| None) },
+            send: Arc::new(move |event| received.lock().unwrap().push(event)),
+            http: Arc::new(Client::new("test".into())), cache, application: Id::new(4),
+        };
+        let upload = message("", json!([{"id":"5", "filename":"image.png", "size":100,
+            "url":"https://cdn.discordapp.com/image.png?ex=signed", "proxy_url":"https://media.discordapp.net/image.png"}]), json!([]));
+        let gif = message("https://tenor.com/view/cat", json!([]), json!([{"type":"gifv", "url":"https://tenor.com/view/cat",
+            "video":{"url":"https://media.tenor.com/cat.mp4"}, "thumbnail":{"url":"https://media.tenor.com/cat.png"}}]));
+        let link = message("here it is wallis: [the clip](https://images-ext-1.discordapp.net/external/cat.mp4)", json!([]), json!([]));
+        for message in [&upload, &gif, &link] {
+            bot.message(&twilight_model::gateway::payload::incoming::MessageCreate(message.clone())).await;
+        }
+        {
+            let guard = events.lock().unwrap();
+            assert_eq!(guard.len(), 3, "media-only uploads must not be dropped");
+            for (event, url) in guard.iter().zip(["https://cdn.discordapp.com/image.png?ex=signed", "https://media.tenor.com/cat.mp4", "https://images-ext-1.discordapp.net/external/cat.mp4"]) {
+                let Incoming::Text { media, .. } = event else { panic!("expected text event") };
+                assert_eq!(media, &[url.to_string()]);
+            }
+        }
+        let mut denied = upload.clone();
+        denied.author.id = Id::new(99);
+        bot.message(&twilight_model::gateway::payload::incoming::MessageCreate(denied)).await;
+        let mut denied = upload;
+        denied.channel_id = Id::new(99);
+        bot.message(&twilight_model::gateway::payload::incoming::MessageCreate(denied)).await;
+        assert_eq!(events.lock().unwrap().len(), 3, "media must not bypass access rules");
     }
 }

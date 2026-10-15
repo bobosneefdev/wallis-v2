@@ -86,6 +86,12 @@ const tools = [
 export default function (pi: ExtensionAPI) {
   if (process.env.WALLIS_ROLE === "realtime") for (const tool of tools) pi.registerTool(tool);
 
+  pi.on("input", (event, ctx) => {
+    if (event.images?.length && !ctx.model?.input.includes("image")) {
+      return { action: "transform", images: [], text: event.text + "\n[media unavailable: the selected model does not support image inputs. Tell the user to select a vision-capable realtime model; do not claim no attachment was sent.]" };
+    }
+  });
+
   // Pi's thinking levels stop at "max"; the Codex catalog also offers levels such as "ultra", so the exact
   // catalog value overrides the request. Fast mode is the "priority" service tier.
   const effort = process.env.WALLIS_EFFORT;

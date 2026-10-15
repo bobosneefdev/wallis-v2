@@ -25,6 +25,8 @@ cargo check --workspace
 
 On Windows, `cargo run -p wallis-core --example provision -- <data_dir>` checks full provisioning and a Pocket-to-Parakeet audio roundtrip. Append `--installed` to test an already provisioned directory. `python crates/wallis-core/py/speech_check.py <data_dir>` checks actual model streaming, cancellation, malformed requests and a transcription roundtrip using the installed speech environment.
 
+Using the provisioned Python environment, `python crates/wallis-core/py/media_check.py` checks real image/GIF/MP4 decoding, frame limits, and download security without a Discord account or network requests.
+
 The release workflow runs on pushes to `master`. Merging the 0.3.0 version bump builds and publishes a new Windows installer if `v0.3.0` does not already exist.
 
 ## Speech sources and licenses
@@ -36,6 +38,12 @@ The release workflow runs on pushes to `master`. Merging the 0.3.0 version bump 
 ## Discord
 
 Wallis has one slash command, `/profile`, which shows his profile as an embed. There are no `/join` or `/leave` commands: ask him, in a text channel or in the call, and he decides. He may say no.
+
+Text chat accepts image uploads, Discord GIF embeds, and public HTTPS media links. Wallis receives actual image inputs; GIFs and videos become timestamped frames using PyAV (installed into the existing Python environment). The realtime model must support images. Unsupported models and failed downloads produce specific media failure notes rather than silently losing attachments.
+
+Replies select the referenced media. Phrases such as “the GIF above” select that user's latest media in the same channel. Up to 64 messages' media metadata stays in RAM for ten minutes and is removed on deletion; media bytes are not cached to disk. An upload within two minutes of a reply to that user in that channel counts as a follow-up, including in mentions-only mode. Existing user and channel access rules still apply.
+
+Each turn examines at most four media items and twelve frames (at most six per item), resized to 768 pixels on the longest edge. Downloads require public HTTPS on port 443, validate and pin DNS addresses on every redirect, and are capped at 20 MiB per item. Decoding rejects images over 16 megapixels, samples at most the first 30 seconds of video, and does not process audio. Media processing has a shared 20 second deadline; partial samples are labelled so Wallis does not claim to have watched the whole clip. Web pages require a media embed from Discord; this is not a general web browser.
 
 ## Time
 
