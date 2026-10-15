@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use wallis_core::agent::{Access, Agent};
 use wallis_core::host::{Discord, Host};
 use wallis_core::jobs::Jobs;
-use wallis_core::participation::{should_consider, sounds_like_wallis, Mode, Participation, State, Turn};
+use wallis_core::participation::{interrupts, should_consider, sounds_like_wallis, Mode, Participation, State, Turn};
 use wallis_core::{pi_config, prompts};
 use wallis_core::role::{Role, RoleConfig};
 use wallis_core::stats::Stats;
@@ -110,10 +110,10 @@ impl Brain {
             for event in queue.rx.try_iter().collect::<Vec<_>>() {
                 match event {
                     Incoming::Voice { guild, user, speaker, pcm, .. } => {
-                        // Talking over Wallis cuts him off, then what they said steers the turn already underway.
-                        out.stop_speaking(guild);
+                        // Talking over Wallis cuts him off (noise and backchannel don't), then what they said steers the turn already underway.
                         match speech::transcribe(&pcm) {
                             Ok(said) if !said.is_empty() => {
+                                if interrupts(&said) { out.stop_speaking(guild); }
                                 let text = turn_prompt(Mode::Voice, 0, &speaker, &said);
                                 stats.steered(); stats.audit("heard", &format!("{speaker}: {said}")); stats.audit("steer", &text); steers.push(text); let _ = user;
                             }
@@ -154,8 +154,8 @@ impl Brain {
                 if self.consider(Mode::Text, user, direct) { self.respond(guild, user, turn_prompt(Mode::Text, channel, &speaker, &said), queue); }
             }
             Incoming::Voice { guild, channel, user, speaker, pcm } => {
-                self.out.stop_speaking(guild);
                 let said = match speech::transcribe(&pcm) { Ok(text) if !text.is_empty() => text, Ok(_) => return, Err(error) => return eprintln!("wallis: {error}") };
+                if interrupts(&said) { self.out.stop_speaking(guild); }
                 self.stats.audit("heard", &format!("{speaker}: {said}"));
                 if self.consider(Mode::Voice, user, sounds_like_wallis(&said)) { self.respond(guild, user, turn_prompt(Mode::Voice, channel, &speaker, &said), queue); }
             }

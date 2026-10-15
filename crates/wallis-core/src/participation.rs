@@ -49,6 +49,14 @@ pub fn sounds_like_wallis(text: &str) -> bool {
     words.iter().map(|word| word.to_string()).chain(words.windows(2).filter(|pair| pair[1].starts_with(['a', 'e', 'i', 'o', 'u'])).map(|pair| pair.concat())).any(|word| soundex(&word) == target) || names_wallis(text)
 }
 
+/// True when an utterance heard over Wallis should cut him off: his name, "stop"/"wait", or two or more words
+/// that are not all backchannel ("yeah", "mhm", "uh huh"). A lone acknowledgement lets him keep talking.
+pub fn interrupts(text: &str) -> bool {
+    let words: Vec<String> = text.split(|c: char| !(c.is_alphanumeric() || c == '\'')).filter(|w| !w.is_empty()).map(str::to_lowercase).collect();
+    let backchannel = |w: &String| ["yeah", "yep", "yes", "ya", "yup", "mhm", "mm", "hmm", "uh", "huh", "um", "ok", "okay", "right", "sure", "lol", "haha", "ha", "nice", "cool", "true", "oh", "ah"].contains(&w.as_str());
+    sounds_like_wallis(text) || words.iter().any(|w| w == "stop" || w == "wait") || (words.len() >= 2 && !words.iter().all(backchannel))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +87,11 @@ mod tests {
         assert_eq!((soundex("Wallis"), soundex("Robert"), soundex("Ashcraft")), (Some("W420".into()), Some("R163".into()), Some("A261".into())));
         assert!(sounds_like_wallis("hey wallace") && sounds_like_wallis("Wallis's turn") && sounds_like_wallis("hey wall is there") && sounds_like_wallis("ok wally"));
         assert!(!sounds_like_wallis("I will go") && !sounds_like_wallis("what is that"));
+    }
+
+    #[test]
+    fn only_real_speech_interrupts() {
+        assert!(!interrupts("") && !interrupts("Yeah.") && !interrupts("uh huh") && !interrupts("okay, right") && !interrupts("no"));
+        assert!(interrupts("wait") && interrupts("Stop!") && interrupts("Wallis") && interrupts("no that's wrong") && interrupts("yeah but why"));
     }
 }
