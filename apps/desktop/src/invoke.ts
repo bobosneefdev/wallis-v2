@@ -99,7 +99,7 @@ const fallback: WallisConfig = {
   participationCooldownSecs: 5,
   autoStart: false,
   onboarded: false,
-  sttModel: "parakeet-110m-int8",
+  sttModel: "parakeet-0.6b-v3-int8",
   sttThreads: 4,
   ttsVoice: "alba",
   ttsSpeed: 1,
