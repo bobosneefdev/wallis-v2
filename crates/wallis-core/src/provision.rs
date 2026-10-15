@@ -162,7 +162,7 @@ fn run(program: &Path, args: &[&str], what: &str) -> Result<(), String> {
     { use std::os::windows::process::CommandExt; command.creation_flags(0x0800_0000); }
     let output = command.output().map_err(|error| format!("Unable to {what}: {error}"))?;
     if output.status.success() { return Ok(()); }
-    Err(format!("Unable to {what}: {}", String::from_utf8_lossy(&output.stderr).lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no output")))
+    Err(format!("Unable to {what}: {}", String::from_utf8_lossy(&output.stderr).trim()))
 }
 
 /// Installs every runtime piece (idempotent): Pi, uv, a CPU Python environment with speech and memory packages, and pinned models.

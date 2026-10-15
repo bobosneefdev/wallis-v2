@@ -4,7 +4,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 source_dir=/opt/wallis/source
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl git unzip xz-utils sudo bubblewrap ffmpeg e2fsprogs mount python3 \
+apt-get install -y --no-install-recommends ca-certificates curl git unzip xz-utils sudo bubblewrap ffmpeg e2fsprogs mount python3 build-essential cmake \
   libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 libdbus-1-3 \
   libxkbcommon0 libx11-6 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 \
   libasound2t64 libpango-1.0-0 libcairo2 fonts-liberation fonts-noto-color-emoji libglib2.0-0t64
@@ -61,6 +61,8 @@ cp -R "$source_dir/mods" /opt/wallis/stock-mods
 # Source tarballs omit node_modules; dependencies are root-owned and read-only to worker code.
 ln -s /opt/wallis/tools/node/node_modules /opt/wallis/stock-mods/node_modules
 export UV_PYTHON_INSTALL_DIR=/opt/wallis/tools/python
+# Mnemosyne's llama-cpp-python builds from source. Do not bake the CI host's CPU into the release.
+export CMAKE_ARGS=-DGGML_NATIVE=OFF
 /opt/wallis/bin/wallis-bot --provision
 # Browser and compiler smoke checks are part of the image build.
 /opt/wallis/tools/clearcote/chrome --headless --no-sandbox --disable-dev-shm-usage --dump-dom about:blank >/dev/null
