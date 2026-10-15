@@ -6734,7 +6734,7 @@ dependencies = [
 
 [[package]]
 name = "wallis"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "serde",
  "serde_json",
