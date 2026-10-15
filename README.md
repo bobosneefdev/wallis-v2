@@ -4,7 +4,7 @@ A Windows desktop Discord companion, built with Tauri, Svelte, Twilight and Song
 
 ## Local speech
 
-Wallis 0.3.9 uses **Parakeet TDT 0.6B v3 INT8** through Sherpa-ONNX and **Pocket TTS 3.3.0** (English September 2026). Both run on CPU. First startup downloads checksummed models and installs CPU PyTorch in the app's Python environment, including upgrades from an existing installation. No GPU or Hugging Face account is required.
+Wallis 0.3.10 uses **Parakeet TDT 0.6B v3 INT8** through Sherpa-ONNX and **Pocket TTS 3.3.0** (English September 2026). Both run on CPU. First startup downloads checksummed models and installs CPU PyTorch in the app's Python environment, including upgrades from an existing installation. No GPU or Hugging Face account is required.
 
 Pocket audio streams directly into Songbird as 24 kHz mono float PCM; Songbird resamples it for Discord. Playback starts while the rest of the sentence is still being synthesized. Interrupting Wallis stops the queued track and closes its stream. Speaking speed adjusts playback rate and therefore pitch; 1.0 preserves the preset voice.
 
@@ -25,7 +25,7 @@ cargo check --workspace
 
 On Windows, `cargo run -p wallis-core --example provision -- <data_dir>` checks full provisioning and a Pocket-to-Parakeet audio roundtrip. Append `--installed` to test an already provisioned directory. `python crates/wallis-core/py/speech_check.py <data_dir>` checks actual model streaming, cancellation, malformed requests and a transcription roundtrip using the installed speech environment.
 
-The release workflow runs on pushes to `master`. Merging the 0.3.9 version bump builds and publishes a new Windows installer if `v0.3.9` does not already exist.
+The release workflow runs on pushes to `master`. Merging the 0.3.10 version bump builds and publishes a new Windows installer if `v0.3.10` does not already exist.
 
 ## Speech sources and licenses
 
