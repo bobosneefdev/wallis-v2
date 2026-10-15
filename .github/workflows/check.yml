@@ -25,6 +25,42 @@ jobs:
       # Disposable runner: Ubuntu's AppArmor user-namespace restriction blocks bubblewrap.
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: sudo scripts/rootfs/build.sh target/release/wallis-bot "$RUNNER_TEMP/runtime" 0.4.0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-runtime
+          path: ${{ runner.temp }}/runtime/wallis-rootfs.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  wsl-runtime:
+    needs: runtime
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-runtime
+          path: runtime
+      - name: Import and exercise the WSL2 runtime
+        shell: pwsh
+        env:
+          WALLIS_WSL_TEST: '1'
+        run: |
+          $imported = $false
+          try {
+            wsl --import Wallis "$env:RUNNER_TEMP\wallis-distro" "$pwd\runtime\wallis-rootfs.tar.gz" --version 2
+            if ($LASTEXITCODE -ne 0) { throw 'WSL2 import failed' }
+            $imported = $true
+            wsl -d Wallis -u root -- /opt/wallis/bin/wallis-bot --self-check
+            if ($LASTEXITCODE -ne 0) { throw 'WSL2 sandbox, browser or mod check failed' }
+            cargo test -p wallis-core --test wsl_runtime -- --ignored --nocapture
+            if ($LASTEXITCODE -ne 0) { throw 'Windows manager integration failed' }
+          } finally {
+            if ($imported) { wsl --unregister Wallis }
+          }
 
   desktop:
     runs-on: windows-latest
