@@ -62,7 +62,7 @@ def load(mode, path, threads, voices_dir=None):
             raise ValueError("Invalid voice name.")
         if name not in cache:
             for folder in (voices, pocket):
-                if (folder / f"{name}.safetensors").is_file():
+                if folder and (folder / f"{name}.safetensors").is_file():
                     if len(cache) >= 8:
                         cache.pop(next(iter(cache)))
                     cache[name] = model.get_state_for_audio_prompt(folder / f"{name}.safetensors")
