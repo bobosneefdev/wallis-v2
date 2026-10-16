@@ -1,4 +1,4 @@
-//! Native Windows install: pinned, checksummed downloads unpacked under the app data folder. No WSL, no admin rights.
+//! Pinned Linux runtime and speech models, assembled into the versioned WSL rootfs.
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -6,11 +6,8 @@ use std::path::{Path, PathBuf};
 pub struct Artifact { pub name: &'static str, pub url: &'static str, pub sha256: &'static str, /// Leading folder to drop while unpacking.
     pub strip: &'static str }
 
-pub const PI: Artifact = Artifact { name: "pi", url: "https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-windows-x64.zip", sha256: "bd272b508657ad8d0ac6176e7751913c848a89cfb8cbe21ff319941e6ca140be", strip: "" };
-pub const UV: Artifact = Artifact { name: "uv", url: "https://github.com/astral-sh/uv/releases/download/0.13.0/uv-x86_64-pc-windows-msvc.zip", sha256: "088962f9e7b7bd9ea740c04c650b2a21c8928c345bd99ac24350dc924dba656c", strip: "" };
-/// busybox-w32 (single exe, applets built in): the worker's `sh`. MSYS shells cannot initialise inside an AppContainer.
-pub const BUSYBOX_URL: &str = "https://frippery.org/files/busybox/busybox-w64u-FRP-6075-g169694ebd.exe";
-pub const BUSYBOX_SHA256: &str = "6e263d154d8548d1eb936f65d1d8312c80df31c45974e48d6335e4dcc0f4f34c";
+pub const PI: Artifact = Artifact { name: "pi", url: "https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-linux-x64.tar.gz", sha256: "00fc36cffdebceea5a48230da62cf3fb463178f8fe185766652f96002a246847", strip: "pi" };
+pub const UV: Artifact = Artifact { name: "uv", url: "https://github.com/astral-sh/uv/releases/download/0.13.0/uv-x86_64-unknown-linux-gnu.tar.gz", sha256: "1468ebd5a5541121837c5a2817b9972ba6090fa6caa3d142620850a47fb75154", strip: "uv-x86_64-unknown-linux-gnu" };
 /// Python packages installed into the app's own virtual environment (voice and realtime memory).
 pub const POCKET_PACKAGE: &str = "pocket-tts==3.3.0";
 pub const SHERPA_PACKAGE: &str = "sherpa-onnx==1.13.8";
@@ -23,7 +20,14 @@ pub fn sha256_hex(bytes: &[u8]) -> String { Sha256::digest(bytes).iter().map(|by
 
 /// Downloads `url` to `dest`, keeping the file only if its SHA-256 matches `sha256`.
 pub fn download_verified(url: &str, sha256: &str, dest: &Path) -> Result<(), String> {
-    if let Ok(existing) = std::fs::read(dest) { if sha256_hex(&existing) == sha256 { return Ok(()); } }
+    if let Ok(mut existing) = std::fs::File::open(dest) {
+        let mut hasher = Sha256::new(); let mut buffer = [0u8;65536];
+        loop {
+            let n = existing.read(&mut buffer).map_err(|e|e.to_string())?;
+            if n == 0 { break; } hasher.update(&buffer[..n]);
+        }
+        if format!("{:x}",hasher.finalize()) == sha256 { return Ok(()); }
+    }
     let parent = dest.parent().ok_or("Bad download path.")?;
     std::fs::create_dir_all(parent).map_err(|error| format!("Unable to create {}: {error}", parent.display()))?;
     let part = dest.with_extension("part");
@@ -64,7 +68,10 @@ pub fn install(artifact: &Artifact, root: &Path, marker: &str) -> Result<PathBuf
     let archive = root.join("downloads").join(format!("{}.zip", artifact.name));
     download_verified(artifact.url, artifact.sha256, &archive)?;
     let _ = std::fs::remove_dir_all(&dir);
-    unzip(&archive, &dir, artifact.strip)?;
+    if artifact.url.ends_with(".tar.gz") {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        run(Path::new("/usr/bin/tar"), &["-xzf", &archive.to_string_lossy(), "--strip-components=1", "-C", &dir.to_string_lossy()], "extract Linux runtime")?;
+    } else { unzip(&archive, &dir, artifact.strip)?; }
     if !dir.join(marker).is_file() { return Err(format!("{} installed without {marker}.", artifact.name)); }
     Ok(dir)
 }
@@ -140,7 +147,7 @@ impl Layout {
     fn exe(name: &str) -> String { if cfg!(windows) { format!("{name}.exe") } else { name.to_string() } }
     pub fn tools(&self) -> PathBuf { self.0.join("tools") }
     pub fn pi(&self) -> PathBuf { self.tools().join("pi").join(Self::exe("pi")) }
-    pub fn shell(&self) -> PathBuf { self.tools().join("busybox").join(Self::exe("sh")) }
+    pub fn shell(&self) -> PathBuf { PathBuf::from("/bin/bash") }
     pub fn uv(&self) -> PathBuf { self.tools().join("uv").join(Self::exe("uv")) }
     pub fn venv(&self) -> PathBuf { self.tools().join("venv") }
     pub fn python(&self) -> PathBuf { if cfg!(windows) { self.venv().join("Scripts").join("python.exe") } else { self.venv().join("bin").join("python") } }
@@ -156,7 +163,7 @@ fn run(program: &Path, args: &[&str], what: &str) -> Result<(), String> {
     { use std::os::windows::process::CommandExt; command.creation_flags(0x0800_0000); }
     let output = command.output().map_err(|error| format!("Unable to {what}: {error}"))?;
     if output.status.success() { return Ok(()); }
-    Err(format!("Unable to {what}: {}", String::from_utf8_lossy(&output.stderr).lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("no output")))
+    Err(format!("Unable to {what}: {}", String::from_utf8_lossy(&output.stderr).trim()))
 }
 
 /// Installs every runtime piece (idempotent): Pi, uv, a CPU Python environment with speech and memory packages, and pinned models.
@@ -168,8 +175,7 @@ pub fn ensure_all(layout: &Layout, stt: &str, tts: &str, progress: &dyn Fn(&str)
     install(&PI, &tools, &Layout::exe("pi"))?;
     progress("Installing speech recognition…");
     install(&UV, &tools, &Layout::exe("uv"))?;
-    progress("Installing the worker shell…");
-    download_verified(BUSYBOX_URL, BUSYBOX_SHA256, &layout.shell())?;
+
     if !layout.python().is_file() {
         progress("Setting up Python for voice and memory…");
         run(&layout.uv(), &["venv", "--python", PYTHON_VERSION, &layout.venv().to_string_lossy()], "create the Python environment")?;
@@ -207,9 +213,10 @@ pub struct SpeechServers(Vec<std::process::Child>);
 
 impl SpeechServers {
     pub fn start(layout: &Layout, stt: &str, threads: u32, tts: &str) -> Result<Self, String> {
+        std::fs::create_dir_all(layout.0.join("logs")).map_err(|e| e.to_string())?;
         let spawn = |program: &Path, args: Vec<String>, what: &str, port: u16| {
             let mut command = std::process::Command::new(program);
-            let log = std::fs::File::create(layout.tools().join(format!("speech-{port}.log"))).map_err(|error| error.to_string())?;
+            let log = std::fs::File::create(layout.0.join("logs").join(format!("speech-{port}.log"))).map_err(|error| error.to_string())?;
             command.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(log);
             #[cfg(windows)]
             { use std::os::windows::process::CommandExt; command.creation_flags(0x0800_0000); }
@@ -224,7 +231,7 @@ impl SpeechServers {
             for _ in 0..300 {
                 for (index, child) in servers.0.iter_mut().enumerate() {
                     if child.try_wait().map_err(|error| error.to_string())?.is_some() {
-                        let log = std::fs::read_to_string(layout.tools().join(format!("speech-{}.log", 8085 + index))).unwrap_or_default();
+                        let log = std::fs::read_to_string(layout.0.join("logs").join(format!("speech-{}.log", 8085 + index))).unwrap_or_default();
                         return Err(format!("Speech server exited: {}", log.lines().last().unwrap_or("no output")));
                     }
                 }

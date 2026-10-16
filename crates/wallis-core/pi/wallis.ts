@@ -22,6 +22,12 @@ const tools = [
     async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "say", params)); },
   }),
   defineTool({
+    name: "stop_speaking", label: "Stop speaking",
+    description: "Interrupt yourself: stop current and queued speech. Use only when you choose to stop or change course; then call say if you want to say something else. New transcripts do not stop your speech.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _update, ctx) { return text(await callHost(ctx, "stop_speaking", {})); },
+  }),
+  defineTool({
     name: "message", label: "Message",
     description: "Post a text message in an allowed Discord channel.",
     parameters: Type.Object({ channelId: Type.String(), text: Type.String() }),
@@ -83,9 +89,22 @@ const tools = [
   }),
 ];
 
+const workerTools = [
+  ...tools.filter((tool) => ["message", "file"].includes(tool.name)),
+  ...["queue_list", "skip_audio", "stop_audio"].map((name) => defineTool({
+    name, label: name, description: "Manage the current guild's music: " + name,
+    parameters: Type.Object({}),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, name, params)); },
+  })),
+  defineTool({ name: "volume", label: "Volume", description: "Set music volume from 0 to 100.", parameters: Type.Object({ percent: Type.Number() }),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "volume", params)); }, }),
+  defineTool({ name: "run_mod", label: "Run mod", description: "Run an enabled slash-command mod. Music uses play with options {query: artist song}.", parameters: Type.Object({ name: Type.String(), options: Type.Record(Type.String(), Type.Union([Type.String(), Type.Number(), Type.Boolean()])) }),
+    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "run_mod", params)); }, }),
+];
+
 export default function (pi: ExtensionAPI) {
   if (process.env.WALLIS_ROLE === "realtime") for (const tool of tools) pi.registerTool(tool);
-
+  if (process.env.WALLIS_ROLE === "worker") for (const tool of workerTools) pi.registerTool(tool);
   pi.on("input", (event, ctx) => {
     if (event.images?.length && !ctx.model?.input.includes("image")) {
       return { action: "transform", images: [], text: event.text + "\n[media unavailable: the selected model does not support image inputs. Tell the user to select a vision-capable realtime model; do not claim no attachment was sent.]" };

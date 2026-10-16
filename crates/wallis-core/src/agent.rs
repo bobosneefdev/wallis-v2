@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 /// What a confined worker may touch: folders it can read (runtimes), folders it can write, and its `PATH`.
 pub struct Access { pub read: Vec<PathBuf>, pub write: Vec<PathBuf>, pub path: Vec<PathBuf> }
 
-/// Keeps the process alive and kills it on drop: a plain child, or a job object around a sandboxed one.
-enum Handle { Child(Child), #[cfg(windows)] Sandboxed(#[allow(dead_code)] crate::sandbox::Sandboxed) }
+/// Keeps the process alive and kills it on drop: a plain child, or a confined Linux process group.
+struct Handle { child: Child, confined: bool }
 
 /// How often a running turn looks for steering messages.
 const POLL: Duration = Duration::from_millis(100);
@@ -21,37 +21,33 @@ pub struct Agent { handle: Handle, stdin: Box<dyn Write + Send>, lines: Receiver
 
 impl Agent {
     /// Starts Pi for `role`. `dir` is the role's own Pi config dir (auth, settings, MCP config) and also holds the extension file.
-    /// With `confine`, Pi runs inside the Windows sandbox and can only reach those folders.
+    /// With `confine`, Pi runs as the worker uid inside a private Linux mount/process namespace.
     pub fn spawn(program: &str, role: Role, config: &RoleConfig, dir: &Path, system_prompt: &str, cwd: &Path, confine: Option<&Access>) -> Result<Self, String> {
         config.validate()?;
-        std::fs::create_dir_all(dir).map_err(|error| format!("Unable to create {}: {error}", dir.display()))?;
+        if confine.is_none() { std::fs::create_dir_all(dir).map_err(|error| format!("Unable to create {}: {error}", dir.display()))?;
         let extension = dir.join("wallis.ts");
         std::fs::write(&extension, pi::EXTENSION).map_err(|error| format!("Unable to write the Pi extension: {error}"))?;
-        let args = pi::launch_args(role, config, &extension.to_string_lossy(), system_prompt);
-        let (handle, stdin, stdout): (Handle, Box<dyn Write + Send>, Box<dyn Read + Send>) = match confine {
-            #[cfg(windows)]
-            Some(access) => {
-                let mut env: Vec<(String, String)> = pi::role_env(role, config).into_iter().map(|(key, value)| (key.to_string(), value)).collect();
-                let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-                let path = access.path.iter().map(|p| p.to_string_lossy().into_owned()).chain([format!(r"{system}\System32")]).collect::<Vec<_>>().join(";");
-                let home = cwd.to_string_lossy().into_owned();
-                env.extend([("PI_CODING_AGENT_DIR", dir.to_string_lossy().into_owned()), ("PATH", path), ("SystemRoot", system), ("TEMP", home.clone()), ("TMP", home.clone()), ("HOME", home.clone()), ("USERPROFILE", home)].map(|(key, value)| (key.to_string(), value)));
-                let sandboxed = crate::sandbox::spawn(Path::new(program), &args, cwd, &env, access)?;
-                let (stdin, stdout) = (sandboxed.stdin.try_clone().map_err(|error| error.to_string())?, sandboxed.stdout.try_clone().map_err(|error| error.to_string())?);
-                (Handle::Sandboxed(sandboxed), Box::new(stdin), Box::new(stdout))
+        }
+        let extension = dir.join("wallis.ts");
+        let mut args = pi::launch_args(role, config, &extension.to_string_lossy(), system_prompt);
+        if role == Role::Worker {
+            for name in ["effect", "wallis-mods", "music", "browser"] {
+                args.extend(["--skill".into(), format!("/opt/wallis/tools/skills/{name}/SKILL.md")]);
             }
-            #[cfg(not(windows))]
-            Some(_) => return Err("The worker sandbox is only available on Windows.".into()),
-            None => {
-                let mut command = Command::new(program);
-                command.args(&args).envs(pi::role_env(role, config)).env("PI_CODING_AGENT_DIR", dir).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-                #[cfg(windows)]
-                { use std::os::windows::process::CommandExt; command.creation_flags(0x0800_0000); }
-                let mut child = command.spawn().map_err(|error| format!("Unable to start Pi ({program}): {error}"))?;
-                let (stdout, stdin) = (child.stdout.take().ok_or("Pi has no stdout")?, child.stdin.take().ok_or("Pi has no stdin")?);
-                (Handle::Child(child), Box::new(stdin), Box::new(stdout))
-            }
+        }
+        let mut env: Vec<(String, String)> = pi::role_env(role, config).into_iter().map(|(k,v)| (k.into(),v)).collect();
+        env.push(("PI_CODING_AGENT_DIR".into(), dir.to_string_lossy().into()));
+        let mut command = match confine {
+            Some(access) => crate::sandbox::command(Path::new(program), &args, cwd, &env, access, false)?,
+            None => { let mut c = Command::new(program); c.args(&args).envs(env).current_dir(cwd); c },
         };
+        #[cfg(target_os = "linux")]
+        { use std::os::unix::process::CommandExt; command.process_group(0); }
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        let mut child = command.spawn().map_err(|error| format!("Unable to start Pi ({program}): {error}"))?;
+        let stdin: Box<dyn Write + Send> = Box::new(child.stdin.take().ok_or("Pi has no stdin")?);
+        let stdout: Box<dyn Read + Send> = Box::new(child.stdout.take().ok_or("Pi has no stdout")?);
+        let handle = Handle { child, confined: confine.is_some() };
         let mut stdout = stdout;
         let (sender, lines) = channel();
         std::thread::spawn(move || {
@@ -87,7 +83,12 @@ impl Agent {
         let id = format!("wallis-{}", self.next_id);
         self.send(&json!({ "id": id, "type": "prompt", "message": message, "images": images }))?;
         let (mut reply, mut last_event) = (String::new(), Instant::now());
+        let started = Instant::now();
         loop {
+            if self.handle.confined {
+                crate::mods::check_budget(Path::new("/var/lib/wallis"))?;
+                if started.elapsed() > Duration::from_secs(300) { return Err("Worker timed out.".into()); }
+            }
             for text in steer() { self.send(&json!({ "type": "steer", "message": text }))?; }
             let line = match self.lines.recv_timeout(POLL.min(timeout)) {
                 Ok(line) => { last_event = Instant::now(); line }
@@ -114,7 +115,7 @@ impl Agent {
 }
 
 impl Drop for Agent {
-    fn drop(&mut self) { if let Handle::Child(child) = &mut self.handle { let _ = child.kill(); let _ = child.wait(); } }
+    fn drop(&mut self) { crate::sandbox::kill(&mut self.handle.child, self.handle.confined); }
 }
 
 #[cfg(all(test, unix))]

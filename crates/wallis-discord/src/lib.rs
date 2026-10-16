@@ -1,12 +1,14 @@
 //! Discord transport for Wallis on Twilight: gateway, slash commands, text events, and voice receive/playback.
 //! It knows nothing about agents; it turns Discord activity into `Incoming` and exposes `Out` for replies.
 pub mod bot;
+mod music;
 use songbird::driver::DecodeMode;
 use songbird::events::{CoreEvent, Event, EventContext, EventHandler as VoiceHandler};
 use songbird::input::{core::io::{MediaSource, ReadOnlySource}, AudioStream, AudioStreamError, Compose, Input, RawAdapter};
 use songbird::shards::TwilightMap;
 use songbird::{Config as VoiceConfig, Songbird};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use twilight_cache_inmemory::{DefaultInMemoryCache, ResourceType};
 use twilight_gateway::{Config, Event as Gateway, EventTypeFlags, Intents, Shard, ShardId, StreamExt as _};
@@ -30,6 +32,8 @@ pub type ProfileSource = Arc<dyn Fn() -> Option<serde_json::Value> + std::marker
 #[derive(Clone)]
 pub struct Settings {
     pub token: String,
+    pub data_dir: PathBuf,
+    pub write_channels: Vec<String>,
     pub allowed_users: Vec<String>,
     pub read_channels: Vec<String>,
     /// Shown by `/profile`.
@@ -39,6 +43,7 @@ pub struct Settings {
 #[derive(Debug)]
 pub enum Incoming {
     Ready { bot_id: u64 },
+    Mod { guild: u64, channel: u64, user: u64, name: String, options: serde_json::Value, token: String },
     Text { guild: u64, channel: u64, message: u64, user: u64, speaker: String, said: String, direct: bool, media: Vec<String>, reply: Option<u64> },
     MediaUpdate { channel: u64, message: u64, user: u64, media: Vec<String> },
     MediaDelete { channel: u64, messages: Vec<u64> },
@@ -50,7 +55,7 @@ fn allowed(list: &[String], user: u64) -> bool { list.iter().any(|id| id == "*" 
 
 /// Reply side, cheap to clone and usable from any thread.
 #[derive(Clone)]
-pub struct Out { http: Arc<Client>, songbird: Arc<Songbird>, runtime: tokio::runtime::Handle, cache: Arc<DefaultInMemoryCache>, settings: Settings, send: Send }
+pub struct Out { http: Arc<Client>, songbird: Arc<Songbird>, runtime: tokio::runtime::Handle, cache: Arc<DefaultInMemoryCache>, settings: Settings, send: Send, music: Arc<music::Player>, application: Id<ApplicationMarker> }
 
 // Songbird opens the request when this track starts, so queued speech cannot block interruption.
 struct Pocket { text: String, rate: u32 }
@@ -100,6 +105,23 @@ impl Out {
         self.runtime.block_on(async { request.await }).map(|_| ()).map_err(|error| error.to_string())
     }
 
+    pub fn queue(&self, guild: u64, user: u64, path: PathBuf, title: String) -> Result<(), String> {
+        if self.voice_channel(guild).is_none() { self.join(guild, user, None)?; }
+        self.runtime.block_on(self.music.queue(guild, path, title))
+    }
+    pub fn queue_list(&self, guild: u64) -> String { self.runtime.block_on(self.music.list(guild)) }
+    pub fn skip_audio(&self, guild: u64) -> Result<(), String> { self.runtime.block_on(self.music.skip(guild)) }
+    pub fn stop_audio(&self, guild: u64) -> Result<(), String> { self.runtime.block_on(self.music.stop(guild)) }
+    pub fn volume(&self, guild: u64, percent: u32) -> Result<(), String> { self.runtime.block_on(self.music.volume(guild, percent)) }
+    pub fn reply_mod(&self, token: &str, text: &str) -> Result<(), String> {
+        let client = self.http.interaction(self.application);
+        self.runtime.block_on(async { client.update_response(token).content(Some(&clip(text,1900))).allowed_mentions(Some(&AllowedMentions::default())).await }).map(|_| ()).map_err(|e| e.to_string())
+    }
+    pub fn set_commands(&self) -> Result<(), String> {
+        let commands = commands(&self.settings.data_dir)?;
+        self.runtime.block_on(async { self.http.interaction(self.application).set_global_commands(&commands).await }).map(|_| ()).map_err(|e| e.to_string())
+    }
+
     /// Queues a live Pocket PCM stream. Songbird resamples to Discord's 48 kHz stereo.
     pub fn speak(&self, guild: u64, text: &str, length_scale: f32) -> Result<(), String> {
         if !length_scale.is_finite() || !(0.5..=2.0).contains(&length_scale) { return Err("Invalid speaking speed.".into()); }
@@ -107,7 +129,11 @@ impl Out {
         if text.trim().is_empty() || text.chars().count() > 16_000 { return Err("Speech must contain 1–16000 characters.".into()); }
         // ponytail: speed changes pitch; add time stretching when pitch-preserving speed is required.
         let input = Input::Lazy(Box::new(Pocket { text: text.into(), rate: (24_000.0 / length_scale).round() as u32 }));
-        self.runtime.block_on(async { call.lock().await.enqueue_with_preload(input.into(), None) });
+        self.runtime.block_on(async {
+            let end = self.music.speaking(guild).await;
+            let track = call.lock().await.enqueue_with_preload(input.into(), None);
+            let _ = track.add_event(Event::Track(songbird::events::TrackEvent::End), end);
+        });
         Ok(())
     }
 
@@ -120,22 +146,25 @@ impl Out {
             None => Id::new_checked(user).and_then(|user| self.cache.voice_state(user, guild).map(|state| state.channel_id())).ok_or("They are not in a voice channel. Ask them to join one, or pass `channelId`.")?,
         };
         self.runtime.block_on(async {
-            if let Some(call) = self.songbird.get(guild) {
-                if call.lock().await.current_channel().is_some_and(|current| current.0.get() == channel.get()) { return Ok(channel.get()) }
+            let call = self.songbird.get_or_insert(guild);
+            {
+                let mut call = call.lock().await;
+                if call.current_channel().is_some_and(|current| current.0.get() == channel.get()) { return Ok(channel.get()) }
+                let receive = Arc::new(Receive { guild: guild.get(), channel: channel.get(), settings: self.settings.clone(), send: self.send.clone(), ssrc: Mutex::default(), segmenter: Mutex::default(), cache: self.cache.clone() });
+                // Speaking announcements arrive during the handshake; listen before joining or their SSRCs are lost.
+                // Moving between channels keeps the call, so replace its old listeners.
+                call.remove_all_global_events();
+                call.add_global_event(CoreEvent::SpeakingStateUpdate.into(), SharedReceive(receive.clone()));
+                call.add_global_event(CoreEvent::VoiceTick.into(), SharedReceive(receive));
             }
-            let call = self.songbird.join(guild, channel).await.map_err(|error| format!("Could not join that channel: {error}"))?;
-            let receive = Arc::new(Receive { guild: guild.get(), channel: channel.get(), settings: self.settings.clone(), send: self.send.clone(), ssrc: Mutex::default(), segmenter: Mutex::default(), cache: self.cache.clone() });
-            let mut call = call.lock().await;
-            // Moving between channels keeps the call, so drop the old listeners rather than hearing everyone twice.
-            call.remove_all_global_events();
-            call.add_global_event(CoreEvent::SpeakingStateUpdate.into(), SharedReceive(receive.clone()));
-            call.add_global_event(CoreEvent::VoiceTick.into(), SharedReceive(receive));
+            self.songbird.join(guild, channel).await.map_err(|error| format!("Could not join that channel: {error}"))?;
             Ok(channel.get())
         })
     }
 
     /// Leaves the call once whatever is queued (a goodbye, usually) has been spoken, for at most 20 seconds.
     pub fn leave(&self, guild: u64) -> Result<(), String> {
+        self.stop_audio(guild)?;
         let guild = Id::<GuildMarker>::new_checked(guild).ok_or("Bad guild id.")?;
         let call = self.songbird.get(guild).ok_or("You are not in a call.")?;
         self.runtime.block_on(async {
@@ -153,8 +182,9 @@ impl Out {
         self.runtime.block_on(async { call.lock().await.current_channel().map(|channel| channel.0.get()) })
     }
 
-    /// Drops everything queued (used when the user interrupts).
+    /// Stops current and queued speech when Wallis chooses to interrupt himself.
     pub fn stop_speaking(&self, guild: u64) {
+        self.runtime.block_on(self.music.reset_speech(guild));
         if let Some(call) = self.songbird.get(Id::<GuildMarker>::new(guild)) { self.runtime.block_on(async { call.lock().await.queue().stop() }); }
     }
 }
@@ -284,8 +314,33 @@ impl Bot {
         if data.name == "profile" {
             let response = match (self.settings.profile)() { Some(profile) => respond_embed(profile_embed(&profile)), None => respond("Wallis has no profile yet.", true) };
             let _ = client.create_response(interaction.id, &interaction.token, &response).await;
+        } else if let Some(guild) = interaction.guild_id {
+            let channel = interaction.channel.as_ref().map(|c| c.id.get()).unwrap_or(0);
+            if !self.settings.write_channels.contains(&channel.to_string()) { let _ = reply("This channel is not an allowed output channel.", true).await; return; }
+            let deferred = InteractionResponse { kind: InteractionResponseType::DeferredChannelMessageWithSource, data: None };
+            if client.create_response(interaction.id, &interaction.token, &deferred).await.is_err() { return; }
+            let mut options = serde_json::Map::new();
+            for option in &data.options {
+                use twilight_model::application::interaction::application_command::CommandOptionValue;
+                let value = match &option.value { CommandOptionValue::String(s) => serde_json::json!(s), CommandOptionValue::Integer(n) => serde_json::json!(n), CommandOptionValue::Boolean(b) => serde_json::json!(b), _ => continue };
+                options.insert(option.name.clone(), value);
+            }
+            (self.send)(Incoming::Mod { guild: guild.get(), channel, user: user.get(), name: data.name.clone(), options: options.into(), token: interaction.token.clone() });
         }
     }
+}
+
+fn commands(data: &std::path::Path) -> Result<Vec<twilight_model::application::command::Command>, String> {
+    use twilight_model::application::command::{Command, CommandType};
+    let mut commands: Vec<Command> = vec![CommandBuilder::new("profile", "Show who Wallis is", CommandType::ChatInput).build()];
+    for m in wallis_core::mods::scan(data)?.into_iter().filter(|m| m.enabled) {
+        // Serde uses the exact Discord command schema and avoids a separate option-builder for each scalar type.
+        let options: Vec<_> = m.options.iter().map(|o| serde_json::json!({"name":o.name,"description":o.description,"type":match o.kind.as_str() {"string"=>3,"integer"=>4,_=>5},"required":o.required})).collect();
+        let mut command = CommandBuilder::new(m.name,m.description,CommandType::ChatInput).build();
+        command.options = serde_json::from_value(serde_json::json!(options)).map_err(|e| e.to_string())?;
+        commands.push(command);
+    }
+    Ok(commands)
 }
 
 /// Connects and runs until the gateway closes. `on_event` is called from Discord's async tasks and must not block.
@@ -297,11 +352,11 @@ pub async fn run(settings: Settings, ready: impl FnOnce(Out) + std::marker::Send
     let mut shard = Shard::with_config(ShardId::ONE, Config::new(settings.token.clone(), intents));
     let songbird = Arc::new(Songbird::twilight_from_config(Arc::new(TwilightMap::new(HashMap::from([(0, shard.sender())]))), me.id, VoiceConfig::default().decode_mode(DecodeMode::Decode(Default::default()))));
     let cache = Arc::new(DefaultInMemoryCache::builder().resource_types(ResourceType::USER_CURRENT | ResourceType::USER | ResourceType::VOICE_STATE | ResourceType::GUILD).build());
-    // Joining and leaving are conversation now; /profile is the only command.
-    let commands = [("profile", "Show who Wallis is")].map(|(name, description)| CommandBuilder::new(name, description, twilight_model::application::command::CommandType::ChatInput).build());
+    let commands = commands(&settings.data_dir)?;
     http.interaction(application).set_global_commands(&commands).await.map_err(|error| format!("Unable to register commands: {error}"))?;
     let send: Send = Arc::new(on_event);
-    ready(Out { http: http.clone(), songbird: songbird.clone(), runtime: tokio::runtime::Handle::current(), cache: cache.clone(), settings: settings.clone(), send: send.clone() });
+    let music = music::Player::new(songbird.clone());
+    ready(Out { music, application, http: http.clone(), songbird: songbird.clone(), runtime: tokio::runtime::Handle::current(), cache: cache.clone(), settings: settings.clone(), send: send.clone() });
     let bot = Arc::new(Bot { settings, send, http, cache: cache.clone(), application });
     while let Some(item) = shard.next_event(EventTypeFlags::all()).await {
         let event = match item {
@@ -330,6 +385,20 @@ mod profile_tests {
     use serde_json::json;
 
     #[test]
+    fn enabled_mods_become_valid_discord_commands() {
+        let root = std::env::temp_dir().join(format!("wallis-commands-{}",std::process::id()));
+        std::fs::create_dir_all(root.join("mods/play")).unwrap();
+        std::fs::write(root.join("mods/play/mod.json"),include_str!("../../../mods/play/mod.json")).unwrap();
+        std::fs::write(root.join("mods/play/index.ts"),"").unwrap();
+        let list = commands(&root).unwrap();
+        assert_eq!(list.len(),2);
+        assert_eq!(list[1].options[0].name,"query");
+        std::fs::write(root.join("mods.json"),r#"{"play":false}"#).unwrap();
+        assert_eq!(commands(&root).unwrap().len(),1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn the_profile_card_has_the_facts_in_order_and_skips_empty_ones() {
         let embed = profile_embed(&json!({ "name": "Wallis Reed", "tagline": "tea first", "bio": "Hi.", "age": "27", "pronouns": "", "location": "Leeds", "interests": ["tea", "trains"], "funFact": "x".repeat(5000) }));
         assert_eq!((embed.title.as_deref(), embed.description.as_deref()), (Some("Wallis Reed"), Some("*tea first*\n\nHi.")));
@@ -350,6 +419,38 @@ mod profile_tests {
 mod speech_tests {
     use super::*;
     use std::io::Write;
+
+    #[tokio::test]
+    async fn speaker_announcements_identify_later_utterances() {
+        let receive = Arc::new(Receive {
+            guild: 1, channel: 2,
+            settings: Settings { token: String::new(), data_dir: std::env::temp_dir(), allowed_users: vec!["42".into()], read_channels: vec![], write_channels: vec![], profile: Arc::new(|| None) },
+            send: Arc::new(|_| {}), ssrc: Mutex::default(), segmenter: Mutex::default(), cache: Arc::new(DefaultInMemoryCache::new()),
+        });
+        let speaking = serde_json::from_value(serde_json::json!({ "speaking": 1, "ssrc": 7, "user_id": "42" })).unwrap();
+        SharedReceive(receive.clone()).act(&EventContext::SpeakingStateUpdate(speaking)).await;
+        let mut segmenter = receive.segmenter.lock().unwrap();
+        for _ in 0..20 { assert!(segmenter.tick(&[(7, &[2000; 1920])], &[]).is_empty()); }
+        let utterances: Vec<_> = (0..8).flat_map(|_| segmenter.tick(&[], &[7])).collect();
+        assert_eq!(utterances.len(), 1);
+        let user = receive.ssrc.lock().unwrap()[&utterances[0].speaker];
+        assert_eq!(user, 42);
+        assert!(allowed(&receive.settings.allowed_users, user));
+        assert!(!allowed(&receive.settings.allowed_users, 43));
+    }
+
+    #[test]
+    fn songbird_decodes_the_download_formats() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for name in ["tone.webm", "tone.m4a"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+            let input: Input = songbird::input::File::new(path).into();
+            let mut input = runtime.block_on(input.make_playable_async(songbird::input::codecs::get_codec_registry(),songbird::input::codecs::get_probe())).unwrap();
+            let parsed = input.parsed_mut().unwrap();
+            let packet = parsed.format.next_packet().unwrap();
+            assert!(parsed.decoder.decode(&packet).unwrap().frames() > 0,"{name}");
+        }
+    }
 
     #[test]
     fn songbird_decodes_live_pocket_pcm_before_the_stream_ends() {
@@ -402,7 +503,7 @@ mod media_tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let received = events.clone();
         let bot = Bot {
-            settings: Settings { token: String::new(), allowed_users: vec!["3".into()], read_channels: vec!["2".into()], profile: Arc::new(|| None) },
+            settings: Settings { token: String::new(), data_dir: PathBuf::new(), write_channels: vec![], allowed_users: vec!["3".into()], read_channels: vec!["2".into()], profile: Arc::new(|| None) },
             send: Arc::new(move |event| received.lock().unwrap().push(event)),
             http: Arc::new(Client::new("test".into())), cache, application: Id::new(4),
         };

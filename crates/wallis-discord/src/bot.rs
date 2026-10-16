@@ -10,7 +10,7 @@ use wallis_core::agent::{Access, Agent};
 use wallis_core::host::{Discord, Host};
 use wallis_core::jobs::Jobs;
 use wallis_core::schedule::{self, Reminders};
-use wallis_core::participation::{interrupts, should_consider, sounds_like_wallis, Mode, Participation, State, Turn};
+use wallis_core::participation::{should_consider, sounds_like_wallis, Mode, Participation, State, Turn};
 use wallis_core::{pi_config, prompts};
 use wallis_core::role::{Role, RoleConfig};
 use wallis_core::stats::Stats;
@@ -25,6 +25,7 @@ pub struct BotConfig {
     pub realtime: RoleConfig,
     pub worker: RoleConfig,
     pub write_channels: Vec<String>,
+    pub voice_text_channel: String,
     pub python: String,
     pub voice_participation: Participation,
     pub text_participation: Participation,
@@ -39,21 +40,19 @@ pub struct BotConfig {
 struct Sink<'a> { out: &'a Out, guild: u64, user: u64, speed: f32 }
 
 impl Discord for Sink<'_> {
+    fn scope(&mut self, guild: u64, user: u64) { self.guild = guild; self.user = user; }
+    fn queue(&mut self, path: &std::path::Path, title: &str) -> Result<(), String> { self.out.queue(self.guild, self.user, path.to_path_buf(), title.into()) }
+    fn queue_list(&mut self) -> Result<String, String> { Ok(self.out.queue_list(self.guild)) }
+    fn skip_audio(&mut self) -> Result<(), String> { self.out.skip_audio(self.guild) }
+    fn stop_audio(&mut self) -> Result<(), String> { self.out.stop_audio(self.guild) }
+    fn volume(&mut self, percent: u32) -> Result<(), String> { self.out.volume(self.guild, percent) }
     fn say(&mut self, text: &str) -> Result<(), String> { self.out.speak(self.guild, text, self.speed) }
+    fn stop_speaking(&mut self) -> Result<(), String> { self.out.stop_speaking(self.guild); Ok(()) }
     fn message(&mut self, channel_id: &str, text: &str) -> Result<(), String> { self.out.message(channel_id.parse().map_err(|_| "Bad channel id")?, text) }
     fn file(&mut self, channel_id: &str, filename: &str, content: &str, text: &str) -> Result<(), String> { self.out.file(channel_id.parse().map_err(|_| "Bad channel id")?, filename, content, text) }
     fn join(&mut self, channel: Option<u64>) -> Result<u64, String> { self.out.join(self.guild, self.user, channel) }
     fn leave(&mut self) -> Result<(), String> { self.out.leave(self.guild) }
     fn voice_channel(&self) -> Option<u64> { self.out.voice_channel(self.guild) }
-}
-
-/// Worker output goes to the channel the job named; speaking is not available there.
-struct WorkerSink<'a>(&'a Out);
-
-impl Discord for WorkerSink<'_> {
-    fn say(&mut self, _: &str) -> Result<(), String> { Err("The worker cannot speak.".into()) }
-    fn message(&mut self, channel_id: &str, text: &str) -> Result<(), String> { self.0.message(channel_id.parse().map_err(|_| "Bad channel id")?, text) }
-    fn file(&mut self, channel_id: &str, filename: &str, content: &str, text: &str) -> Result<(), String> { self.0.file(channel_id.parse().map_err(|_| "Bad channel id")?, filename, content, text) }
 }
 
 /// What the realtime agent is told for one event, led by the local time (`at`, unix seconds) so he always has a clock.
@@ -66,7 +65,7 @@ pub fn turn_prompt(at: i64, mode: Mode, channel: u64, speaker: &str, said: &str)
 }
 
 /// The realtime Pi: memory (Mnemosyne over MCP) plus Wallis' own tools, no shell or files.
-pub fn spawn_realtime(config: &BotConfig) -> Result<Agent, String> { spawn_realtime_with(config, &prompts::realtime_prompt(&config.persona)) }
+pub fn spawn_realtime(config: &BotConfig) -> Result<Agent, String> { spawn_realtime_with(config, &format!("{}\nAllowed text output channel IDs: {}. Voice requests use output channel {}. Use those IDs for delegate, message and file.",prompts::realtime_prompt(&config.persona),config.write_channels.join(", "),config.voice_text_channel)) }
 
 /// The same Pi, but with a caller-supplied system prompt (used by the one-off profile generator).
 pub fn spawn_realtime_with(config: &BotConfig, system_prompt: &str) -> Result<Agent, String> {
@@ -114,13 +113,12 @@ impl Brain {
             let mut steers = Vec::new();
             for event in queue.rx.try_iter().collect::<Vec<_>>() {
                 match event {
-                    Incoming::Voice { guild, user, speaker, pcm, .. } => {
-                        // Talking over Wallis cuts him off (noise and backchannel don't), then what they said steers the turn already underway.
+                    Incoming::Voice { speaker, pcm, .. } => {
+                        // Keep listening without stopping playback; Wallis decides whether to change course.
                         match speech::transcribe(&pcm) {
                             Ok(said) if !said.is_empty() => {
-                                if interrupts(&said) { out.stop_speaking(guild); }
                                 let text = turn_prompt(schedule::now(), Mode::Voice, 0, &speaker, &said);
-                                stats.steered(); stats.audit("heard", &format!("{speaker}: {said}")); stats.audit("steer", &text); steers.push(text); let _ = user;
+                                stats.steered(); stats.audit("heard", &format!("{speaker}: {said}")); stats.audit("steer", &text); steers.push(text);
                             }
                             Ok(_) => {}
                             Err(error) => eprintln!("wallis: {error}"),
@@ -205,9 +203,22 @@ impl Brain {
             Incoming::MediaDelete { channel, messages } => self.media.forget(channel, &messages),
             Incoming::Voice { guild, channel, user, speaker, pcm } => {
                 let said = match speech::transcribe(&pcm) { Ok(text) if !text.is_empty() => text, Ok(_) => return, Err(error) => return eprintln!("wallis: {error}") };
-                if interrupts(&said) { self.out.stop_speaking(guild); }
                 self.stats.audit("heard", &format!("{speaker}: {said}"));
                 if self.consider(Mode::Voice, user, sounds_like_wallis(&said)) { self.respond(guild, user, turn_prompt(schedule::now(), Mode::Voice, channel, &speaker, &said), &[], queue); }
+            }
+            Incoming::Mod { guild, channel, user, name, options, token } => {
+                let (out, config) = (self.out.clone(), self.config.clone());
+                // Downloads must not block live conversation or other interactions.
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        let jobs = Jobs::open(&config.data_dir.join("jobs.sqlite").to_string_lossy())?;
+                        let reminders = Reminders::open(&config.data_dir.join("jobs.sqlite").to_string_lossy())?;
+                        let mut sink = Sink { out: &out, guild, user, speed: config.speech_speed };
+                        let mut host = Host { discord: &mut sink, jobs: &jobs, reminders: &reminders, guild, user, write_channels: vec![channel.to_string()], skipped: false, profile: config.data_dir.join("profile.json") };
+                        wallis_core::mods::run(&config.data_dir, &name, serde_json::json!({"options":options,"guild":guild.to_string(),"user":user.to_string(),"channel":channel.to_string()}), &mut |call| host.handle(call))
+                    })();
+                    if let Err(error) = out.reply_mod(&token, &result.unwrap_or_else(|e| format!("Failed: {e}"))) { eprintln!("wallis: {error}"); }
+                });
             }
             Incoming::Ready { .. } => {}
         }
@@ -256,17 +267,15 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
         let scratch = config.data_dir.join("worker-scratch");
         let dir = config.data_dir.join("pi").join("worker");
         while !worker_stop.load(Ordering::Relaxed) {
-            let mut sink = WorkerSink(&out);
+            let mut sink = Sink { out: &out, guild: 0, user: 0, speed: config.speech_speed };
             let mut start = || {
-                std::fs::create_dir_all(&scratch).map_err(|error| error.to_string())?;
-                std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-                pi_config::write_settings(&dir, &config.worker.packages, serde_json::json!({ "shellPath": config.shell }))?;
+
                 let shell_bin = config.shell.parent().map(PathBuf::from).unwrap_or_default();
-                let access = Access { read: config.sandbox_read.clone(), write: vec![scratch.clone(), dir.clone()], path: vec![shell_bin] };
+                let access = Access { read: config.sandbox_read.clone(), write: vec![scratch.clone(), dir.clone(), config.data_dir.join("mods"), config.data_dir.join("media")], path: vec![shell_bin] };
                 Agent::spawn(&config.worker_program, Role::Worker, &config.worker, &dir, &prompts::worker_prompt(), &scratch, Some(&access))
             };
-            match worker::run_next(&jobs, &mut sink, &mut start, Duration::from_secs(300)) {
-                Ok(Some(_)) => {}
+            match worker::run_next(&jobs, &mut sink, &mut start, Duration::from_secs(300), &config.data_dir) {
+                Ok(Some(_)) => { if let Err(error) = out.set_commands() { eprintln!("wallis: {error}"); } }
                 Ok(None) => std::thread::sleep(Duration::from_secs(1)),
                 Err(error) => { eprintln!("wallis: {error}"); std::thread::sleep(Duration::from_secs(5)); }
             }

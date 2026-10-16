@@ -1,0 +1,12 @@
+{
+  "name": "browse",
+  "description": "Ask Wallis to research something on the web",
+  "options": [
+    {
+      "name": "question",
+      "description": "What to look up",
+      "type": "string",
+      "required": true
+    }
+  ]
+}

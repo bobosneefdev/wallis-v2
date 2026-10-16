@@ -1,11 +1,12 @@
 <script lang="ts">
+  import Commands from "./Commands.svelte";
   import Discord from "./Discord.svelte";
   import Home from "./Home.svelte";
   import Inference from "./Inference.svelte";
   import Profile from "./Profile.svelte";
   import { invoke, type RuntimeStatus } from "./invoke";
 
-  const pages = [["home", "Home"], ["discord", "Discord"], ["profile", "Profile"], ["inference", "Inference"]] as const;
+  const pages = [["home", "Home"], ["discord", "Discord"], ["profile", "Profile"], ["inference", "Inference"], ["commands", "Commands"]] as const;
 
   let page = $state<(typeof pages)[number][0]>("home");
   let runtime = $state<RuntimeStatus>({ state: "stopped", message: "Wallis is stopped." });
@@ -34,6 +35,7 @@
     <div hidden={page !== "home"}><Home bind:runtime {hasProfile} {hasToken} /></div>
     {#if page === "discord"}<Discord refresh={loadFlags} />{/if}
     {#if page === "profile"}<Profile ready={modelsChosen} onChange={() => { void loadFlags().catch(() => {}); runtime = { state: "stopped", message: "Wallis is stopped." }; }} />{/if}
+    {#if page === "commands"}<Commands />{/if}
     {#if page === "inference"}<Inference />{/if}
   </main>
 </div>
