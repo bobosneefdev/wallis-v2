@@ -1,6 +1,6 @@
 [package]
 name = "wallis"
-version = "0.5.0"
+version = "0.5.1"
 description = "Wallis desktop application"
 authors = ["Wallis contributors"]
 edition = "2021"
