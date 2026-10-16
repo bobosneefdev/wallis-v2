@@ -13,6 +13,7 @@ pub const POCKET_PACKAGE: &str = "pocket-tts==3.3.0";
 pub const SHERPA_PACKAGE: &str = "sherpa-onnx==1.13.8";
 pub const TORCH_PACKAGE: &str = "torch==2.14.1+cpu";
 pub const MEMORY_PACKAGE: &str = "mnemosyne-memory[all]==3.15.1";
+pub const MEDIA_PACKAGE: &str = "av==19.0.1";
 pub const PYTHON_VERSION: &str = "3.12";
 
 pub fn sha256_hex(bytes: &[u8]) -> String { Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect() }
@@ -179,12 +180,12 @@ pub fn ensure_all(layout: &Layout, stt: &str, tts: &str, progress: &dyn Fn(&str)
         progress("Setting up Python for voice and memory…");
         run(&layout.uv(), &["venv", "--python", PYTHON_VERSION, &layout.venv().to_string_lossy()], "create the Python environment")?;
     }
-    let packages = format!("{POCKET_PACKAGE} {SHERPA_PACKAGE} {TORCH_PACKAGE} {MEMORY_PACKAGE}");
+    let packages = format!("{POCKET_PACKAGE} {SHERPA_PACKAGE} {TORCH_PACKAGE} {MEMORY_PACKAGE} {MEDIA_PACKAGE}");
     let marker = layout.venv().join("wallis-packages.txt");
     if std::fs::read_to_string(&marker).ok().as_deref() != Some(&packages) {
         progress("Installing CPU speech and memory packages…");
         run(&layout.uv(), &["pip", "install", "--python", &layout.python().to_string_lossy(), "--index-url", "https://download.pytorch.org/whl/cpu", TORCH_PACKAGE], "install CPU PyTorch")?;
-        run(&layout.uv(), &["pip", "install", "--python", &layout.python().to_string_lossy(), TORCH_PACKAGE, POCKET_PACKAGE, SHERPA_PACKAGE, MEMORY_PACKAGE], "install speech and memory packages")?;
+        run(&layout.uv(), &["pip", "install", "--python", &layout.python().to_string_lossy(), TORCH_PACKAGE, POCKET_PACKAGE, SHERPA_PACKAGE, MEMORY_PACKAGE, MEDIA_PACKAGE], "install speech and memory packages")?;
         std::fs::write(marker, packages).map_err(|error| error.to_string())?;
     }
     std::fs::write(layout.speech_script(), SPEECH_SERVER).map_err(|error| format!("Unable to write the speech server: {error}"))?;

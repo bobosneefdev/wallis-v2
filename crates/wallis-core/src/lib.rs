@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod codex_auth;
 pub mod host;
 pub mod jobs;
+pub mod media;
 pub mod participation;
 pub mod pi;
 pub mod pi_config;

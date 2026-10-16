@@ -51,6 +51,7 @@ cargo build -p wallis-bot --release
 
 The desktop requires Windows for DPAPI and WSL lifecycle checks. Linux desktop builds additionally require Tauri's GTK/WebKit development libraries. Run native Windows tests through the shared VM queue described in AGENTS.md.
 
+Using the provisioned Python environment, `python crates/wallis-core/py/media_check.py` checks real image/GIF/MP4 decoding, frame limits, and download security without a Discord account or network requests.
 Build the release image on an Ubuntu host with root privileges:
 
 ```sh
@@ -61,6 +62,11 @@ This produces `wallis-rootfs.tar.gz.*` parts and the image checksum after sandbo
 
 ## Sources and licenses
 
+Text chat accepts image uploads, Discord GIF embeds, and public HTTPS media links. Wallis receives actual image inputs; GIFs and videos become timestamped frames using PyAV (installed into the existing Python environment). The realtime model must support images. Unsupported models and failed downloads produce specific media failure notes rather than silently losing attachments.
+
+Replies select the referenced media. Phrases such as “the GIF above” select that user's latest media in the same channel. Up to 64 messages' media metadata stays in RAM for ten minutes and is removed on deletion; media bytes are not cached to disk. An upload within two minutes of a reply to that user in that channel counts as a follow-up, including in mentions-only mode. Existing user and channel access rules still apply.
+
+Each turn examines at most four media items and twelve frames (at most six per item), resized to 768 pixels on the longest edge. Downloads require public HTTPS on port 443, validate and pin DNS addresses on every redirect, and are capped at 20 MiB per item. Decoding rejects images over 16 megapixels, samples at most the first 30 seconds of video, and does not process audio. Media processing has a shared 20 second deadline; partial samples are labelled so Wallis does not claim to have watched the whole clip. Web pages require a media embed from Discord; this is not a general web browser.
 - [Pi](https://github.com/earendil-works/pi): MIT; agent runtime 1.2.0.
 - [Bun](https://github.com/oven-sh/bun): MIT; runtime 1.4.3.
 - [Effect](https://github.com/Effect-TS/effect): MIT; 4.0.5.

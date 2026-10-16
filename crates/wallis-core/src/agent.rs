@@ -74,9 +74,14 @@ impl Agent {
     /// Pi delivers it after the current tool calls, before its next model call, without aborting anything.
     /// ponytail: a steer sent in the instant Pi is already settling waits in Pi's queue for the next prompt instead of being lost.
     pub fn turn_steered(&mut self, message: &str, timeout: Duration, steer: &mut dyn FnMut() -> Vec<String>, on_host: &mut dyn FnMut(HostCall) -> String, on_delta: &mut dyn FnMut(&str)) -> Result<String, String> {
+        self.turn_with_images(message, &[], timeout, steer, on_host, on_delta)
+    }
+
+    /// Images use Pi's native ImageContent format; URLs in prompt text are not visual inputs.
+    pub fn turn_with_images(&mut self, message: &str, images: &[crate::media::Image], timeout: Duration, steer: &mut dyn FnMut() -> Vec<String>, on_host: &mut dyn FnMut(HostCall) -> String, on_delta: &mut dyn FnMut(&str)) -> Result<String, String> {
         self.next_id += 1;
         let id = format!("wallis-{}", self.next_id);
-        self.send(&json!({ "id": id, "type": "prompt", "message": message }))?;
+        self.send(&json!({ "id": id, "type": "prompt", "message": message, "images": images }))?;
         let (mut reply, mut last_event) = (String::new(), Instant::now());
         let started = Instant::now();
         loop {
@@ -120,6 +125,7 @@ mod tests {
     /// A stand-in for Pi: streams text, asks the host for `say`, waits for the answer, then settles.
     const FAKE_PI: &str = r#"#!/bin/sh
 read prompt
+printf '%s' "$prompt" > prompt.json
 echo '{"type":"response","id":"wallis-1","success":true}'
 echo '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Hi "}}'
 echo '{"type":"extension_ui_request","id":"u1","method":"input","title":"wallis-host:{\"tool\":\"say\",\"args\":{\"text\":\"hello\"}}"}'
@@ -139,7 +145,11 @@ sleep 5
         let config = RoleConfig { provider: "openai-codex".into(), model: "gpt-6-sol".into(), effort: "low".into(), ..RoleConfig::default() };
         let mut agent = Agent::spawn(script.to_str().unwrap(), Role::Realtime, &config, &dir.join("pi"), "system", &dir, None).unwrap();
         let (mut calls, mut streamed) = (vec![], String::new());
-        let reply = agent.turn("hello", Duration::from_secs(5), &mut |call| { calls.push((call.tool, call.args)); "spoken".into() }, &mut |delta| streamed.push_str(delta)).unwrap();
+        let images = vec![crate::media::Image { r#type: "image".into(), data: "aGVsbG8=".into(), mime_type: "image/png".into() }];
+        let reply = agent.turn_with_images("hello", &images, Duration::from_secs(5), &mut Vec::new, &mut |call| { calls.push((call.tool, call.args)); "spoken".into() }, &mut |delta| streamed.push_str(delta)).unwrap();
+        let prompt: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("prompt.json")).unwrap()).unwrap();
+        assert_eq!(prompt["images"], json!([{"type":"image","data":"aGVsbG8=","mimeType":"image/png"}]));
+        assert_eq!(prompt["message"], "hello");
         assert_eq!(reply, "Hi there");
         assert_eq!(streamed, reply);
         assert_eq!(calls, vec![("say".to_string(), json!({ "text": "hello" }))]);
