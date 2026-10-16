@@ -3,9 +3,10 @@ use crate::settings::{Roles, WallisConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use sha2::{Digest, Sha256};
 
 pub const SYNC_FILES: &[&str] = &["profile.json", "pi/realtime/auth.json", "pi/realtime/models.json", "pi/worker/auth.json", "pi/worker/models.json"];
 #[derive(Serialize, Deserialize)]
@@ -45,11 +46,72 @@ pub fn ensure(data: &Path, version: &str, progress: &dyn Fn(&str)) -> Result<(),
     }
     progress("Downloading the Wallis Linux environment…");
     let release: Value = ureq::get(format!("https://api.github.com/repos/bobosneefdev/wallis-v2/releases/tags/v{version}")).header("Accept","application/vnd.github+json").call().map_err(|e|format!("Unable to find the Linux runtime release: {e}"))?.body_mut().read_json().map_err(|e|e.to_string())?;
-    let asset = release["assets"].as_array().into_iter().flatten().find(|a|a["name"] == "wallis-rootfs.tar.gz").ok_or("Release has no Linux runtime.")?;
-    let hash = asset["digest"].as_str().and_then(|s|s.strip_prefix("sha256:")).filter(|s|s.len()==64).ok_or("Runtime checksum missing.")?;
-    let archive = data.join("downloads").join(format!("wallis-rootfs-{version}.tar.gz"));
-    crate::provision::download_verified(asset["browser_download_url"].as_str().ok_or("Missing runtime URL.")?,hash,&archive)?;
+    // One release asset cannot exceed 2 GiB, so the image arrives as ordered parts.
+    let assets = release["assets"].as_array().into_iter().flatten().collect::<Vec<&Value>>();
+    let names = assets.iter().filter_map(|asset| asset["name"].as_str()).collect::<Vec<&str>>();
+    let parts = image_parts(&names);
+    if parts.is_empty() { return Err("Release has no Linux runtime.".into()); }
+    let fetch = |name: &str, dest: &Path| -> Result<(), String> {
+        let asset = assets.iter().copied().find(|asset| asset["name"] == name).ok_or_else(|| format!("Release has no {name}."))?;
+        let hash = asset["digest"].as_str().and_then(|s| s.strip_prefix("sha256:")).filter(|s| s.len() == 64).ok_or("Runtime checksum missing.")?;
+        crate::provision::download_verified(asset["browser_download_url"].as_str().ok_or("Missing runtime URL.")?, hash, dest)
+    };
+    let downloads = data.join("downloads");
+    let archive = downloads.join(format!("wallis-rootfs-{version}.tar.gz"));
+    let checksums = downloads.join("wallis-rootfs.tar.gz.sha256");
+    fetch("wallis-rootfs.tar.gz.sha256", &checksums)?;
+    let expected = std::fs::read_to_string(&checksums).map_err(|error| error.to_string())?
+        .split_whitespace().next().filter(|hash| hash.len() == 64).ok_or("Runtime checksum missing.")?.to_string();
+    if file_sha256(&archive).ok().as_deref() != Some(expected.as_str()) {
+        for name in &parts { fetch(name, &downloads.join(name))?; }
+        assemble(&downloads, &parts, &archive, &expected)?;
+    }
     import_runtime(data, &archive, exists, progress)
+}
+
+/// Asset names holding the ordered image parts; the `.sha256` sidecar is not one.
+fn image_parts<'a>(names: &[&'a str]) -> Vec<&'a str> {
+    let mut parts: Vec<&str> = names.iter().copied().filter(|name|
+        name.strip_prefix("wallis-rootfs.tar.gz.").is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    ).collect();
+    parts.sort_unstable();
+    parts
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let (mut hasher, mut buffer) = (Sha256::new(), [0u8; 65536]);
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 { break; }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Joins the verified parts into `dest`, checks the whole image hash, then drops the parts.
+fn assemble(dir: &Path, parts: &[&str], dest: &Path, expected: &str) -> Result<(), String> {
+    let temporary = dest.with_extension("assembled");
+    let mut output = std::fs::File::create(&temporary).map_err(|error| error.to_string())?;
+    let (mut hasher, mut buffer) = (Sha256::new(), [0u8; 65536]);
+    for name in parts {
+        let mut part = std::fs::File::open(dir.join(name)).map_err(|error| format!("Missing runtime download {name}: {error}"))?;
+        loop {
+            let read = part.read(&mut buffer).map_err(|error| error.to_string())?;
+            if read == 0 { break; }
+            hasher.update(&buffer[..read]);
+            output.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
+        }
+    }
+    drop(output);
+    let actual: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    if actual != expected {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("Assembled runtime checksum mismatch: expected {expected}, got {actual}."));
+    }
+    std::fs::rename(&temporary, dest).map_err(|error| error.to_string())?;
+    for name in parts { let _ = std::fs::remove_file(dir.join(name)); }
+    Ok(())
 }
 
 fn import_runtime(data: &Path, archive: &Path, exists: bool, progress: &dyn Fn(&str)) -> Result<(), String> {
@@ -193,5 +255,26 @@ mod tests {
         let utf16: Vec<u8> = "Wallis\r\nOther".encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert_eq!(decode(&utf16),"Wallis\r\nOther");
         assert_eq!(decode(b"Wallis\n"),"Wallis\n");
+    }
+
+    #[test]
+    fn image_parts_order_and_assemble_are_verified() {
+        let names = ["Wallis_0.4.1_x64-setup.exe", "wallis-rootfs.tar.gz.sha256", "wallis-rootfs.tar.gz.001", "wallis-rootfs.tar.gz.000"];
+        assert_eq!(image_parts(&names), ["wallis-rootfs.tar.gz.000", "wallis-rootfs.tar.gz.001"]);
+        let dir = std::env::temp_dir().join(format!("wallis-parts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("wallis-rootfs.tar.gz.000"), b"hello ").unwrap();
+        std::fs::write(dir.join("wallis-rootfs.tar.gz.001"), b"world").unwrap();
+        let dest = dir.join("image.tar.gz");
+        let expected = crate::provision::sha256_hex(b"hello world");
+        assemble(&dir, &["wallis-rootfs.tar.gz.000", "wallis-rootfs.tar.gz.001"], &dest, &expected).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello world");
+        assert!(!dir.join("wallis-rootfs.tar.gz.000").exists());
+        // Tampered content never replaces an already verified image.
+        std::fs::write(dir.join("wallis-rootfs.tar.gz.000"), b"evil").unwrap();
+        let error = assemble(&dir, &["wallis-rootfs.tar.gz.000"], &dest, &expected).unwrap_err();
+        assert!(error.contains("checksum mismatch"), "{error}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello world");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

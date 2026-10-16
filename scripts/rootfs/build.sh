@@ -50,5 +50,6 @@ install -d -o 1000 -g 1000 -m 0755 "$root/var/lib/wallis"
 rm -rf "$root/opt/wallis/source"
 for ((i=${#mounted[@]}-1;i>=0;i--)); do umount -R "${mounted[i]}"; done
 mounted=()
-tar --numeric-owner -C "$root" -czf "$output/wallis-rootfs.tar.gz" .
-(cd "$output" && sha256sum wallis-rootfs.tar.gz > wallis-rootfs.tar.gz.sha256)
+# GitHub rejects one release asset over 2 GiB, so the image streams straight into ordered parts.
+tar --numeric-owner -C "$root" -czf - . | split -b 1900m -d -a 3 - "$output/wallis-rootfs.tar.gz."
+cat "$output"/wallis-rootfs.tar.gz.[0-9]* | sha256sum | awk '{print $1"  wallis-rootfs.tar.gz"}' > "$output/wallis-rootfs.tar.gz.sha256"

@@ -28,7 +28,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux-runtime
-          path: ${{ runner.temp }}/runtime/wallis-rootfs.tar.gz
+          path: ${{ runner.temp }}/runtime/wallis-rootfs.tar.gz.*
           compression-level: 0
           retention-days: 1
 
@@ -44,6 +44,11 @@ jobs:
         with:
           name: linux-runtime
           path: runtime
+      - name: Reassemble the runtime image
+        shell: bash
+        run: |
+          cat runtime/wallis-rootfs.tar.gz.[0-9]* > runtime/wallis-rootfs.tar.gz
+          (cd runtime && sha256sum -c wallis-rootfs.tar.gz.sha256)
       - name: Import and exercise the WSL2 runtime
         shell: pwsh
         env:
