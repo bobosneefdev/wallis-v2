@@ -38,9 +38,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux-runtime
-          path: |
-            ${{ runner.temp }}/runtime/wallis-rootfs.tar.gz
-            ${{ runner.temp }}/runtime/wallis-rootfs.tar.gz.sha256
+          path: ${{ runner.temp }}/runtime/wallis-rootfs.tar.gz.*
 
   installer:
     needs: [version, runtime]
