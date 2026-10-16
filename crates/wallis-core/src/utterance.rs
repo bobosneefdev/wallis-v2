@@ -1,10 +1,8 @@
-//! Groups Discord's 20 ms voice ticks into utterances per speaker. Same thresholds as the Node bot.
+//! Groups Discord's 20 ms voice ticks into utterances per speaker. The silence window is live-tunable.
 use std::collections::HashMap;
 
 /// One tick is 20 ms of 48 kHz stereo (960 frames * 2 channels).
 pub const TICK_MS: u64 = 20;
-/// Silence that ends an utterance.
-const SILENCE_MS: u64 = 150;
 /// Peak amplitude below this is room noise, not speech.
 const MIN_AMPLITUDE: i16 = 500;
 /// Shorter than this is a click or cough.
@@ -33,7 +31,7 @@ impl Segmenter {
         for speaker in silent.iter().copied().chain(self.0.keys().copied().filter(|id| !speaking.iter().any(|(s, _)| s == id)).collect::<Vec<_>>()) {
             let Some(capture) = self.0.get_mut(&speaker) else { continue };
             capture.silent_ms += TICK_MS;
-            if capture.silent_ms >= SILENCE_MS {
+            if capture.silent_ms >= crate::tuning::current().silence_ms as u64 {
                 let capture = self.0.remove(&speaker).expect("capture exists");
                 let speech_ms = capture.pcm.len() as u64 / 2 * 1000 / 48_000;
                 if capture.peak >= MIN_AMPLITUDE && speech_ms >= MIN_SPEECH_MS { done.push(Utterance { speaker, pcm: capture.pcm }); }

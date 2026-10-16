@@ -68,6 +68,7 @@ impl Player {
         if let Some((track,_)) = &state.current { let _ = track.set_volume(level(state)); }
         SpeechEnd { player: self.clone(), guild, generation: state.generation }
     }
+    pub async fn pending_speech(&self, guild: u64) -> usize { self.guilds.lock().await.get(&guild).map_or(0, |s| s.speech) }
     pub async fn reset_speech(&self, guild: u64) {
         let mut guilds = self.guilds.lock().await;
         if let Some(state) = guilds.get_mut(&guild) {

@@ -58,7 +58,7 @@ fn allowed(list: &[String], user: u64) -> bool { list.iter().any(|id| id == "*" 
 pub struct Out { http: Arc<Client>, songbird: Arc<Songbird>, runtime: tokio::runtime::Handle, cache: Arc<DefaultInMemoryCache>, settings: Settings, send: Send, music: Arc<music::Player>, application: Id<ApplicationMarker> }
 
 // Songbird opens the request when this track starts, so queued speech cannot block interruption.
-struct Pocket { text: String, rate: u32 }
+struct Pocket { text: String }
 
 #[async_trait::async_trait]
 impl Compose for Pocket {
@@ -67,7 +67,9 @@ impl Compose for Pocket {
             eprintln!("wallis: {error}");
             AudioStreamError::Fail(error.into())
         })?;
-        Ok(AudioStream { input: Box::new(RawAdapter::new(ReadOnlySource::new(stream), self.rate, 1)) })
+        // ponytail: speed changes pitch; add time stretching when pitch-preserving speed is required.
+        let rate = (24_000.0 / wallis_core::tuning::current().speed).round() as u32;
+        Ok(AudioStream { input: Box::new(RawAdapter::new(ReadOnlySource::new(stream), rate, 1)) })
     }
     async fn create_async(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> { Err(AudioStreamError::Unsupported) }
     fn should_create_async(&self) -> bool { false }
@@ -90,6 +92,13 @@ impl Out {
                 vec![]
             }).await.unwrap_or_default()
         })
+    }
+
+    /// Last `limit` messages of a read channel, oldest first. Bots and non-allow-listed authors are labelled, not hidden, so he sees the whole room.
+    pub fn history(&self, channel: u64, limit: u8) -> Result<String, String> {
+        if !self.settings.read_channels.contains(&channel.to_string()) { return Err(format!("Channel {channel} is not in the allowed read channels.")); }
+        let messages = self.runtime.block_on(async { let response = self.http.channel_messages(Id::new(channel)).limit(u16::from(limit)).await.map_err(|e| e.to_string())?; response.models().await.map_err(|e| e.to_string()) })?;
+        Ok(messages.iter().rev().map(|m| format!("[{}] {}{}: {}{}", m.id, m.author.name, if m.author.bot { " (bot)" } else { "" }, clip(&m.content, 500), if m.attachments.is_empty() { String::new() } else { format!(" [{} attachment(s)]", m.attachments.len()) })).collect::<Vec<_>>().join("\n"))
     }
 
     pub fn message(&self, channel: u64, text: &str) -> Result<(), String> {
@@ -123,12 +132,11 @@ impl Out {
     }
 
     /// Queues a live Pocket PCM stream. Songbird resamples to Discord's 48 kHz stereo.
-    pub fn speak(&self, guild: u64, text: &str, length_scale: f32) -> Result<(), String> {
-        if !length_scale.is_finite() || !(0.5..=2.0).contains(&length_scale) { return Err("Invalid speaking speed.".into()); }
+    /// Voice, speed and sampling are read when each sentence starts playing, so a tuning change reaches speech already queued.
+    pub fn speak(&self, guild: u64, text: &str) -> Result<(), String> {
         let call = self.songbird.get(Id::<GuildMarker>::new(guild)).ok_or("Wallis is not in a voice channel.")?;
         if text.trim().is_empty() || text.chars().count() > 16_000 { return Err("Speech must contain 1–16000 characters.".into()); }
-        // ponytail: speed changes pitch; add time stretching when pitch-preserving speed is required.
-        let input = Input::Lazy(Box::new(Pocket { text: text.into(), rate: (24_000.0 / length_scale).round() as u32 }));
+        let input = Input::Lazy(Box::new(Pocket { text: text.into() }));
         self.runtime.block_on(async {
             let end = self.music.speaking(guild).await;
             let track = call.lock().await.enqueue_with_preload(input.into(), None);
@@ -150,7 +158,7 @@ impl Out {
             {
                 let mut call = call.lock().await;
                 if call.current_channel().is_some_and(|current| current.0.get() == channel.get()) { return Ok(channel.get()) }
-                let receive = Arc::new(Receive { guild: guild.get(), channel: channel.get(), settings: self.settings.clone(), send: self.send.clone(), ssrc: Mutex::default(), segmenter: Mutex::default(), cache: self.cache.clone() });
+                let receive = Arc::new(Receive { guild: guild.get(), channel: channel.get(), settings: self.settings.clone(), send: self.send.clone(), ssrc: Mutex::default(), segmenter: Mutex::default(), cache: self.cache.clone(), songbird: self.songbird.clone(), music: self.music.clone(), talking: Mutex::default() });
                 // Speaking announcements arrive during the handshake; listen before joining or their SSRCs are lost.
                 // Moving between channels keeps the call, so replace its old listeners.
                 call.remove_all_global_events();
@@ -177,6 +185,9 @@ impl Out {
     }
 
     /// The voice channel Wallis is in, if any.
+    /// Sentences queued or being spoken right now.
+    pub fn pending_speech(&self, guild: u64) -> usize { self.runtime.block_on(self.music.pending_speech(guild)) }
+
     pub fn voice_channel(&self, guild: u64) -> Option<u64> {
         let call = self.songbird.get(Id::<GuildMarker>::new_checked(guild)?)?;
         self.runtime.block_on(async { call.lock().await.current_channel().map(|channel| channel.0.get()) })
@@ -184,14 +195,19 @@ impl Out {
 
     /// Stops current and queued speech when Wallis chooses to interrupt himself.
     pub fn stop_speaking(&self, guild: u64) {
-        self.runtime.block_on(self.music.reset_speech(guild));
-        if let Some(call) = self.songbird.get(Id::<GuildMarker>::new(guild)) { self.runtime.block_on(async { call.lock().await.queue().stop() }); }
+        self.runtime.block_on(cut_off_speech(&self.songbird, &self.music, guild));
     }
 }
 
 type Send = Arc<dyn Fn(Incoming) + std::marker::Send + Sync>;
 
-struct Receive { guild: u64, channel: u64, settings: Settings, send: Send, ssrc: Mutex<HashMap<u32, u64>>, segmenter: Mutex<Segmenter>, cache: Arc<DefaultInMemoryCache> }
+struct Receive { guild: u64, channel: u64, settings: Settings, send: Send, ssrc: Mutex<HashMap<u32, u64>>, segmenter: Mutex<Segmenter>, cache: Arc<DefaultInMemoryCache>, songbird: Arc<Songbird>, music: Arc<music::Player>, talking: Mutex<HashMap<u32, u64>> }
+
+/// Cuts off current and queued speech (not music), whether Wallis chose to or someone talked over him.
+async fn cut_off_speech(songbird: &Songbird, music: &music::Player, guild: u64) {
+    music.reset_speech(guild).await;
+    if let Some(call) = songbird.get(Id::<GuildMarker>::new(guild)) { call.lock().await.queue().stop(); }
+}
 
 struct SharedReceive(Arc<Receive>);
 
@@ -206,6 +222,18 @@ impl VoiceHandler for SharedReceive {
             EventContext::VoiceTick(tick) => {
                 let heard: Vec<(u32, &[i16])> = tick.speaking.iter().filter_map(|(ssrc, data)| data.decoded_voice.as_deref().map(|pcm| (*ssrc, pcm))).collect();
                 let silent: Vec<u32> = tick.silent.iter().copied().collect();
+                // Talking over him long enough (`bargeInMs`, 0 = never) cuts him off; he is told through the transcript that he was interrupted.
+                let barge_in = wallis_core::tuning::current().barge_in_ms as u64;
+                let talked_over = {
+                    let mut talking = this.talking.lock().expect("talking map poisoned");
+                    talking.retain(|ssrc, _| heard.iter().any(|(s, _)| s == ssrc));
+                    let loud = |pcm: &[i16]| pcm.iter().any(|s| s.saturating_abs() >= 500);
+                    heard.iter().any(|(ssrc, pcm)| { let ms = talking.entry(*ssrc).or_default(); *ms = if loud(pcm) { *ms + 20 } else { 0 }; barge_in > 0 && *ms >= barge_in })
+                };
+                if talked_over && this.music.pending_speech(this.guild).await > 0 {
+                    this.talking.lock().expect("talking map poisoned").clear();
+                    cut_off_speech(&this.songbird, &this.music, this.guild).await;
+                }
                 let finished = this.segmenter.lock().expect("segmenter poisoned").tick(&heard, &silent);
                 for utterance in finished {
                     let Some(user) = this.ssrc.lock().expect("ssrc map poisoned").get(&utterance.speaker).copied() else { continue };
@@ -422,10 +450,12 @@ mod speech_tests {
 
     #[tokio::test]
     async fn speaker_announcements_identify_later_utterances() {
+        let songbird = Arc::new(Songbird::twilight(Arc::new(TwilightMap::new(HashMap::new())), Id::new(1)));
         let receive = Arc::new(Receive {
             guild: 1, channel: 2,
             settings: Settings { token: String::new(), data_dir: std::env::temp_dir(), allowed_users: vec!["42".into()], read_channels: vec![], write_channels: vec![], profile: Arc::new(|| None) },
             send: Arc::new(|_| {}), ssrc: Mutex::default(), segmenter: Mutex::default(), cache: Arc::new(DefaultInMemoryCache::new()),
+            songbird: songbird.clone(), music: music::Player::new(songbird), talking: Mutex::default(),
         });
         let speaking = serde_json::from_value(serde_json::json!({ "speaking": 1, "ssrc": 7, "user_id": "42" })).unwrap();
         SharedReceive(receive.clone()).act(&EventContext::SpeakingStateUpdate(speaking)).await;

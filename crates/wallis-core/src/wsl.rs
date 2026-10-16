@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn image_parts_order_and_assemble_are_verified() {
-        let names = ["Wallis_0.4.1_x64-setup.exe", "wallis-rootfs.tar.gz.sha256", "wallis-rootfs.tar.gz.001", "wallis-rootfs.tar.gz.000"];
+        let names = ["Wallis_0.5.0_x64-setup.exe", "wallis-rootfs.tar.gz.sha256", "wallis-rootfs.tar.gz.001", "wallis-rootfs.tar.gz.000"];
         assert_eq!(image_parts(&names), ["wallis-rootfs.tar.gz.000", "wallis-rootfs.tar.gz.001"]);
         let dir = std::env::temp_dir().join(format!("wallis-parts-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

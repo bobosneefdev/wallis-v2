@@ -1,6 +1,6 @@
 # Wallis
 
-A Windows desktop Discord companion built with Tauri, Svelte, Twilight and Songbird. Wallis 0.4.1 runs the bot, agents, local speech, music and browser inside a private **WSL2** distro. Pi runs the realtime and worker agents; Mnemosyne provides local memory.
+A Windows desktop Discord companion built with Tauri, Svelte, Twilight and Songbird. Wallis 0.5.0 runs the bot, agents, local speech, music and browser inside a private **WSL2** distro. Pi runs the realtime and worker agents; Mnemosyne provides local memory.
 
 Install WSL2 before first setup: run `wsl --install --no-distribution` as administrator, restart Windows, then open Wallis. Virtualization must be enabled. First setup downloads a versioned, checksummed Ubuntu 26.04 runtime with CPU speech models and browser tools. It needs several GB of disk space. The Windows desktop manages settings, sign-in and updates; runtime control uses stdin/stdout without a listening port.
 
@@ -10,7 +10,7 @@ Existing native-install profiles, provider sign-ins, memories, jobs and reminder
 
 ## Mods and tools
 
-Ask Wallis to learn a feature, for example “make a coinflip command.” His worker writes a slash-command mod in TypeScript with **Effect 4.0.5**, checks it, and registers it after the job. The kitlangton Effect skill, mod-writing guide, music guide and browser guide are available to the worker by default. The realtime agent delegates music, browsing and feature work so conversation can continue.
+Ask Wallis to learn a feature, for example “make a coinflip command.” His worker writes a slash-command mod in TypeScript with **Effect 4.0.5**, checks it, and registers it after the job. The kitlangton Effect skill, mod-writing guide, music guide and browser guide are available to the worker by default. The realtime agent runs commands such as `/play` and `/browse` itself and delegates feature work to the worker so conversation can continue.
 
 Stock commands:
 
@@ -29,9 +29,23 @@ Mod format: `mods/<name>/{mod.json,index.ts}`. See [the mod guide](skills/wallis
 
 ## Local speech
 
-Parakeet TDT 0.6B v3 INT8 runs through Sherpa-ONNX; Pocket TTS 3.3.0 uses English September 2026 preset-only weights. Both run on CPU with pinned CPU PyTorch. No GPU or Hugging Face account is required. Speech models total approximately 712 MB for one preset, plus Python packages. The rootfs includes Alba, Marius and Javert.
+Parakeet TDT 0.6B v3 INT8 runs through Sherpa-ONNX; Pocket TTS 3.3.0 uses English September 2026 preset-only weights. Both run on CPU with pinned CPU PyTorch. No GPU is required, and no Hugging Face account unless you enable voice cloning (below). Speech models total approximately 712 MB for one preset, plus Python packages. The rootfs includes Alba, Marius and Javert.
 
 Pocket streams 24 kHz mono float PCM directly into Songbird. Speaking speed adjusts playback rate and pitch; 1.0 preserves the voice. Saved Whisper, Parakeet 110M and Piper settings migrate to the current defaults. STT supports 25 European languages with automatic detection. New transcriptions reach Wallis while he responds without stopping playback. He normally finishes his thought, but can choose `stop_speaking` to stop current and queued speech before saying something else.
+
+## Self-tuning voice and cloning
+
+Wallis adjusts his own delivery live, with no restart: the `tune` tool changes speed, voice, temperature, end-of-speech threshold, how eager he is to chime in (`cooldownSecs`, `followUpSecs`), pause length before he answers (`silenceMs`) and how easily he can be interrupted (`bargeInMs`). Changes persist in `tuning.json` and last until you change the matching setting in the desktop app. `list_voices` shows presets and clones.
+
+Voice cloning is off until you enable it in the desktop app's Discord and voice settings. Enabling it requires accepting that you, the host, are fully responsible for ensuring every clone is consensual and lawful, and a Hugging Face token whose account has accepted the terms of [kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts) (stored with Windows DPAPI like the Discord token). The cloning weights (checksummed) download on demand. Once enabled, Wallis clones from a clean WAV clip the worker prepares (for example from a YouTube video) with `clone_voice` and can switch to it immediately. Everything else works without a token.
+
+## Staying in the conversation
+
+Voice transcripts that arrive while he is thinking are merged into one turn, and queued speech is counted: when he is more than four sentences behind, `say` pushes back and he is told to `stop_speaking` and answer only what matters now.
+
+## Realtime and worker
+
+Wallis (realtime) is the only face people see. `delegate` takes a brief that says what to find and what to bring back; the worker never posts to Discord. Its report returns privately to Wallis as a `[job finished]` turn and he tells you in his own words. `channel_history` lets him read recent messages in a channel. Realtime uses [@smoose/pi-persona](https://pi.dev/packages/@smoose/pi-persona) for a soul and moods; the worker stays a plain coding agent without it.
 
 ## Time
 
@@ -55,7 +69,7 @@ Using the provisioned Python environment, `python crates/wallis-core/py/media_ch
 Build the release image on an Ubuntu host with root privileges:
 
 ```sh
-sudo scripts/rootfs/build.sh target/release/wallis-bot /path/to/output 0.4.1
+sudo scripts/rootfs/build.sh target/release/wallis-bot /path/to/output 0.5.0
 ```
 
 This produces `wallis-rootfs.tar.gz.*` parts and the image checksum after sandbox, browser, mod and real speech roundtrip checks; GitHub caps one release asset at 2 GiB, so reassemble an importable image with `cat wallis-rootfs.tar.gz.[0-9]* > wallis-rootfs.tar.gz` and verify it against the checksum. The release workflow builds the Linux image first, then publishes it with the Windows installer under the matching version tag. Inside an imported test distro, run `/opt/wallis/bin/wallis-bot --self-check` as root for uid/filesystem isolation, browser navigation and a real Bun mod roundtrip. This initializes the workspace; use a disposable test distro. Stage `crates/wallis-core/py/speech_check.py` there and run it with `/opt/wallis/tools/venv/bin/python` as `wallis` to repeat the speech check.

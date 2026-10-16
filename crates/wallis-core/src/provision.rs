@@ -19,7 +19,10 @@ pub const PYTHON_VERSION: &str = "3.12";
 pub fn sha256_hex(bytes: &[u8]) -> String { Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect() }
 
 /// Downloads `url` to `dest`, keeping the file only if its SHA-256 matches `sha256`.
-pub fn download_verified(url: &str, sha256: &str, dest: &Path) -> Result<(), String> {
+pub fn download_verified(url: &str, sha256: &str, dest: &Path) -> Result<(), String> { download_verified_as(url, sha256, dest, None) }
+
+/// The same, sending `Authorization: Bearer <token>` to the first host (for gated Hugging Face files).
+pub fn download_verified_as(url: &str, sha256: &str, dest: &Path, token: Option<&str>) -> Result<(), String> {
     if let Ok(mut existing) = std::fs::File::open(dest) {
         let mut hasher = Sha256::new(); let mut buffer = [0u8;65536];
         loop {
@@ -31,7 +34,9 @@ pub fn download_verified(url: &str, sha256: &str, dest: &Path) -> Result<(), Str
     let parent = dest.parent().ok_or("Bad download path.")?;
     std::fs::create_dir_all(parent).map_err(|error| format!("Unable to create {}: {error}", parent.display()))?;
     let part = dest.with_extension("part");
-    let mut response = ureq::get(url).call().map_err(|error| format!("Unable to download {url}: {error}"))?;
+    let mut request = ureq::get(url);
+    if let Some(token) = token { request = request.header("Authorization", &format!("Bearer {token}")); }
+    let mut response = request.call().map_err(|error| format!("Unable to download {url}: {}", if token.is_some() && error.to_string().contains("40") { "Hugging Face refused the token. Accept the Kyutai terms for kyutai/pocket-tts with that account and use a read token.".to_string() } else { error.to_string() }))?;
     let (mut file, mut hasher, mut buffer) = (std::fs::File::create(&part).map_err(|error| error.to_string())?, Sha256::new(), [0u8; 65536]);
     let mut reader = response.body_mut().as_reader();
     loop {
@@ -138,6 +143,9 @@ pub const TTS_VOICES: [(&str, &str, &str, u32); 3] = [
 ];
 const STT_ARCHIVE: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
 const POCKET_BASE: &str = "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/4e1e0a3e611c51c0b4ed8174fc10f32a54644303/languages/english_2026-09";
+/// Voice cloning needs Kyutai's gated weights, fetched only with the host's own Hugging Face token (pinned, checksummed).
+pub const CLONING_WEIGHTS_URL: &str = "https://huggingface.co/kyutai/pocket-tts/resolve/983151f13aaeab1b13c1e5e3c2c383d49a9edf3f/languages/english_2026-09/model.safetensors";
+pub const CLONING_WEIGHTS_SHA256: &str = "fb0dc01b0d4d2e1c905b7a3e0676e3d9c96d5ae460e24e3ab94981805babf997";
 pub const SPEECH_SERVER: &str = include_str!("../py/speech_server.py");
 
 /// Where everything lives under the app data folder.
@@ -208,6 +216,15 @@ pub fn ensure_all(layout: &Layout, stt: &str, tts: &str, progress: &dyn Fn(&str)
     Ok(())
 }
 
+/// Enables voice cloning: downloads the gated weights with `token` (resumes instantly once they are verified on disk) and
+/// leaves a `cloning-enabled` marker the `clone_voice` tool checks. Without consent and a token it removes the marker.
+pub fn set_cloning(data: &Path, consent_and_token: Option<&str>) -> Result<(), String> {
+    let marker = data.join("cloning-enabled");
+    let Some(token) = consent_and_token else { let _ = std::fs::remove_file(&marker); return Ok(()) };
+    download_verified_as(CLONING_WEIGHTS_URL, CLONING_WEIGHTS_SHA256, &data.join("cloning/model.safetensors"), Some(token))?;
+    std::fs::write(marker, "1").map_err(|error| error.to_string())
+}
+
 /// The two local speech servers. Dropping this stops them.
 pub struct SpeechServers(Vec<std::process::Child>);
 
@@ -225,7 +242,7 @@ impl SpeechServers {
         if !STT_MODELS.iter().any(|m| m.0 == stt) || !TTS_VOICES.iter().any(|m| m.0 == tts) || !(1..=64).contains(&threads) { return Err("Invalid speech settings.".into()); }
         let stt_server = spawn(&layout.python(), vec!["-u".into(), layout.speech_script().to_string_lossy().into(), "stt".into(), layout.stt_model(stt).join(STT_ARCHIVE).to_string_lossy().into(), threads.to_string()], "speech recognition", 8085)?;
         let mut servers = Self(vec![stt_server]);
-        servers.0.push(spawn(&layout.python(), vec!["-u".into(), layout.speech_script().to_string_lossy().into(), "tts".into(), layout.tts_model(tts).to_string_lossy().into(), threads.to_string()], "the voice", 8086)?);
+        servers.0.push(spawn(&layout.python(), vec!["-u".into(), layout.speech_script().to_string_lossy().into(), "tts".into(), layout.tts_model(tts).to_string_lossy().into(), threads.to_string(), layout.0.join("voices").to_string_lossy().into()], "the voice", 8086)?);
         for (name, port) in [("speech recognition", 8085u16), ("the voice", 8086)] {
             let mut up = false;
             for _ in 0..300 {
