@@ -21,11 +21,13 @@ pub struct WallisConfig {
     pub tts_voice: String,
     pub tts_speed: f32,
     pub silence_ms: u32,
+    /// The host accepted that they alone are responsible for every voice clone being consensual. Cloning needs this and a Hugging Face token.
+    pub cloning_consent: bool,
 }
 
 impl Default for WallisConfig {
     fn default() -> Self {
-        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), discord_read_channels: String::new(), discord_write_channels: String::new(), discord_voice_text_channel: String::new(), voice_participation: "natural".into(), text_participation: "natural".into(), participation_cooldown_secs: 5, auto_start: false, onboarded: false, stt_model: "parakeet-0.6b-v3-int8".into(), stt_threads: 4, tts_voice: "alba".into(), tts_speed: 1.0, silence_ms: 350 }
+        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), discord_read_channels: String::new(), discord_write_channels: String::new(), discord_voice_text_channel: String::new(), voice_participation: "natural".into(), text_participation: "natural".into(), participation_cooldown_secs: 5, auto_start: false, onboarded: false, stt_model: "parakeet-0.6b-v3-int8".into(), stt_threads: 4, tts_voice: "alba".into(), tts_speed: 1.0, silence_ms: 350, cloning_consent: false }
     }
 }
 

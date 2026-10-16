@@ -39,7 +39,7 @@ fn prepare(init: &Bootstrap) -> Result<(), String> {
         if !alias.exists() { std::os::unix::fs::symlink(&target,&alias).map_err(|e|e.to_string())?; }
         if alias.canonicalize().map_err(|e|e.to_string())? != target { return Err("Unexpected workspace path.".into()); }
     }
-    for name in ["pi/realtime", "pi/worker", "memory", "realtime-cwd", "logs"] {
+    for name in ["pi/realtime", "pi/worker", "memory", "realtime-cwd", "logs", "voices"] {
         std::fs::create_dir_all(data.join(name)).map_err(|e| e.to_string())?;
         for component in [data.join(name), data.join(name).parent().unwrap().into()] {
             if component != data.join("pi/worker") && std::fs::symlink_metadata(&component).map_err(|e|e.to_string())?.is_symlink() { return Err("Runtime directories cannot be symlinks.".into()); }
@@ -114,14 +114,19 @@ impl Server {
         let list = |s: &str| s.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
         let data = PathBuf::from(DATA); let layout = Layout(data.clone());
         for role in [&self.init.roles.realtime, &self.init.roles.worker] { role.validate()?; }
-        Ok(BotConfig { pi_program: layout.pi().to_string_lossy().into(), worker_program: layout.pi().to_string_lossy().into(), data_dir: data.clone(), persona: persona(&data), realtime: self.init.roles.realtime.clone(), worker: self.init.roles.worker.clone(), write_channels: list(&c.discord_write_channels), voice_text_channel: c.discord_voice_text_channel.clone(), python: layout.python().to_string_lossy().into(), voice_participation: mode(&c.voice_participation), text_participation: mode(&c.text_participation), cooldown: Duration::from_secs(c.participation_cooldown_secs.into()), speech_speed: c.tts_speed, sandbox_read: vec![layout.tools()], shell: layout.shell() })
+        Ok(BotConfig { pi_program: layout.pi().to_string_lossy().into(), worker_program: layout.pi().to_string_lossy().into(), data_dir: data.clone(), persona: persona(&data), realtime: self.init.roles.realtime.clone(), worker: self.init.roles.worker.clone(), write_channels: list(&c.discord_write_channels), voice_text_channel: c.discord_voice_text_channel.clone(), python: layout.python().to_string_lossy().into(), voice_participation: mode(&c.voice_participation), text_participation: mode(&c.text_participation), sandbox_read: vec![layout.tools()], shell: layout.shell() })
     }
-    fn start(&mut self, token: &str) -> Result<Value, String> {
+    fn start(&mut self, token: &str, args: &Value) -> Result<Value, String> {
         if self.running.is_some() { return self.handle("get_runtime_status", &json!({})); }
         if token.is_empty() { return Err("Save the Discord token first.".into()); }
         read_profile(Path::new(DATA))?;
         let config = self.config()?;
         let c = &self.init.config;
+        // Voice cloning is on only with the host's recorded acceptance and a Hugging Face token. The weights download in the background.
+        let hf = args["hfToken"].as_str().filter(|t| c.cloning_consent && !t.is_empty()).map(String::from);
+        if hf.is_none() { let _ = wallis_core::provision::set_cloning(Path::new(DATA), None); }
+        else { std::thread::spawn(move || if let Err(error) = wallis_core::provision::set_cloning(Path::new(DATA), hf.as_deref()) { eprintln!("wallis: voice cloning unavailable: {error}"); }); }
+        wallis_core::tuning::load(Path::new(DATA), wallis_core::tuning::Tuning { voice: c.tts_voice.clone(), speed: c.tts_speed, cooldown_secs: c.participation_cooldown_secs, ..Default::default() });
         let speech = SpeechServers::start(&Layout(DATA.into()), &c.stt_model, c.stt_threads, &c.tts_voice)?;
         let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
         let (bot, out, failure) = (Arc::new(Mutex::new(None::<Bot>)), Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)));
@@ -143,7 +148,7 @@ impl Server {
     fn handle(&mut self, command: &str, args: &Value) -> Result<Value, String> {
         let data = Path::new(DATA);
         match command {
-            "start_wallis" => self.start(args["token"].as_str().unwrap_or("")),
+            "start_wallis" => self.start(args["token"].as_str().unwrap_or(""), args),
             "stop_wallis" => { self.running.take(); Ok(json!({"state":"stopped","message":"Wallis is stopped."})) }
             "get_runtime_status" => Ok(match &self.running { None => json!({"state":"stopped","message":"Wallis is stopped."}), Some(r) => match r.failure.lock().unwrap().as_ref() { Some(e) => json!({"state":"unavailable","message":e}), None => json!({"state":"running","message":"Wallis is online."}) } }),
             "get_stats" => Ok(self.running.as_ref().and_then(|r| r.bot.lock().unwrap().as_ref().map(|b| json!(b.stats.snapshot()))).unwrap_or(Value::Null)),
@@ -170,7 +175,7 @@ impl Server {
             "generate_wallis" => {
                 if read_profile(data).is_ok() { return Err("Wallis already has a profile. Only he can change it.".into()); }
                 let config = self.config()?;
-                let mut agent = bot::spawn_realtime_with(&config, &prompts::profile_generator_prompt())?;
+                let mut agent = bot::spawn_realtime_with(&config, false, &prompts::profile_generator_prompt())?;
                 let answer = agent.turn(&generation_prompt(args["hint"].as_str().unwrap_or("")), Duration::from_secs(120), &mut |_| "Unavailable during generation.".into(), &mut |_| {})?;
                 let profile = sanitize_profile(serde_json::from_str(extract_json(&answer).ok_or("The model did not return a profile.")?).map_err(|e|e.to_string())?);
                 let stored = json!(profile).to_string();
@@ -247,7 +252,7 @@ fn serve() -> Result<(), String> {
     prepare(&init)?;
     for (name,role) in [("realtime",&init.roles.realtime),("worker",&init.roles.worker)] {
         let dir = Path::new(DATA).join("pi").join(name);
-        if name == "realtime" { wallis_core::pi_config::install_packages("/opt/wallis/tools/pi/pi",&dir,&role.packages)?; }
+        if name == "realtime" { wallis_core::pi_config::install_packages("/opt/wallis/tools/pi/pi",&dir,&wallis_core::pi_config::with_persona(&role.packages))?; }
         else {
             let access = wallis_core::agent::Access { read:vec![], write:vec![dir.clone(),Path::new(DATA).join("worker-scratch"),Path::new(DATA).join("mods"),Path::new(DATA).join("media")],path:vec![] };
             for package in &role.packages {

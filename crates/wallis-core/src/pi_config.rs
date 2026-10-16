@@ -6,6 +6,14 @@ use std::process::{Command, Stdio};
 /// Name Pi knows the OpenAI-compatible provider by (`RoleConfig.provider`).
 pub const CUSTOM: &str = "custom";
 
+/// Gives the realtime role (never the worker) a soul and moods; it reads SOUL.md and IDENTIFY.md from the role dir.
+pub const PERSONA_PACKAGE: &str = "npm:@smoose/pi-persona";
+
+/// The role's configured packages plus the persona package, once.
+pub fn with_persona(packages: &[String]) -> Vec<String> {
+    packages.iter().cloned().chain(std::iter::once(PERSONA_PACKAGE.to_string())).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+}
+
 /// Pi package sources Wallis accepts: registry, git and https only. The text reaches a command line, so no flags or whitespace.
 pub fn valid_package(source: &str) -> Result<(), String> {
     let ok = source.len() <= 200 && ["npm:", "git:", "https://"].iter().any(|prefix| source.starts_with(prefix)) && !source.chars().any(|c| c.is_whitespace() || c.is_control());

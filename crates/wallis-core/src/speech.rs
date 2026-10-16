@@ -56,11 +56,22 @@ pub fn transcribe(pcm_48k_stereo: &[i16]) -> Result<String, String> {
     Ok(clean_transcript(response["text"].as_str().ok_or("Parakeet returned no transcript field.")?))
 }
 
-/// Streaming 24 kHz mono little-endian f32 PCM. Dropping the reader cancels the HTTP stream.
+/// Streaming 24 kHz mono little-endian f32 PCM in the live voice (`tuning::current`). Dropping the reader cancels the HTTP stream.
 pub fn synthesize_stream(text: &str) -> Result<impl Read + Send + Sync + 'static, String> {
-    let response = ureq::post(format!("{TTS_URL}/synthesize")).config().timeout_recv_response(Some(std::time::Duration::from_secs(30))).timeout_recv_body(Some(std::time::Duration::from_secs(600))).build().send_json(serde_json::json!({ "text": text }))
+    let tuning = crate::tuning::current();
+    let response = ureq::post(format!("{TTS_URL}/synthesize")).config().timeout_recv_response(Some(std::time::Duration::from_secs(30))).timeout_recv_body(Some(std::time::Duration::from_secs(600))).build().send_json(serde_json::json!({ "text": text, "voice": tuning.voice, "temp": tuning.temp, "eos_threshold": tuning.eos_threshold }))
         .map_err(|error| format!("Pocket TTS failed: {error}"))?;
     Ok(response.into_body().into_reader())
+}
+
+/// Turns a WAV already in the media folder into a voice named `name`, via the speech server. Needs cloning enabled.
+pub fn clone_voice(name: &str, wav: &std::path::Path) -> Result<(), String> {
+    ureq::post(format!("{TTS_URL}/clone")).config().timeout_global(Some(std::time::Duration::from_secs(300))).http_status_as_error(false).build()
+        .send_json(serde_json::json!({ "name": name, "audio": wav })).map_err(|error| format!("Voice cloning failed: {error}")).and_then(|mut response| {
+            if response.status().is_success() { return Ok(()); }
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            Err(body.split("Error code explanation:").nth(1).and_then(|rest| rest.split("</p>").next()).map(|s| s.trim().trim_end_matches('.').to_string()).unwrap_or_else(|| "Voice cloning failed.".into()))
+        })
 }
 
 /// Buffered roundtrip helper for the provisioning check; Discord uses synthesize_stream directly.

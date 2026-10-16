@@ -17,6 +17,7 @@ pub mod settings;
 pub mod mods;
 pub mod speech;
 pub mod stats;
+pub mod tuning;
 pub mod update;
 pub mod utterance;
 pub mod worker;

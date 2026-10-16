@@ -9,7 +9,7 @@ import wave
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
-def load(mode, path, threads):
+def load(mode, path, threads, voices_dir=None):
     if mode == "stt":
         import numpy as np
         import sherpa_onnx
@@ -36,31 +36,81 @@ def load(mode, path, threads):
 
     import yaml
     from pocket_tts import TTSModel
+    from pocket_tts.models.model_state import export_model_state
     from pocket_tts.utils.config import CONFIGS_DIR
-    # Reuse the pinned package's architecture, replacing every network source.
-    config = yaml.safe_load((CONFIGS_DIR / "english_2026-09.yaml").read_text())
-    config["weights_path"] = str(path.parent / "model.safetensors")
-    config.pop("weights_path_without_voice_cloning", None)
-    config["flow_lm"]["lookup_table"]["tokenizer_path"] = str(path.parent / "tokenizer.json")
-    with tempfile.TemporaryDirectory() as temporary:
-        local_config = Path(temporary) / "local.yaml"
-        local_config.write_text(yaml.safe_dump(config))
-        model = TTSModel.load_model(config=local_config)
+    pocket = path.parent
+    voices = voices_dir  # Cloned voices: <name>.safetensors. Presets live beside the model.
+
+    def build(weights):
+        # Reuse the pinned package's architecture, replacing every network source.
+        config = yaml.safe_load((CONFIGS_DIR / "english_2026-09.yaml").read_text())
+        config["weights_path"] = str(weights)
+        config.pop("weights_path_without_voice_cloning", None)
+        config["flow_lm"]["lookup_table"]["tokenizer_path"] = str(pocket / "tokenizer.json")
+        with tempfile.TemporaryDirectory() as temporary:
+            local_config = Path(temporary) / "local.yaml"
+            local_config.write_text(yaml.safe_dump(config))
+            return TTSModel.load_model(config=local_config)
+
+    model = build(pocket / "model.safetensors")
     model.has_voice_cloning = False
-    state = model.get_state_for_audio_prompt(path)
+    default_temp, default_eos = model.temp, model.eos_threshold
+    cache = {}
+
+    def voice_state(name):
+        if not name.replace("_", "").replace("-", "").isalnum() or len(name) > 40:
+            raise ValueError("Invalid voice name.")
+        if name not in cache:
+            for folder in (voices, pocket):
+                if folder and (folder / f"{name}.safetensors").is_file():
+                    if len(cache) >= 8:
+                        cache.pop(next(iter(cache)))
+                    cache[name] = model.get_state_for_audio_prompt(folder / f"{name}.safetensors")
+                    break
+            else:
+                raise ValueError(f"No voice named {name}.")
+        return cache[name]
+
+    voice_state(path.stem)
+    cloner = []
+
+    def clone(body):
+        request = json.loads(body)
+        name, audio = request.get("name"), Path(str(request.get("audio")))
+        if not isinstance(name, str) or (pocket / f"{name}.safetensors").is_file():
+            raise ValueError("Pick a new voice name that is not a built-in preset.")
+        voice_state_check = name.replace("_", "").replace("-", "")
+        if not voice_state_check.isalnum() or len(name) > 40 or not audio.is_file() or audio.suffix.lower() != ".wav":
+            raise ValueError("Cloning needs a voice name and a 16-bit WAV file.")
+        weights = voices.parent / "cloning" / "model.safetensors"
+        if not weights.is_file():
+            raise ValueError("Voice cloning is not enabled: the cloning weights are not installed.")
+        if not cloner:
+            cloner.append(build(weights))
+        state = cloner[0].get_state_for_audio_prompt(audio, truncate=True)
+        voices.mkdir(parents=True, exist_ok=True)
+        export_model_state(state, voices / f"{name}.safetensors")
+        cache.pop(name, None)
+        return json.dumps({"voice": name}).encode()
 
     def synthesize(body):
         request = json.loads(body)
         text = request.get("text") if isinstance(request, dict) else None
         if not isinstance(text, str) or not text.strip() or len(text) > 16000:
             raise ValueError("Text must contain 1–16000 characters.")
+        state = voice_state(request.get("voice") or path.stem)
+        # The server handles one request at a time, so per-request sampling is safe to set here.
+        model.temp = float(request.get("temp") or default_temp)
+        model.eos_threshold = float(request.get("eos_threshold", default_eos))
+        if not 0.05 <= model.temp <= 1.5 or not -8.0 <= model.eos_threshold <= 0.0:
+            raise ValueError("Sampling settings out of range.")
         return (chunk.detach().cpu().numpy().astype("<f4").tobytes()
                 for chunk in model.generate_audio_stream(state, text))
+    synthesize.clone = clone
     return synthesize
 
-
-def serve(mode, path, threads):
-    inference = load(mode, path.resolve(), threads)
+def serve(mode, path, threads, voices_dir=None):
+    inference = load(mode, path.resolve(), threads, voices_dir and voices_dir.resolve())
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -73,6 +123,8 @@ def serve(mode, path, threads):
             self.end_headers()
 
         def do_POST(self):
+            if mode == "tts" and self.path == "/clone":
+                return self.clone()
             if self.path != ("/inference" if mode == "stt" else "/synthesize"):
                 return self.send_error(404)
             self.connection.settimeout(30)
@@ -113,6 +165,24 @@ def serve(mode, path, threads):
                 print(error, file=sys.stderr, flush=True)
                 self.close_connection = True  # No terminal chunk: the reader sees a failed stream.
 
+        def clone(self):
+            self.connection.settimeout(300)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 10_000:
+                    raise ValueError("Invalid body size.")
+                body = inference.clone(self.rfile.read(length))
+            except (ValueError, KeyError) as error:
+                return self.send_error(400, "Invalid clone request.", explain=str(error))
+            except Exception as error:
+                print(error, file=sys.stderr, flush=True)
+                return self.send_error(500, "Voice cloning failed.")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def log_message(self, *_):
             pass
 
@@ -120,7 +190,7 @@ def serve(mode, path, threads):
 
 
 if __name__ == "__main__":
-    mode, path, threads = sys.argv[1:]
+    mode, path, threads, *rest = sys.argv[1:]
     if mode not in ("stt", "tts") or not 1 <= int(threads) <= 64:
         raise ValueError("Invalid speech settings.")
-    serve(mode, Path(path), int(threads))
+    serve(mode, Path(path), int(threads), Path(rest[0]) if rest else None)

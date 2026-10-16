@@ -14,7 +14,7 @@ use wallis_core::participation::{should_consider, sounds_like_wallis, Mode, Part
 use wallis_core::{pi_config, prompts};
 use wallis_core::role::{Role, RoleConfig};
 use wallis_core::stats::Stats;
-use wallis_core::{speech, worker, media};
+use wallis_core::{speech, worker, media, tuning};
 
 #[derive(Clone)]
 pub struct BotConfig {
@@ -29,15 +29,13 @@ pub struct BotConfig {
     pub python: String,
     pub voice_participation: Participation,
     pub text_participation: Participation,
-    pub cooldown: Duration,
-    pub speech_speed: f32,
     /// Folders the confined worker needs to run from (Pi, the shell), and the shell itself.
     pub sandbox_read: Vec<PathBuf>,
     pub shell: PathBuf,
 }
 
 /// Speaks and posts for one guild on behalf of the host tools.
-struct Sink<'a> { out: &'a Out, guild: u64, user: u64, speed: f32 }
+struct Sink<'a> { out: &'a Out, guild: u64, user: u64 }
 
 impl Discord for Sink<'_> {
     fn scope(&mut self, guild: u64, user: u64) { self.guild = guild; self.user = user; }
@@ -46,13 +44,15 @@ impl Discord for Sink<'_> {
     fn skip_audio(&mut self) -> Result<(), String> { self.out.skip_audio(self.guild) }
     fn stop_audio(&mut self) -> Result<(), String> { self.out.stop_audio(self.guild) }
     fn volume(&mut self, percent: u32) -> Result<(), String> { self.out.volume(self.guild, percent) }
-    fn say(&mut self, text: &str) -> Result<(), String> { self.out.speak(self.guild, text, self.speed) }
+    fn say(&mut self, text: &str) -> Result<(), String> { self.out.speak(self.guild, text) }
     fn stop_speaking(&mut self) -> Result<(), String> { self.out.stop_speaking(self.guild); Ok(()) }
     fn message(&mut self, channel_id: &str, text: &str) -> Result<(), String> { self.out.message(channel_id.parse().map_err(|_| "Bad channel id")?, text) }
     fn file(&mut self, channel_id: &str, filename: &str, content: &str, text: &str) -> Result<(), String> { self.out.file(channel_id.parse().map_err(|_| "Bad channel id")?, filename, content, text) }
+    fn history(&mut self, channel_id: &str, limit: u8) -> Result<String, String> { self.out.history(channel_id.parse().map_err(|_| "Bad channel id")?, limit) }
     fn join(&mut self, channel: Option<u64>) -> Result<u64, String> { self.out.join(self.guild, self.user, channel) }
     fn leave(&mut self) -> Result<(), String> { self.out.leave(self.guild) }
     fn voice_channel(&self) -> Option<u64> { self.out.voice_channel(self.guild) }
+    fn pending_speech(&self) -> usize { self.out.pending_speech(self.guild) }
 }
 
 /// What the realtime agent is told for one event, led by the local time (`at`, unix seconds) so he always has a clock.
@@ -64,16 +64,47 @@ pub fn turn_prompt(at: i64, mode: Mode, channel: u64, speaker: &str, said: &str)
     }
 }
 
+/// Transcribes finished utterances, dropping silence and failures.
+fn hear(events: Vec<Incoming>, stats: &Stats) -> Vec<(String, String)> {
+    events.into_iter().filter_map(|event| {
+        let Incoming::Voice { speaker, pcm, .. } = event else { return None };
+        match speech::transcribe(&pcm) {
+            Ok(said) if !said.is_empty() => { stats.audit("heard", &format!("{speaker}: {said}")); Some((speaker, said)) }
+            Ok(_) => None,
+            Err(error) => { eprintln!("wallis: {error}"); None }
+        }
+    }).collect()
+}
+
+/// Everything heard in the same moment as one message. Consecutive lines from one speaker join into a single line.
+pub fn merge_voice(at: i64, heard: &[(String, String)]) -> String {
+    let mut lines: Vec<(&str, String)> = Vec::new();
+    for (speaker, said) in heard {
+        match lines.last_mut() { Some((last, text)) if last == speaker => { text.push(' '); text.push_str(said); } _ => lines.push((speaker, said.clone())) }
+    }
+    let mut out = format!("[{}] [voice transcript]", schedule::stamp(at));
+    for (speaker, said) in lines { out.push_str(&format!("\n{speaker}: {said}")); }
+    out
+}
+
 /// The realtime Pi: memory (Mnemosyne over MCP) plus Wallis' own tools, no shell or files.
-pub fn spawn_realtime(config: &BotConfig) -> Result<Agent, String> { spawn_realtime_with(config, &format!("{}\nAllowed text output channel IDs: {}. Voice requests use output channel {}. Use those IDs for delegate, message and file.",prompts::realtime_prompt(&config.persona),config.write_channels.join(", "),config.voice_text_channel)) }
+pub fn spawn_realtime(config: &BotConfig) -> Result<Agent, String> { spawn_realtime_with(config, true, &format!("{}\nAllowed text output channel IDs: {}. Voice requests use output channel {}. Use those IDs for delegate, message and file.",prompts::realtime_prompt(&config.persona),config.write_channels.join(", "),config.voice_text_channel)) }
+
+/// pi-persona's soul and trait files. Only the realtime Pi reads them; the one-off profile generator runs without the package.
+fn write_persona(dir: &std::path::Path, persona: &str) -> Result<(), String> {
+    std::fs::write(dir.join("SOUL.md"), persona).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("IDENTIFY.md"), "---\nname: Wallis\nemoji: 🎧\ndescription: A person hanging out in a Discord call and chat, not an assistant.\nopenness: 0.7\nconscientiousness: 0.5\nextraversion: 0.7\nagreeableness: 0.5\nneuroticism: 0.3\nformality: 0.2\nsarcasm: 0.5\n---\n").map_err(|e| e.to_string())
+}
 
 /// The same Pi, but with a caller-supplied system prompt (used by the one-off profile generator).
-pub fn spawn_realtime_with(config: &BotConfig, system_prompt: &str) -> Result<Agent, String> {
+pub fn spawn_realtime_with(config: &BotConfig, persona: bool, system_prompt: &str) -> Result<Agent, String> {
     let dir = config.data_dir.join("pi").join("realtime");
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let mcp = prompts::realtime_mcp(&config.python, &config.data_dir.join("memory").to_string_lossy());
     std::fs::write(dir.join("mcp.json"), mcp.to_string()).map_err(|error| error.to_string())?;
-    pi_config::write_settings(&dir, &config.realtime.packages, serde_json::json!({}))?;
+    if persona { write_persona(&dir, &config.persona)?; }
+    let packages = if persona { pi_config::with_persona(&config.realtime.packages) } else { config.realtime.packages.clone() };
+    pi_config::write_settings(&dir, &packages, serde_json::json!({}))?;
     let cwd = config.data_dir.join("realtime-cwd");
     std::fs::create_dir_all(&cwd).map_err(|error| error.to_string())?;
     Agent::spawn(&config.pi_program, Role::Realtime, &config.realtime, &dir, system_prompt, &cwd, None)
@@ -98,36 +129,29 @@ impl Brain {
         let participation = if mode == Mode::Voice { self.config.voice_participation } else { self.config.text_participation };
         let turn = Turn { mode, user_id: &user.to_string(), direct, participation, speaking: false };
         let last_user = self.last_reply_user.map(|id| id.to_string());
-        let state = State { pending: 0, next_consider_at_ms: self.ms(self.next_consider_at), last_reply_at_ms: self.last_reply_at.map(|at| self.ms(at)).unwrap_or(0), last_reply_user: last_user.as_deref() };
+        let state = State { follow_up_ms: tuning::current().follow_up_secs as u64 * 1000, pending: 0, next_consider_at_ms: self.ms(self.next_consider_at), last_reply_at_ms: self.last_reply_at.map(|at| self.ms(at)).unwrap_or(0), last_reply_user: last_user.as_deref() };
         should_consider(&turn, &state, self.ms(now))
     }
 
     fn respond(&mut self, guild: u64, user: u64, prompt: String, images: &[media::Image], queue: &mut Queue) {
         // Take the agent out for the turn so the host can borrow the job store at the same time.
         let mut agent = match self.agent() { Ok(_) => self.agent.take().expect("agent present"), Err(error) => return eprintln!("wallis: realtime agent unavailable: {error}") };
-        let (out, speed, write_channels) = (self.out.clone(), self.config.speech_speed, self.config.write_channels.clone());
-        let mut sink = Sink { out: &out, guild, user, speed };
+        let (out, write_channels) = (self.out.clone(), self.config.write_channels.clone());
+        let mut sink = Sink { out: &out, guild, user };
         let mut host = Host { discord: &mut sink, jobs: &self.jobs, reminders: &self.reminders, guild, user, write_channels, skipped: false, profile: self.config.data_dir.join("profile.json") };
         let (stats, started) = (self.stats.clone(), Instant::now());
+        // Several people talk at once in a fast room: transcribe everything that arrived and hand it over as ONE message, with
+        // how far behind his speech is, so he can drop what is stale instead of working through each line in order.
         let mut steer = || {
-            let mut steers = Vec::new();
-            for event in queue.rx.try_iter().collect::<Vec<_>>() {
-                match event {
-                    Incoming::Voice { speaker, pcm, .. } => {
-                        // Keep listening without stopping playback; Wallis decides whether to change course.
-                        match speech::transcribe(&pcm) {
-                            Ok(said) if !said.is_empty() => {
-                                let text = turn_prompt(schedule::now(), Mode::Voice, 0, &speaker, &said);
-                                stats.steered(); stats.audit("heard", &format!("{speaker}: {said}")); stats.audit("steer", &text); steers.push(text);
-                            }
-                            Ok(_) => {}
-                            Err(error) => eprintln!("wallis: {error}"),
-                        }
-                    }
-                    other => queue.later.push(other),
-                }
-            }
-            steers
+            let (voices, others): (Vec<_>, Vec<_>) = queue.rx.try_iter().partition(|event| matches!(event, Incoming::Voice { .. }));
+            queue.later.extend(others);
+            let heard = hear(voices, &stats);
+            if heard.is_empty() { return vec![]; }
+            let behind = out.pending_speech(guild);
+            let note = if behind >= 2 { format!("\n[you still have {behind} sentences queued to speak; if they are stale, call stop_speaking and catch up in one short line]") } else { String::new() };
+            let text = format!("{}{note}", merge_voice(schedule::now(), &heard));
+            stats.steered(); stats.audit("steer", &text);
+            vec![text]
         };
         self.stats.audit("prompt", &prompt);
         let audit = self.stats.clone();
@@ -146,7 +170,7 @@ impl Brain {
             let now = Instant::now();
             self.last_reply_at = Some(now);
             self.last_reply_user = Some(user);
-            self.next_consider_at = now + self.config.cooldown;
+            self.next_consider_at = now + Duration::from_secs(tuning::current().cooldown_secs.into());
         }
     }
 
@@ -158,6 +182,16 @@ impl Brain {
             self.stats.audit("reminder", &reminder.note);
             let prompt = reminder.prompt(now, self.out.voice_channel(reminder.guild), &self.config.write_channels);
             self.respond(reminder.guild, reminder.user, prompt, &[], queue);
+        }
+    }
+
+    /// Hands every finished worker job to Wallis privately: an ordinary turn whose prompt carries the full report. Nothing is posted to the channel.
+    fn deliver_jobs(&mut self, queue: &mut Queue) {
+        let jobs = match self.jobs.take_finished() { Ok(jobs) => jobs, Err(error) => return eprintln!("wallis: {error}") };
+        for job in jobs {
+            self.stats.audit("job", &format!("{} {}", job.id, job.status));
+            let prompt = job.prompt(schedule::now(), self.out.voice_channel(job.guild), &self.config.write_channels);
+            self.respond(job.guild, job.user, prompt, &[], queue);
         }
     }
 
@@ -202,9 +236,16 @@ impl Brain {
             Incoming::MediaUpdate { channel, message, user, media } => self.media.remember(channel, message, user, &media),
             Incoming::MediaDelete { channel, messages } => self.media.forget(channel, &messages),
             Incoming::Voice { guild, channel, user, speaker, pcm } => {
-                let said = match speech::transcribe(&pcm) { Ok(text) if !text.is_empty() => text, Ok(_) => return, Err(error) => return eprintln!("wallis: {error}") };
-                self.stats.audit("heard", &format!("{speaker}: {said}"));
-                if self.consider(Mode::Voice, user, sounds_like_wallis(&said)) { self.respond(guild, user, turn_prompt(schedule::now(), Mode::Voice, channel, &speaker, &said), &[], queue); }
+                // Utterances that piled up while the last turn ran are heard together, not answered one by one.
+                let (voices, others): (Vec<_>, Vec<_>) = queue.rx.try_iter().partition(|event| matches!(event, Incoming::Voice { .. }));
+                queue.later.extend(others);
+                let mut heard = hear(std::iter::once(Incoming::Voice { guild, channel, user, speaker, pcm }).chain(voices).collect(), &self.stats);
+                if heard.is_empty() { return; }
+                let direct = heard.iter().any(|(_, said)| sounds_like_wallis(said));
+                if self.consider(Mode::Voice, user, direct) {
+                    let prompt = if heard.len() == 1 { let (speaker, said) = heard.remove(0); turn_prompt(schedule::now(), Mode::Voice, channel, &speaker, &said) } else { merge_voice(schedule::now(), &heard) };
+                    self.respond(guild, user, prompt, &[], queue);
+                }
             }
             Incoming::Mod { guild, channel, user, name, options, token } => {
                 let (out, config) = (self.out.clone(), self.config.clone());
@@ -213,7 +254,7 @@ impl Brain {
                     let result = (|| {
                         let jobs = Jobs::open(&config.data_dir.join("jobs.sqlite").to_string_lossy())?;
                         let reminders = Reminders::open(&config.data_dir.join("jobs.sqlite").to_string_lossy())?;
-                        let mut sink = Sink { out: &out, guild, user, speed: config.speech_speed };
+                        let mut sink = Sink { out: &out, guild, user };
                         let mut host = Host { discord: &mut sink, jobs: &jobs, reminders: &reminders, guild, user, write_channels: vec![channel.to_string()], skipped: false, profile: config.data_dir.join("profile.json") };
                         wallis_core::mods::run(&config.data_dir, &name, serde_json::json!({"options":options,"guild":guild.to_string(),"user":user.to_string(),"channel":channel.to_string()}), &mut |call| host.handle(call))
                     })();
@@ -236,8 +277,8 @@ impl Drop for Bot {
 pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
     std::fs::create_dir_all(&config.data_dir).map_err(|error| error.to_string())?;
     let db = config.data_dir.join("jobs.sqlite").to_string_lossy().to_string();
-    let interrupted = Jobs::open(&db)?.fail_interrupted()?;
-    for job in interrupted { let _ = out.message(job.channel_id.parse().unwrap_or(0), &format!("Job {} was interrupted by a restart. Ask me to retry it.", job.id)); }
+    // Interrupted jobs are marked failed and reach Wallis like any other finished job, so he tells the user.
+    Jobs::open(&db)?.fail_interrupted()?;
 
     let (sender, receiver): (Sender<Incoming>, Receiver<Incoming>) = channel();
     let (brain_config, brain_out, brain_db) = (config.clone(), out.clone(), db.clone());
@@ -256,6 +297,7 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             brain.fire_due(&mut queue);
+            brain.deliver_jobs(&mut queue);
             while !queue.later.is_empty() { let next = queue.later.remove(0); brain.handle(next, &mut queue); }
         }
     });
@@ -267,7 +309,7 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
         let scratch = config.data_dir.join("worker-scratch");
         let dir = config.data_dir.join("pi").join("worker");
         while !worker_stop.load(Ordering::Relaxed) {
-            let mut sink = Sink { out: &out, guild: 0, user: 0, speed: config.speech_speed };
+            let mut sink = Sink { out: &out, guild: 0, user: 0 };
             let mut start = || {
 
                 let shell_bin = config.shell.parent().map(PathBuf::from).unwrap_or_default();
@@ -287,6 +329,13 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_burst_of_voice_lines_becomes_one_message() {
+        let heard = |s: &str, t: &str| (s.to_string(), t.to_string());
+        let merged = merge_voice(0, &[heard("Jake", "so I was"), heard("Jake", "saying"), heard("Mia", "wait what"), heard("Jake", "never mind")]);
+        assert_eq!(merged, format!("[{}] [voice transcript]\nJake: so I was saying\nMia: wait what\nJake: never mind", schedule::stamp(0)));
+    }
 
     #[test]
     fn prompts_tell_the_agent_where_the_message_came_from() {
