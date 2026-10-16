@@ -100,6 +100,8 @@ fn prepare(init: &Bootstrap) -> Result<(), String> {
     for entry in std::fs::read_dir(data.join("media")).map_err(|e| e.to_string())? { let p = entry.map_err(|e| e.to_string())?.path(); if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) }.map_err(|e| e.to_string())?; }
     // Drop every root capability before starting speech, Pi or Discord.
     if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 || unsafe { libc::setgid(1000) } != 0 || unsafe { libc::setuid(1000) } != 0 { return Err("Unable to drop runtime privileges.".into()); }
+    // WSL starts root in /root, which Pi's child processes cannot enter after the uid change.
+    std::env::set_current_dir(data).map_err(|e| e.to_string())?;
     std::env::set_var("HOME", "/home/wallis");
     std::env::set_var("PATH", "/opt/wallis/tools/bun:/opt/wallis/tools/pi:/opt/wallis/tools/node/node_modules/.bin:/usr/local/bin:/usr/bin:/bin");
     Ok(())
@@ -204,9 +206,12 @@ impl Server {
 }
 
 fn self_check() -> Result<(),String> {
+    #[cfg(target_os = "linux")]
+    std::env::set_current_dir("/root").map_err(|e|e.to_string())?;
     let init = Bootstrap { config: WallisConfig::default(), roles: Roles::default(), files: Default::default() };
     prepare(&init)?;
     let data = Path::new(DATA);
+    wallis_core::pi_config::install_packages("/opt/wallis/tools/pi/pi", &data.join("pi/realtime"), &wallis_core::pi_config::with_persona(&[]))?;
     std::fs::write(data.join("pi/realtime/secret-probe"),"private").map_err(|e|e.to_string())?;
     let status = std::process::Command::new("sudo").args(["-n","-u","worker","--","touch","/var/lib/wallis/pi/worker/secret-probe"]).status().map_err(|e|e.to_string())?;
     if !status.success() { return Err("Unable to create worker isolation probe.".into()); }
