@@ -22,6 +22,12 @@ const tools = [
     async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "say", params)); },
   }),
   defineTool({
+    name: "stop_speaking", label: "Stop speaking",
+    description: "Interrupt yourself: stop current and queued speech. Use only when you choose to stop or change course; then call say if you want to say something else. New transcripts do not stop your speech.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _update, ctx) { return text(await callHost(ctx, "stop_speaking", {})); },
+  }),
+  defineTool({
     name: "message", label: "Message",
     description: "Post a text message in an allowed Discord channel.",
     parameters: Type.Object({ channelId: Type.String(), text: Type.String() }),

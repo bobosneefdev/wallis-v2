@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub trait Discord {
     fn scope(&mut self, _guild: u64, _user: u64) {}
     fn say(&mut self, text: &str) -> Result<(), String>;
+    /// Stops current and queued speech when Wallis chooses to interrupt himself.
+    fn stop_speaking(&mut self) -> Result<(), String> { Err("Only the live Wallis can stop speaking.".into()) }
     fn message(&mut self, channel_id: &str, text: &str) -> Result<(), String>;
     fn file(&mut self, channel_id: &str, filename: &str, content: &str, text: &str) -> Result<(), String>;
     fn queue(&mut self, _path: &Path, _title: &str) -> Result<(), String> { Err("Music unavailable.".into()) }
@@ -80,6 +82,7 @@ impl<D: Discord> Host<'_, D> {
             "stop_audio" => self.discord.stop_audio().map(|_| "Music stopped.".into()),
             "volume" => call.args.get("percent").and_then(Value::as_u64).filter(|p| *p <= 100).ok_or_else(|| "Volume must be 0–100.".to_string()).and_then(|p| self.discord.volume(p as u32)).map(|_| "Volume changed.".into()),
             "say" => self.discord.say(&text("text")).map(|_| "Spoken.".to_string()),
+            "stop_speaking" => self.discord.stop_speaking().map(|_| "Stopped speaking.".into()),
             "update_profile" => update_profile(&self.profile, &call.args),
             "join_call" => match call.args.get("channelId").filter(|value| !value.is_null()) {
                 None => self.discord.join(None),
@@ -120,9 +123,10 @@ mod tests {
     use serde_json::json;
 
     #[derive(Default)]
-    struct Fake { spoken: Vec<String>, posted: Vec<(String, String)>, joined: Vec<Option<u64>>, left: bool, in_call: Option<u64>, music: Vec<String> }
+    struct Fake { stopped: bool, spoken: Vec<String>, posted: Vec<(String, String)>, joined: Vec<Option<u64>>, left: bool, in_call: Option<u64>, music: Vec<String> }
     impl Discord for Fake {
         fn say(&mut self, text: &str) -> Result<(), String> { self.spoken.push(text.into()); Ok(()) }
+        fn stop_speaking(&mut self) -> Result<(), String> { self.stopped = true; self.spoken.clear(); Ok(()) }
         fn message(&mut self, channel_id: &str, text: &str) -> Result<(), String> { self.posted.push((channel_id.into(), text.into())); Ok(()) }
         fn file(&mut self, _: &str, _: &str, _: &str, _: &str) -> Result<(), String> { Err("upload failed".into()) }
         fn join(&mut self, channel: Option<u64>) -> Result<u64, String> { self.joined.push(channel); self.in_call = Some(channel.unwrap_or(5)); Ok(channel.unwrap_or(5)) }
@@ -159,6 +163,20 @@ mod tests {
         assert_eq!(host.handle(call("stop_audio", json!({}))), "Music stopped.");
         assert_eq!(fake.music, vec![format!("queue:{}:Song", root.join("media/song.webm").canonicalize().unwrap().display()), "volume:40".into(), "skip".into(), "stop".into()]);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn speech_continues_until_wallis_explicitly_stops_it() {
+        let (mut fake, jobs, reminders) = (Fake::default(), Jobs::open(":memory:").unwrap(), Reminders::open(":memory:").unwrap());
+        let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec![], skipped: false, profile: PathBuf::new() };
+        host.handle(call("say", json!({ "text": "Keep going." })));
+        host.handle(call("skip", json!({})));
+        assert!(!host.discord.stopped);
+        assert_eq!(host.discord.spoken, ["Keep going."]);
+        assert_eq!(host.handle(call("stop_speaking", json!({}))), "Stopped speaking.");
+        assert!(host.discord.stopped && host.discord.spoken.is_empty());
+        host.handle(call("say", json!({ "text": "Changed my mind." })));
+        assert_eq!(host.discord.spoken, ["Changed my mind."]);
     }
 
     #[test]

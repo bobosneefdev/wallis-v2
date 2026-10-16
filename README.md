@@ -1,6 +1,6 @@
 # Wallis
 
-A Windows desktop Discord companion built with Tauri, Svelte, Twilight and Songbird. Wallis 0.4.0 runs the bot, agents, local speech, music and browser inside a private **WSL2** distro. Pi runs the realtime and worker agents; Mnemosyne provides local memory.
+A Windows desktop Discord companion built with Tauri, Svelte, Twilight and Songbird. Wallis 0.4.1 runs the bot, agents, local speech, music and browser inside a private **WSL2** distro. Pi runs the realtime and worker agents; Mnemosyne provides local memory.
 
 Install WSL2 before first setup: run `wsl --install --no-distribution` as administrator, restart Windows, then open Wallis. Virtualization must be enabled. First setup downloads a versioned, checksummed Ubuntu 26.04 runtime with CPU speech models and browser tools. It needs several GB of disk space. The Windows desktop manages settings, sign-in and updates; runtime control uses stdin/stdout without a listening port.
 
@@ -19,7 +19,7 @@ Stock commands:
 - `/queue`, `/skip`, `/stop` and `/volume percent` control music.
 - `/browse question` delegates web research using Clearcote and agent-browser.
 
-Music plays independently of speech and drops to 25% of its set volume while Wallis talks. Interrupting him stops speech without cutting the song. Downloads cap at 50 MiB and 20 minutes; each song is deleted after playback, and stale media is cleared at startup. Playback remains subject to the source's access restrictions, terms and applicable rights.
+Music plays independently of speech and drops to 25% of its set volume while Wallis talks. When he chooses to interrupt himself, speech stops without cutting the song. Downloads cap at 50 MiB and 20 minutes; each song is deleted after playback, and stale media is cleared at startup. Playback remains subject to the source's access restrictions, terms and applicable rights.
 
 Anyone on the configured Discord allow-list can request features or use commands in allowed output channels. The desktop **Commands** page lists mods and lets the owner disable or delete them. Deleted stock commands stay deleted. A disabled/deleted command cannot be run through the worker. Discord may take time to propagate global command changes.
 
@@ -31,7 +31,7 @@ Mod format: `mods/<name>/{mod.json,index.ts}`. See [the mod guide](skills/wallis
 
 Parakeet TDT 0.6B v3 INT8 runs through Sherpa-ONNX; Pocket TTS 3.3.0 uses English September 2026 preset-only weights. Both run on CPU with pinned CPU PyTorch. No GPU or Hugging Face account is required. Speech models total approximately 712 MB for one preset, plus Python packages. The rootfs includes Alba, Marius and Javert.
 
-Pocket streams 24 kHz mono float PCM directly into Songbird. Speaking speed adjusts playback rate and pitch; 1.0 preserves the voice. Saved Whisper, Parakeet 110M and Piper settings migrate to the current defaults. STT supports 25 European languages with automatic detection.
+Pocket streams 24 kHz mono float PCM directly into Songbird. Speaking speed adjusts playback rate and pitch; 1.0 preserves the voice. Saved Whisper, Parakeet 110M and Piper settings migrate to the current defaults. STT supports 25 European languages with automatic detection. New transcriptions reach Wallis while he responds without stopping playback. He normally finishes his thought, but can choose `stop_speaking` to stop current and queued speech before saying something else.
 
 ## Time
 
@@ -54,7 +54,7 @@ The desktop requires Windows for DPAPI and WSL lifecycle checks. Linux desktop b
 Build the release image on an Ubuntu host with root privileges:
 
 ```sh
-sudo scripts/rootfs/build.sh target/release/wallis-bot /path/to/output 0.4.0
+sudo scripts/rootfs/build.sh target/release/wallis-bot /path/to/output 0.4.1
 ```
 
 This produces `wallis-rootfs.tar.gz` and its checksum after sandbox, browser, mod and real speech roundtrip checks. The release workflow builds the Linux image first, then publishes it with the Windows installer under the matching version tag. Inside an imported test distro, run `/opt/wallis/bin/wallis-bot --self-check` as root for uid/filesystem isolation, browser navigation and a real Bun mod roundtrip. This initializes the workspace; use a disposable test distro. Stage `crates/wallis-core/py/speech_check.py` there and run it with `/opt/wallis/tools/venv/bin/python` as `wallis` to repeat the speech check.

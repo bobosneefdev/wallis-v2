@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn extension_ships_with_the_tools_and_the_role_gate() {
-        for tool in ["\"say\"", "\"message\"", "\"file\"", "\"skip\"", "\"delegate\"", "\"update_profile\""] { assert!(EXTENSION.contains(tool), "{tool}"); }
+        for tool in ["\"say\"", "\"stop_speaking\"", "\"message\"", "\"file\"", "\"skip\"", "\"delegate\"", "\"update_profile\""] { assert!(EXTENSION.contains(tool), "{tool}"); }
         assert!(EXTENSION.contains("WALLIS_ROLE") && EXTENSION.contains("service_tier"));
         let env = role_env(Role::Worker, &RoleConfig { fast: true, ..RoleConfig::default() });
         assert!(env.contains(&("WALLIS_ROLE", "worker".to_string())) && env.contains(&("WALLIS_FAST", "1".to_string())));

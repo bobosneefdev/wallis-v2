@@ -161,7 +161,7 @@ impl Out {
         self.runtime.block_on(async { call.lock().await.current_channel().map(|channel| channel.0.get()) })
     }
 
-    /// Drops everything queued (used when the user interrupts).
+    /// Stops current and queued speech when Wallis chooses to interrupt himself.
     pub fn stop_speaking(&self, guild: u64) {
         self.runtime.block_on(self.music.reset_speech(guild));
         if let Some(call) = self.songbird.get(Id::<GuildMarker>::new(guild)) { self.runtime.block_on(async { call.lock().await.queue().stop() }); }

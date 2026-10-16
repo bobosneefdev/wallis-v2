@@ -10,7 +10,7 @@ use wallis_core::agent::{Access, Agent};
 use wallis_core::host::{Discord, Host};
 use wallis_core::jobs::Jobs;
 use wallis_core::schedule::{self, Reminders};
-use wallis_core::participation::{interrupts, should_consider, sounds_like_wallis, Mode, Participation, State, Turn};
+use wallis_core::participation::{should_consider, sounds_like_wallis, Mode, Participation, State, Turn};
 use wallis_core::{pi_config, prompts};
 use wallis_core::role::{Role, RoleConfig};
 use wallis_core::stats::Stats;
@@ -47,6 +47,7 @@ impl Discord for Sink<'_> {
     fn stop_audio(&mut self) -> Result<(), String> { self.out.stop_audio(self.guild) }
     fn volume(&mut self, percent: u32) -> Result<(), String> { self.out.volume(self.guild, percent) }
     fn say(&mut self, text: &str) -> Result<(), String> { self.out.speak(self.guild, text, self.speed) }
+    fn stop_speaking(&mut self) -> Result<(), String> { self.out.stop_speaking(self.guild); Ok(()) }
     fn message(&mut self, channel_id: &str, text: &str) -> Result<(), String> { self.out.message(channel_id.parse().map_err(|_| "Bad channel id")?, text) }
     fn file(&mut self, channel_id: &str, filename: &str, content: &str, text: &str) -> Result<(), String> { self.out.file(channel_id.parse().map_err(|_| "Bad channel id")?, filename, content, text) }
     fn join(&mut self, channel: Option<u64>) -> Result<u64, String> { self.out.join(self.guild, self.user, channel) }
@@ -112,13 +113,12 @@ impl Brain {
             let mut steers = Vec::new();
             for event in queue.rx.try_iter().collect::<Vec<_>>() {
                 match event {
-                    Incoming::Voice { guild, user, speaker, pcm, .. } => {
-                        // Talking over Wallis cuts him off (noise and backchannel don't), then what they said steers the turn already underway.
+                    Incoming::Voice { speaker, pcm, .. } => {
+                        // Keep listening without stopping playback; Wallis decides whether to change course.
                         match speech::transcribe(&pcm) {
                             Ok(said) if !said.is_empty() => {
-                                if interrupts(&said) { out.stop_speaking(guild); }
                                 let text = turn_prompt(schedule::now(), Mode::Voice, 0, &speaker, &said);
-                                stats.steered(); stats.audit("heard", &format!("{speaker}: {said}")); stats.audit("steer", &text); steers.push(text); let _ = user;
+                                stats.steered(); stats.audit("heard", &format!("{speaker}: {said}")); stats.audit("steer", &text); steers.push(text);
                             }
                             Ok(_) => {}
                             Err(error) => eprintln!("wallis: {error}"),
@@ -169,7 +169,6 @@ impl Brain {
             }
             Incoming::Voice { guild, channel, user, speaker, pcm } => {
                 let said = match speech::transcribe(&pcm) { Ok(text) if !text.is_empty() => text, Ok(_) => return, Err(error) => return eprintln!("wallis: {error}") };
-                if interrupts(&said) { self.out.stop_speaking(guild); }
                 self.stats.audit("heard", &format!("{speaker}: {said}"));
                 if self.consider(Mode::Voice, user, sounds_like_wallis(&said)) { self.respond(guild, user, turn_prompt(schedule::now(), Mode::Voice, channel, &speaker, &said), queue); }
             }
