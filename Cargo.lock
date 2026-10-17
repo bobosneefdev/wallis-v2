@@ -6784,7 +6784,7 @@ dependencies = [
 
 [[package]]
 name = "wallis"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -6796,7 +6796,7 @@ dependencies = [
 
 [[package]]
 name = "wallis-bot"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "libc",
  "serde",
