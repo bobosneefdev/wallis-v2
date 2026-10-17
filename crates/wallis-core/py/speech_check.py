@@ -8,6 +8,7 @@ import time
 import urllib.request
 import wave
 import io
+import tempfile
 
 import torch
 assert torch.version.cuda is None, "Expected CPU-only PyTorch"
@@ -15,8 +16,9 @@ assert torch.version.cuda is None, "Expected CPU-only PyTorch"
 root = Path(sys.argv[1]).resolve()
 script = root / "tools/speech_server.py"
 model = root / "models/parakeet-0.6b-v3-int8/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+voices = tempfile.TemporaryDirectory()
 children = [subprocess.Popen([sys.executable, str(script), "stt", str(model), "4"]),
-            subprocess.Popen([sys.executable, str(script), "tts", str(root / "models/pocket/alba.safetensors"), "4"])]
+            subprocess.Popen([sys.executable, str(script), "tts", str(root / "models/pocket/alba.safetensors"), "4", voices.name])]
 
 
 def request(port, path, body):
@@ -40,6 +42,19 @@ try:
         connection, response = request(port, path, body)
         assert response.status == 400, response.status
         response.read()
+        connection.close()
+    # The model must reject unknown/corrupt voices and remain usable after each rejection.
+    (Path(voices.name) / "broken.safetensors").write_bytes(b"not a voice state")
+    for body, status in [(b'{"voice":"missing"}', 400), (b'{"voice":"broken"}', 500), (b'[]', 400), (b'{"voice":"../alba"}', 400), (b'{"voice":"alba"}', 200)]:
+        connection, response = request(8086, "/voice", body)
+        assert response.status == status, (body, response.status)
+        response.read()
+        connection.close()
+    for voice in ("alba", "marius", "javert", "alba"):
+        if not (root / f"models/pocket/{voice}.safetensors").is_file():
+            continue
+        connection, response = request(8086, "/synthesize", json.dumps({"text": "I can still speak.", "voice": voice}))
+        assert response.status == 200 and len(response.read()) > 24000, voice
         connection.close()
     start = time.monotonic()
     connection, response = request(8086, "/synthesize", json.dumps({"text": "Hello, this is a test of the Wallis voice."}))
@@ -71,9 +86,10 @@ try:
     connection, response = request(8086, "/synthesize", json.dumps({"text": "We can speak again."}))
     assert response.status == 200 and len(response.read()) > 24000
     connection.close()
-    print(f"PASS: first sample {first_ms:.0f} ms; {len(samples) / 24000:.2f} s audio; transcript {text!r}; cancellation and validation")
+    print(f"PASS: first sample {first_ms:.0f} ms; {len(samples) / 24000:.2f} s audio; transcript {text!r}; cancellation, voice switching and invalid/corrupt voice recovery")
 finally:
     for child in children:
         child.terminate()
     for child in children:
         child.wait(timeout=10)
+    voices.cleanup()

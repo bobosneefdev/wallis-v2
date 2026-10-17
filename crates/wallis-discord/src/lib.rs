@@ -49,6 +49,8 @@ pub enum Incoming {
     MediaDelete { channel: u64, messages: Vec<u64> },
     /// A finished utterance of 48 kHz interleaved stereo PCM from an allow-listed speaker.
     Voice { guild: u64, channel: u64, user: u64, speaker: String, pcm: Vec<i16> },
+    /// Includes synthesis startup and mid-stream playback failures.
+    SpeechFailed { guild: u64, text: String, tuning: wallis_core::tuning::Tuning, generation: u64, retried: bool, error: String },
 }
 
 fn allowed(list: &[String], user: u64) -> bool { list.iter().any(|id| id == "*" || id == &user.to_string()) }
@@ -58,21 +60,62 @@ fn allowed(list: &[String], user: u64) -> bool { list.iter().any(|id| id == "*" 
 pub struct Out { http: Arc<Client>, songbird: Arc<Songbird>, runtime: tokio::runtime::Handle, cache: Arc<DefaultInMemoryCache>, settings: Settings, send: Send, music: Arc<music::Player>, application: Id<ApplicationMarker> }
 
 // Songbird opens the request when this track starts, so queued speech cannot block interruption.
-struct Pocket { text: String }
+#[derive(Clone)]
+struct Pocket { text: String, tuning: Arc<Mutex<wallis_core::tuning::Tuning>>, send: Send, guild: u64, generation: u64, retried: bool, reported: Arc<std::sync::atomic::AtomicBool> }
+
+impl Pocket {
+    fn report(&self, error: String) {
+        if self.reported.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
+        (self.send)(Incoming::SpeechFailed { guild: self.guild, text: self.text.clone(), tuning: self.tuning.lock().expect("speech tuning poisoned").clone(), generation: self.generation, retried: self.retried, error });
+    }
+}
+
+// Songbird treats next_packet I/O errors as EOF, so report stream failures before it reads them.
+struct PocketStream<R> { stream: R, pocket: Pocket, bytes: usize }
+impl<R: std::io::Read> std::io::Read for PocketStream<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.stream.read(buf) {
+            Ok(n) => {
+                self.bytes += n;
+                if n == 0 && !buf.is_empty() && (self.bytes == 0 || !self.bytes.is_multiple_of(4)) { self.pocket.report("Speech returned empty or incomplete PCM.".into()); }
+                Ok(n)
+            }
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::Interrupted { self.pocket.report(error.to_string()); }
+                Err(error)
+            }
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl Compose for Pocket {
     fn create(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
-        let stream = wallis_core::speech::synthesize_stream(&self.text).map_err(|error| {
+        let tuning = wallis_core::tuning::current();
+        *self.tuning.lock().expect("speech tuning poisoned") = tuning.clone();
+        let stream = wallis_core::speech::synthesize_stream(&self.text, &tuning).map_err(|error| {
             eprintln!("wallis: {error}");
             AudioStreamError::Fail(error.into())
         })?;
         // ponytail: speed changes pitch; add time stretching when pitch-preserving speed is required.
-        let rate = (24_000.0 / wallis_core::tuning::current().speed).round() as u32;
+        let rate = (24_000.0 / tuning.speed).round() as u32;
+        let stream = PocketStream { stream, pocket: self.clone(), bytes: 0 };
         Ok(AudioStream { input: Box::new(RawAdapter::new(ReadOnlySource::new(stream), rate, 1)) })
     }
     async fn create_async(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> { Err(AudioStreamError::Unsupported) }
     fn should_create_async(&self) -> bool { false }
+}
+
+#[async_trait::async_trait]
+impl VoiceHandler for Pocket {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        let error = match ctx {
+            EventContext::Track(tracks) => tracks.first().map(|(state, _)| format!("{:?}", state.playing)).unwrap_or_else(|| "Speech playback failed.".into()),
+            _ => "Speech playback failed.".into(),
+        };
+        self.report(error);
+        Some(Event::Cancel)
+    }
 }
 
 impl Out {
@@ -134,13 +177,20 @@ impl Out {
     /// Queues a live Pocket PCM stream. Songbird resamples to Discord's 48 kHz stereo.
     /// Voice, speed and sampling are read when each sentence starts playing, so a tuning change reaches speech already queued.
     pub fn speak(&self, guild: u64, text: &str) -> Result<(), String> {
+        self.speak_retry(guild, text, false)
+    }
+
+    pub(crate) fn speak_retry(&self, guild: u64, text: &str, retried: bool) -> Result<(), String> {
         let call = self.songbird.get(Id::<GuildMarker>::new(guild)).ok_or("Wallis is not in a voice channel.")?;
         if text.trim().is_empty() || text.chars().count() > 16_000 { return Err("Speech must contain 1–16000 characters.".into()); }
-        let input = Input::Lazy(Box::new(Pocket { text: text.into() }));
         self.runtime.block_on(async {
             let end = self.music.speaking(guild).await;
-            let track = call.lock().await.enqueue_with_preload(input.into(), None);
-            let _ = track.add_event(Event::Track(songbird::events::TrackEvent::End), end);
+            let pocket = Pocket { text: text.into(), tuning: Arc::new(Mutex::new(wallis_core::tuning::current())), send: self.send.clone(), guild, generation: end.generation, retried, reported: Default::default() };
+            let mut track = songbird::tracks::Track::new(Input::Lazy(Box::new(pocket.clone())));
+            // Register before enqueueing: a lazy source can fail as soon as it starts.
+            track.events.add_event(songbird::events::EventData::new(Event::Track(songbird::events::TrackEvent::Error), pocket), std::time::Duration::ZERO);
+            track.events.add_event(songbird::events::EventData::new(Event::Track(songbird::events::TrackEvent::End), end), std::time::Duration::ZERO);
+            call.lock().await.enqueue_with_preload(track, None);
         });
         Ok(())
     }
@@ -187,6 +237,8 @@ impl Out {
     /// The voice channel Wallis is in, if any.
     /// Sentences queued or being spoken right now.
     pub fn pending_speech(&self, guild: u64) -> usize { self.runtime.block_on(self.music.pending_speech(guild)) }
+
+    pub(crate) fn speech_generation(&self, guild: u64) -> u64 { self.runtime.block_on(self.music.speech_generation(guild)) }
 
     pub fn voice_channel(&self, guild: u64) -> Option<u64> {
         let call = self.songbird.get(Id::<GuildMarker>::new_checked(guild)?)?;
@@ -467,6 +519,29 @@ mod speech_tests {
         assert_eq!(user, 42);
         assert!(allowed(&receive.settings.allowed_users, user));
         assert!(!allowed(&receive.settings.allowed_users, 43));
+    }
+
+    #[tokio::test]
+    async fn playback_errors_report_the_actual_tuning_and_retry_budget() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> { Err(std::io::Error::other("broken speech stream")) }
+        }
+        for prefix in [0, 24_000] {
+            let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+            let failed = wallis_core::tuning::Tuning { voice: "test-voice".into(), temp: 0.8, ..Default::default() };
+            let pocket = Pocket { text: "Keep this reply".into(), tuning: Arc::new(Mutex::new(failed.clone())), send: Arc::new(move |event| { let _ = send.send(event); }), guild: 1, generation: 7, retried: prefix > 0, reported: Default::default() };
+            let source = std::io::Read::chain(std::io::Read::take(std::io::repeat(0), prefix), Broken);
+            let mut stream = PocketStream { stream: source, pocket: pocket.clone(), bytes: 0 };
+            let mut audio = Vec::new();
+            assert!(std::io::Read::read_to_end(&mut stream, &mut audio).is_err());
+            assert_eq!(audio.len(), prefix as usize);
+            let event = receive.try_recv().unwrap();
+            let Incoming::SpeechFailed { guild, text, tuning, generation, retried, .. } = event else { panic!("expected speech failure") };
+            assert_eq!((guild, text.as_str(), tuning, generation, retried), (1, "Keep this reply", failed, 7, prefix > 0));
+            pocket.act(&EventContext::Track(&[])).await;
+            assert!(receive.try_recv().is_err(), "a stream error and track error must trigger only one recovery");
+        }
     }
 
     #[test]

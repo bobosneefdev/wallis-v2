@@ -110,7 +110,7 @@ impl<D: Discord> Host<'_, D> {
             "volume" => call.args.get("percent").and_then(Value::as_u64).filter(|p| *p <= 100).ok_or_else(|| "Volume must be 0–100.".to_string()).and_then(|p| self.discord.volume(p as u32)).map(|_| "Volume changed.".into()),
             // Speech is spoken in order, so a long queue means he is talking about the past. Make him catch up instead of piling on.
             "say" if self.discord.pending_speech() >= MAX_QUEUED_SPEECH => Err(format!("You already have {} sentences waiting to be spoken, so you are falling behind the conversation. Call stop_speaking, then say one short line that fits what is happening now.", self.discord.pending_speech())),
-            "say" => self.discord.say(&text("text")).map(|_| "Spoken.".to_string()),
+            "say" => self.discord.say(&text("text")).map(|_| "Queued for speech. Playback failures recover automatically.".to_string()),
             "stop_speaking" => self.discord.stop_speaking().map(|_| "Stopped speaking.".into()),
             "update_profile" => update_profile(&self.profile, &call.args),
             "tune" => call.args.as_object().ok_or_else(|| "Pass the settings to change.".to_string()).and_then(|changes| crate::tuning::update(self.data(), changes))
@@ -220,7 +220,7 @@ mod tests {
     fn routes_tools_enforces_write_channels_and_queues_delegations() {
         let (mut fake, jobs, reminders) = (Fake::default(), Jobs::open(":memory:").unwrap(), Reminders::open(":memory:").unwrap());
         let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec!["10".into()], skipped: false, profile: std::env::temp_dir().join(format!("wallis-host-profile-{}.json", std::process::id())) };
-        assert_eq!(host.handle(call("say", json!({ "text": "hi" }))), "Spoken.");
+        assert!(host.handle(call("say", json!({ "text": "hi" }))).starts_with("Queued for speech."));
         assert_eq!(host.handle(call("message", json!({ "channelId": "10", "text": "yo" }))), "Posted.");
         assert!(host.handle(call("message", json!({ "channelId": "99", "text": "no" }))).starts_with("Failed: Channel"));
         assert!(host.handle(call("file", json!({ "channelId": "10", "filename": "a.rs", "content": "x" }))).contains("upload failed"));
@@ -252,6 +252,7 @@ mod tests {
 
     #[test]
     fn voice_tools_tune_live_and_cloning_needs_the_hosts_switch() {
+        let _guard = crate::tuning::TEST_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!("wallis-host-voice-{}", std::process::id()));
         std::fs::create_dir_all(root.join("media")).unwrap();
         std::fs::write(root.join("media/johnny.wav"), "RIFF").unwrap();
