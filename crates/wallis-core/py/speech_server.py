@@ -58,7 +58,7 @@ def load(mode, path, threads, voices_dir=None):
     cache = {}
 
     def voice_state(name):
-        if not name.replace("_", "").replace("-", "").isalnum() or len(name) > 40:
+        if not isinstance(name, str) or not name.isascii() or not name.replace("_", "").replace("-", "").isalnum() or len(name) > 40:
             raise ValueError("Invalid voice name.")
         if name not in cache:
             for folder in (voices, pocket):
@@ -73,6 +73,11 @@ def load(mode, path, threads, voices_dir=None):
 
     voice_state(path.stem)
     cloner = []
+
+    def validate_voice(body):
+        request = json.loads(body)
+        voice_state(request.get("voice") if isinstance(request, dict) else None)
+        return b"{}"
 
     def clone(body):
         request = json.loads(body)
@@ -107,6 +112,7 @@ def load(mode, path, threads, voices_dir=None):
         return (chunk.detach().cpu().numpy().astype("<f4").tobytes()
                 for chunk in model.generate_audio_stream(state, text))
     synthesize.clone = clone
+    synthesize.validate_voice = validate_voice
     return synthesize
 
 def serve(mode, path, threads, voices_dir=None):
@@ -124,7 +130,9 @@ def serve(mode, path, threads, voices_dir=None):
 
         def do_POST(self):
             if mode == "tts" and self.path == "/clone":
-                return self.clone()
+                return self.control(inference.clone, "Voice cloning failed.")
+            if mode == "tts" and self.path == "/voice":
+                return self.control(inference.validate_voice, "Voice validation failed.")
             if self.path != ("/inference" if mode == "stt" else "/synthesize"):
                 return self.send_error(404)
             self.connection.settimeout(30)
@@ -165,18 +173,21 @@ def serve(mode, path, threads, voices_dir=None):
                 print(error, file=sys.stderr, flush=True)
                 self.close_connection = True  # No terminal chunk: the reader sees a failed stream.
 
-        def clone(self):
+        def control(self, action, failure):
             self.connection.settimeout(300)
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 10_000:
                     raise ValueError("Invalid body size.")
-                body = inference.clone(self.rfile.read(length))
+                request = self.rfile.read(length)
+                if len(request) != length:
+                    raise ValueError("Truncated request.")
+                body = action(request)
             except (ValueError, KeyError) as error:
-                return self.send_error(400, "Invalid clone request.", explain=str(error))
+                return self.send_error(400, "Invalid voice request.", explain=str(error))
             except Exception as error:
                 print(error, file=sys.stderr, flush=True)
-                return self.send_error(500, "Voice cloning failed.")
+                return self.send_error(500, failure)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

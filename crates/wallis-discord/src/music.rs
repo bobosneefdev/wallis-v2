@@ -69,6 +69,7 @@ impl Player {
         SpeechEnd { player: self.clone(), guild, generation: state.generation }
     }
     pub async fn pending_speech(&self, guild: u64) -> usize { self.guilds.lock().await.get(&guild).map_or(0, |s| s.speech) }
+    pub async fn speech_generation(&self, guild: u64) -> u64 { self.guilds.lock().await.get(&guild).map_or(0, |s| s.generation) }
     pub async fn reset_speech(&self, guild: u64) {
         let mut guilds = self.guilds.lock().await;
         if let Some(state) = guilds.get_mut(&guild) {
@@ -91,7 +92,7 @@ impl EventHandler for End {
         None
     }
 }
-pub(crate) struct SpeechEnd { player: Arc<Player>, guild: u64, generation: u64 }
+pub(crate) struct SpeechEnd { player: Arc<Player>, guild: u64, pub(crate) generation: u64 }
 #[async_trait::async_trait]
 impl EventHandler for SpeechEnd {
     async fn act(&self, _: &EventContext<'_>) -> Option<Event> {

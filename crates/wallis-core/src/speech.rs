@@ -56,12 +56,18 @@ pub fn transcribe(pcm_48k_stereo: &[i16]) -> Result<String, String> {
     Ok(clean_transcript(response["text"].as_str().ok_or("Parakeet returned no transcript field.")?))
 }
 
-/// Streaming 24 kHz mono little-endian f32 PCM in the live voice (`tuning::current`). Dropping the reader cancels the HTTP stream.
-pub fn synthesize_stream(text: &str) -> Result<impl Read + Send + Sync + 'static, String> {
-    let tuning = crate::tuning::current();
+/// Streaming 24 kHz mono little-endian f32 PCM. Dropping the reader cancels the HTTP stream.
+pub fn synthesize_stream(text: &str, tuning: &crate::tuning::Tuning) -> Result<impl Read + Send + Sync + 'static, String> {
     let response = ureq::post(format!("{TTS_URL}/synthesize")).config().timeout_recv_response(Some(std::time::Duration::from_secs(30))).timeout_recv_body(Some(std::time::Duration::from_secs(600))).build().send_json(serde_json::json!({ "text": text, "voice": tuning.voice, "temp": tuning.temp, "eos_threshold": tuning.eos_threshold }))
         .map_err(|error| format!("Pocket TTS failed: {error}"))?;
     Ok(response.into_body().into_reader())
+}
+
+/// Ask the running model to load the voice before accepting a persistent change.
+pub fn validate_voice(name: &str) -> Result<(), String> {
+    ureq::post(format!("{TTS_URL}/voice")).config().timeout_global(Some(std::time::Duration::from_secs(30))).build()
+        .send_json(serde_json::json!({ "voice": name })).map(|_| ())
+        .map_err(|error| format!("Unable to load voice {name:?}: {error}. Use list_voices to choose an installed voice; your settings have not changed."))
 }
 
 /// Turns a WAV already in the media folder into a voice named `name`, via the speech server. Needs cloning enabled.
@@ -77,7 +83,7 @@ pub fn clone_voice(name: &str, wav: &std::path::Path) -> Result<(), String> {
 /// Buffered roundtrip helper for the provisioning check; Discord uses synthesize_stream directly.
 pub fn synthesize(text: &str) -> Result<Vec<i16>, String> {
     let mut bytes = Vec::new();
-    synthesize_stream(text)?.read_to_end(&mut bytes).map_err(|error| format!("Pocket TTS stream failed: {error}"))?;
+    synthesize_stream(text, &crate::tuning::current())?.read_to_end(&mut bytes).map_err(|error| format!("Pocket TTS stream failed: {error}"))?;
     if bytes.len() % 4 != 0 { return Err("Pocket TTS returned incomplete PCM.".into()); }
     let mono: Vec<i16> = bytes.chunks_exact(4).map(|sample| (f32::from_le_bytes(sample.try_into().unwrap()).clamp(-1.0, 1.0) * 32767.0) as i16).collect();
     Ok(pocket_to_discord(&mono))

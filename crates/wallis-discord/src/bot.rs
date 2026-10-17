@@ -110,7 +110,7 @@ pub fn spawn_realtime_with(config: &BotConfig, persona: bool, system_prompt: &st
     Agent::spawn(&config.pi_program, Role::Realtime, &config.realtime, &dir, system_prompt, &cwd, None)
 }
 
-struct Brain { config: BotConfig, out: Out, jobs: Jobs, reminders: Reminders, stats: Arc<Stats>, agent: Option<Agent>, last_reply_at: Option<Instant>, last_reply_user: Option<u64>, next_consider_at: Instant, started: Instant, media: media::History, last_text_reply: Option<(u64, u64, Instant)> }
+struct Brain { config: BotConfig, out: Out, jobs: Jobs, reminders: Reminders, stats: Arc<Stats>, agent: Option<Agent>, last_reply_at: Option<Instant>, last_reply_user: Option<u64>, next_consider_at: Instant, started: Instant, media: media::History, last_text_reply: Option<(u64, u64, Instant)>, speech_notes: std::collections::HashMap<u64, String> }
 
 /// A new voice transcript is delivered by whether the agent is busy: `steer` into the running turn, or a fresh `prompt`.
 /// `rx` is read between Pi's events while it works; events that are not speech wait in `later` until the turn ends.
@@ -133,7 +133,8 @@ impl Brain {
         should_consider(&turn, &state, self.ms(now))
     }
 
-    fn respond(&mut self, guild: u64, user: u64, prompt: String, images: &[media::Image], queue: &mut Queue) {
+    fn respond(&mut self, guild: u64, user: u64, mut prompt: String, images: &[media::Image], queue: &mut Queue) {
+        if let Some(note) = self.speech_notes.remove(&guild) { prompt.push_str(&format!("\n[speech recovery] {note}")); }
         // Take the agent out for the turn so the host can borrow the job store at the same time.
         let mut agent = match self.agent() { Ok(_) => self.agent.take().expect("agent present"), Err(error) => return eprintln!("wallis: realtime agent unavailable: {error}") };
         let (out, write_channels) = (self.out.clone(), self.config.write_channels.clone());
@@ -197,6 +198,26 @@ impl Brain {
 
     fn handle(&mut self, event: Incoming, queue: &mut Queue) {
         match event {
+            Incoming::SpeechFailed { guild, text, tuning: failed, generation, retried, error } => {
+                // Ignore failures from speech that was deliberately stopped, including stale queued errors.
+                if self.out.speech_generation(guild) != generation { return; }
+                eprintln!("wallis: speech: {error}");
+                self.stats.audit("speech_error", &error);
+                self.out.stop_speaking(guild);
+                if !retried {
+                    let saved = tuning::recover(&self.config.data_dir, &failed);
+                    let note = format!("Speech failed ({error}). Safe speech settings were restored unless you already changed them. The failed sentence is being retried once. Do not repeat the failed tuning.{}", saved.err().map(|e| format!(" Recovery is live but could not be saved: {e}")).unwrap_or_default());
+                    self.speech_notes.insert(guild, note);
+                    if self.out.speak_retry(guild, &text, true).is_ok() { return; }
+                }
+                let channel = std::iter::once(&self.config.voice_text_channel).chain(&self.config.write_channels).find(|id| self.config.write_channels.contains(id) && id.parse::<u64>().is_ok()).and_then(|id| id.parse::<u64>().ok());
+                let delivered = if let Some(channel) = channel {
+                    let message: Vec<char> = format!("Voice playback is unavailable. Here is what I was saying:\n{text}").chars().collect();
+                    message.chunks(1900).try_for_each(|chunk| self.out.message(channel, &chunk.iter().collect::<String>()))
+                } else { Err("No allowed text output channel is configured.".into()) };
+                let delivery = match delivered { Ok(()) => "The failed reply was sent to an allowed text channel.".to_string(), Err(error) => { eprintln!("wallis: speech text fallback: {error}"); format!("Text fallback also failed: {error}") } };
+                self.speech_notes.insert(guild, format!("Speech failed even after recovery. {delivery} Use message for now; do not keep trying say or the failed tuning."));
+            }
             Incoming::Text { guild, channel, message, user, speaker, said, direct, mut media, reply } => {
                 self.stats.audit("typed", &format!("{speaker}: {said}"));
                 self.media.remember(channel, message, user, &media);
@@ -287,7 +308,7 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
     std::thread::spawn(move || {
         let (Ok(jobs), Ok(reminders)) = (Jobs::open(&brain_db), Reminders::open(&brain_db)) else { return };
         let now = Instant::now();
-        let mut brain = Brain { config: brain_config, out: brain_out, jobs, reminders, stats: brain_stats, agent: None, last_reply_at: None, last_reply_user: None, next_consider_at: now, started: now, media: media::History::default(), last_text_reply: None };
+        let mut brain = Brain { config: brain_config, out: brain_out, jobs, reminders, stats: brain_stats, agent: None, last_reply_at: None, last_reply_user: None, next_consider_at: now, started: now, media: media::History::default(), last_text_reply: None, speech_notes: Default::default() };
         let mut queue = Queue { rx: &receiver, later: Vec::new() };
         // Waking once a second is the reminder clock; events still arrive immediately.
         loop {

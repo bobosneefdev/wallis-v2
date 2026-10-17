@@ -15,7 +15,7 @@ pub struct Tuning {
     pub speed: f32,
     /// Pocket sampling temperature: higher is livelier and more varied, lower is flatter and steadier.
     pub temp: f32,
-    /// Pocket end-of-speech threshold: higher ends sentences sooner, lower lets them trail.
+    /// Pocket end-of-speech threshold: higher allows longer generation, lower ends sooner.
     pub eos_threshold: f32,
     /// Seconds between unprompted contributions.
     pub cooldown_secs: u32,
@@ -32,7 +32,7 @@ impl Default for Tuning {
 }
 
 impl Tuning {
-    /// Every value comes from a model, so it is clamped, never trusted.
+    /// Every value comes from a model, so validate it before applying it.
     pub fn validate(&self) -> Result<(), String> {
         let ranges = [("speed", self.speed, 0.5, 2.0), ("temp", self.temp, 0.05, 1.5), ("eos_threshold", self.eos_threshold, -8.0, 0.0)];
         for (name, value, low, high) in ranges { if !(low..=high).contains(&value) { return Err(format!("{name} must be between {low} and {high}.")); } }
@@ -70,6 +70,8 @@ impl Tuning {
 }
 
 static CURRENT: RwLock<Option<Tuning>> = RwLock::new(None);
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The live values. Before `load` they are the defaults.
 pub fn current() -> Tuning { CURRENT.read().ok().and_then(|t| t.clone()).unwrap_or_default() }
@@ -81,20 +83,47 @@ pub fn load(dir: &Path, seed: Tuning) -> Tuning {
     let seed_json = serde_json::to_string(&seed).unwrap_or_default();
     let fresh = std::fs::read_to_string(&marker).ok().as_deref() != Some(&seed_json);
     if fresh { let _ = std::fs::write(&marker, &seed_json); let _ = std::fs::remove_file(dir.join(FILE)); }
-    let tuning = std::fs::read_to_string(dir.join(FILE)).ok().and_then(|text| serde_json::from_str::<Tuning>(&text).ok()).filter(|t| t.validate().is_ok()).unwrap_or(seed);
+    let mut tuning = std::fs::read_to_string(dir.join(FILE)).ok().and_then(|text| serde_json::from_str::<Tuning>(&text).ok()).filter(|t| t.validate().is_ok()).unwrap_or(seed.clone());
+    if !dir.join("voices").join(format!("{}.safetensors", tuning.voice)).is_file() && !dir.join("models/pocket").join(format!("{}.safetensors", tuning.voice)).is_file() {
+        tuning.voice = seed.voice;
+    }
     if let Ok(mut slot) = CURRENT.write() { *slot = Some(tuning.clone()); }
     tuning
 }
 
 /// Applies `changes`, saves them and makes them current.
 pub fn update(dir: &Path, changes: &serde_json::Map<String, serde_json::Value>) -> Result<(Tuning, Vec<&'static str>), String> {
+    if changes.contains_key("voice") {
+        let mut next = current();
+        next.apply(changes)?;
+        crate::speech::validate_voice(&next.voice)?;
+    }
     let mut slot = CURRENT.write().map_err(|_| "Tuning is unavailable.".to_string())?;
     let mut tuning = slot.clone().unwrap_or_default();
     let changed = tuning.apply(changes)?;
-    let temporary = dir.join(format!("{FILE}.tmp"));
-    std::fs::write(&temporary, serde_json::to_vec_pretty(&tuning).map_err(|e| e.to_string())?).and_then(|_| std::fs::rename(&temporary, dir.join(FILE))).map_err(|error| format!("Unable to save the tuning: {error}"))?;
+    save(dir, &tuning)?;
     *slot = Some(tuning.clone());
     Ok((tuning, changed))
+}
+
+fn save(dir: &Path, tuning: &Tuning) -> Result<(), String> {
+    let temporary = dir.join(format!("{FILE}.tmp"));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(tuning).map_err(|e| e.to_string())?).and_then(|_| std::fs::rename(&temporary, dir.join(FILE))).map_err(|error| format!("Unable to save the tuning: {error}"))
+}
+
+/// Reset only failed speech settings. A late error must not overwrite a newer tune.
+/// Recovery takes effect even if the disk is full or unavailable.
+pub fn recover(dir: &Path, failed: &Tuning) -> Result<(), String> {
+    let mut slot = CURRENT.write().map_err(|_| "Tuning is unavailable.".to_string())?;
+    let mut next = slot.clone().unwrap_or_default();
+    if (next.voice.as_str(), next.speed, next.temp, next.eos_threshold) != (failed.voice.as_str(), failed.speed, failed.temp, failed.eos_threshold) { return Ok(()); }
+    let seed = std::fs::read_to_string(dir.join("tuning.seed")).ok().and_then(|s| serde_json::from_str::<Tuning>(&s).ok()).filter(|t| t.validate().is_ok()).unwrap_or_default();
+    next.voice = seed.voice;
+    next.speed = 1.0;
+    next.temp = Tuning::default().temp;
+    next.eos_threshold = Tuning::default().eos_threshold;
+    *slot = Some(next.clone());
+    save(dir, &next)
 }
 
 #[cfg(test)]
@@ -118,13 +147,31 @@ mod tests {
 
     #[test]
     fn updates_persist_and_are_current() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("wallis-tuning-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         load(&dir, Tuning::default());
-        update(&dir, &changes(json!({"voice":"johnny","speed":1.1}))).unwrap();
-        assert_eq!(current().voice, "johnny");
+        update(&dir, &changes(json!({"speed":1.1}))).unwrap();
+        let before = std::fs::read(dir.join(FILE)).unwrap();
+        assert!(update(&dir, &changes(json!({"voice":"../invalid","speed":1.9}))).is_err());
+        assert_eq!(std::fs::read(dir.join(FILE)).unwrap(), before, "a rejected voice must not change persisted settings");
+        assert_eq!(current().speed, 1.1);
         assert_eq!(load(&dir, Tuning::default()).speed, 1.1, "read back from disk");
         assert_eq!(load(&dir, Tuning { speed: 0.9, ..Tuning::default() }).speed, 0.9, "a changed desktop setting wins");
+        let failed = Tuning { voice: "missing".into(), temp: 1.5, speed: 2.0, eos_threshold: 0.0, cooldown_secs: 42, ..Default::default() };
+        save(&dir, &failed).unwrap();
+        assert_eq!(load(&dir, Tuning { speed: 0.9, ..Tuning::default() }).voice, "alba", "a missing saved voice cannot disable speech on startup");
+        *CURRENT.write().unwrap() = Some(failed.clone());
+        recover(&dir, &failed).unwrap();
+        let recovered = current();
+        assert_eq!((recovered.voice.as_str(), recovered.speed, recovered.temp, recovered.eos_threshold, recovered.cooldown_secs), ("alba", 1.0, 0.3, -4.0, 42));
+        assert_eq!(load(&dir, Tuning { speed: 0.9, ..Tuning::default() }), recovered, "recovery survives restart");
+        update(&dir, &changes(json!({"temp":0.6}))).unwrap();
+        recover(&dir, &failed).unwrap();
+        assert_eq!(current().temp, 0.6, "late playback errors must not overwrite newer settings");
+        let live = current();
         std::fs::remove_dir_all(dir).unwrap();
+        assert!(recover(&std::env::temp_dir().join("wallis-no-such-recovery-directory").join("child"), &live).is_err());
+        assert_eq!(current().temp, 0.3, "disk failure cannot prevent live recovery");
     }
 }
