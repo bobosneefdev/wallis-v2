@@ -6,21 +6,23 @@ pub struct Jobs(Connection);
 
 #[derive(Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Job { pub id: i64, pub task: String, pub channel_id: String, pub status: String, pub guild: u64, pub user: u64, pub result: Option<String> }
+/// `origin`: the text channel the job was asked in, or 0 when it was asked in the voice call.
+pub struct Job { pub id: i64, pub task: String, pub channel_id: String, pub status: String, pub guild: u64, pub user: u64, pub result: Option<String>, pub origin: u64 }
 
 impl Job {
     /// The private turn Wallis gets when his worker finishes: the user never saw the worker, so he is the one who tells them.
     pub fn prompt(&self, now: i64, in_call: Option<u64>, write_channels: &[String]) -> String {
         let task: String = self.task.chars().take(1500).collect();
         let result: String = self.result.as_deref().unwrap_or("").chars().take(12_000).collect();
-        let here = in_call.map(|id| format!("You are in voice channel {id} right now: tell them aloud.")).unwrap_or_else(|| format!("You are not in a call: tell them in a text channel (requested in {}; allowed: {}).", self.channel_id, write_channels.join(", ")));
+        let here = if self.origin != 0 { format!("This was asked in text channel {}, where they may not be in your call: reply with `message` in channel {} (written so it makes sense without any call context), not aloud, unless they asked otherwise.", self.origin, self.channel_id) }
+            else { in_call.map(|id| format!("You are in voice channel {id} right now: tell them aloud.")).unwrap_or_else(|| format!("You are not in a call: tell them in a text channel (requested in {}; allowed: {}).", self.channel_id, write_channels.join(", "))) };
         let outcome = if self.status == "done" { "finished" } else { "FAILED" };
         format!("[job finished] [{}] Your background worker {outcome} job {} (private: the user cannot see this and does not know a worker exists). You asked it: \"{task}\"\n\n--- its report ---\n{result}\n--- end ---\n{here} Say it as yourself, in your own words: if it is something to tell or show (jokes, findings), lead with a quick hook or a offer (\"got those jokes, want them?\") unless they are clearly waiting for it. Never mention workers, jobs or reports; if it failed, say you couldn't manage it and offer to try differently. Use `delegate` again if more work is needed.", crate::schedule::stamp(now), self.id)
     }
 }
 
 fn job(row: &rusqlite::Row) -> rusqlite::Result<Job> {
-    Ok(Job { id: row.get(0)?, task: row.get(1)?, channel_id: row.get(2)?, status: row.get(3)?, guild: row.get::<_, String>(4)?.parse().unwrap_or(0), user: row.get::<_, String>(5)?.parse().unwrap_or(0), result: row.get(6)? })
+    Ok(Job { id: row.get(0)?, task: row.get(1)?, channel_id: row.get(2)?, status: row.get(3)?, guild: row.get::<_, String>(4)?.parse().unwrap_or(0), user: row.get::<_, String>(5)?.parse().unwrap_or(0), result: row.get(6)?, origin: row.get::<_, String>(7)?.parse().unwrap_or(0) })
 }
 
 impl Jobs {
@@ -29,7 +31,7 @@ impl Jobs {
         db.execute_batch("CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, task TEXT NOT NULL, channel_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', result TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch()))")
             .map_err(|error| format!("Unable to prepare the job store: {error}"))?;
         db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
-        for name in ["guild", "user"] {
+        for name in ["guild", "user", "origin"] {
             let exists: bool = db.prepare("PRAGMA table_info(jobs)").map_err(|e| e.to_string())?.query_map([], |row| row.get::<_, String>(1)).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?.iter().any(|col| col == name);
             if !exists { db.execute(&format!("ALTER TABLE jobs ADD COLUMN {name} TEXT NOT NULL DEFAULT '0'"), []).map_err(|e| e.to_string())?; }
         }
@@ -41,7 +43,7 @@ impl Jobs {
 
     /// Finished (done or failed) jobs Wallis has not heard about yet, oldest first. Returning them is the claim: each is handed over once.
     pub fn take_finished(&self) -> Result<Vec<Job>, String> {
-        let mut statement = self.0.prepare("UPDATE jobs SET delivered=1 WHERE delivered=0 AND status IN ('done','failed') RETURNING id, task, channel_id, status, guild, user, result").map_err(|e| e.to_string())?;
+        let mut statement = self.0.prepare("UPDATE jobs SET delivered=1 WHERE delivered=0 AND status IN ('done','failed') RETURNING id, task, channel_id, status, guild, user, result, origin").map_err(|e| e.to_string())?;
         let mut jobs = statement.query_map([], job).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
         jobs.sort_by_key(|job| job.id);
         Ok(jobs)
@@ -55,11 +57,11 @@ impl Jobs {
     }
 
     pub fn enqueue(&self, task: &str, channel_id: &str) -> Result<i64, String> {
-        self.enqueue_scoped(task, channel_id, 0, 0)
+        self.enqueue_scoped(task, channel_id, 0, 0, 0)
     }
 
-    pub fn enqueue_scoped(&self, task: &str, channel_id: &str, guild: u64, user: u64) -> Result<i64, String> {
-        self.0.execute("INSERT INTO jobs (task, channel_id, guild, user) VALUES (?1, ?2, ?3, ?4)", params![task, channel_id, guild.to_string(), user.to_string()]).map_err(|error| error.to_string())?;
+    pub fn enqueue_scoped(&self, task: &str, channel_id: &str, guild: u64, user: u64, origin: u64) -> Result<i64, String> {
+        self.0.execute("INSERT INTO jobs (task, channel_id, guild, user, origin) VALUES (?1, ?2, ?3, ?4, ?5)", params![task, channel_id, guild.to_string(), user.to_string(), origin.to_string()]).map_err(|error| error.to_string())?;
         Ok(self.0.last_insert_rowid())
     }
 
@@ -80,7 +82,7 @@ impl Jobs {
     }
 
     pub fn with_status(&self, statuses: &[&str]) -> Result<Vec<Job>, String> {
-        let mut statement = self.0.prepare("SELECT id, task, channel_id, status, guild, user, result FROM jobs ORDER BY id").map_err(|error| error.to_string())?;
+        let mut statement = self.0.prepare("SELECT id, task, channel_id, status, guild, user, result, origin FROM jobs ORDER BY id").map_err(|error| error.to_string())?;
         let rows = statement.query_map([], job).map_err(|error| error.to_string())?;
         Ok(rows.filter_map(Result::ok).filter(|job| statuses.contains(&job.status.as_str())).collect())
     }
@@ -98,12 +100,20 @@ mod tests {
         drop(db);
         let jobs = Jobs::open(path.to_str().unwrap()).unwrap();
         assert_eq!((jobs.claim().unwrap().unwrap().guild,jobs.with_status(&["running"]).unwrap()[0].user),(0,0));
-        jobs.enqueue_scoped("music","10",u64::MAX,42).unwrap();
+        jobs.enqueue_scoped("music","10",u64::MAX,42,7).unwrap();
         drop(jobs);
         let jobs = Jobs::open(path.to_str().unwrap()).unwrap();
         let claimed = jobs.claim().unwrap().unwrap();
-        assert_eq!((claimed.guild,claimed.user),(u64::MAX,42));
+        assert_eq!((claimed.guild,claimed.user,claimed.origin),(u64::MAX,42,7));
         drop(jobs); std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn results_return_to_the_conversation_that_asked() {
+        let job = |origin| Job { id: 1, task: "jokes".into(), channel_id: "10".into(), status: "done".into(), guild: 1, user: 2, result: Some("ha".into()), origin };
+        let text = job(10).prompt(0, Some(77), &["10".into()]);
+        assert!(text.contains("asked in text channel 10") && text.contains("`message` in channel 10") && !text.contains("tell them aloud"));
+        assert!(job(0).prompt(0, Some(77), &[]).contains("tell them aloud") && job(0).prompt(0, None, &["10".into()]).contains("not in a call"));
     }
 
     #[test]

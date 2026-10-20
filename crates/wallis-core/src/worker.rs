@@ -13,7 +13,7 @@ pub fn run_next(jobs: &Jobs, discord: &mut impl Discord, start: &mut dyn FnMut()
     let outcome = (|| {
         crate::mods::check_budget(data)?;
         let reminders = crate::schedule::Reminders::open(&data.join("jobs.sqlite").to_string_lossy())?;
-        let mut host = crate::host::Host { discord, jobs, reminders: &reminders, guild: job.guild, user: job.user, write_channels: vec![job.channel_id.clone()], skipped: false, profile: data.join("profile.json") };
+        let mut host = crate::host::Host { discord, jobs, reminders: &reminders, guild: job.guild, user: job.user, write_channels: vec![job.channel_id.clone()], skipped: false, origin: 0, profile: data.join("profile.json") };
         let mut agent = start()?;
         agent.turn(&format!("Guild: {}. Requester: {}. Reply channel: {}.\n{}", job.guild, job.user, job.channel_id, job.task), idle_timeout, &mut |call| {
             if matches!(call.tool.as_str(), "queue_list" | "skip_audio" | "stop_audio" | "volume") { host.handle(call) } else { "Failed: This tool is unavailable to the worker.".into() }

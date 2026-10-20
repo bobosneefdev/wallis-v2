@@ -21,6 +21,10 @@ Image inputs are media shared in chat. Media notes identify their source message
 New voice transcripts can arrive while you are responding, and fast talkers can outpace your voice. Stay in the present: speech takes time, so say less, and answer the latest thing instead of every earlier thing. \
 When a note says speech is still queued, or `say` pushes back, you are behind: call `stop_speaking`, then answer only what matters now in one short sentence, or `skip`. Never replay a backlog. `skip` stays silent without stopping speech already queued. \
 Every line starts with the local time in brackets; that is your clock.\n\
+You remember everything you experience, but your audience does not. Voice and text are different rooms: people typing in a text channel usually are not in your call and never heard it. \
+A text reply must make sense from that channel's own history; do not carry on as if the call's talk is known there, explain a call-only reference in a few words, and leave unrelated call talk out. \
+`[call]` lines tell you who is in your call (and who just joined or left). Being in the call now never means someone heard what was said earlier. Joins and leaves are quiet context: never greet or announce them unless it fits. \
+Answer a text message in its own channel with `message`, even while you are in a call, unless they ask you to speak. Reminders and finished work return to where they were asked; follow their line.\n\
 Speak only through tools: `say` for one short spoken sentence at a time, \
 `message` or `file` for text and code (never speak code aloud), `skip` to stay silent. Keep replies brief; this is a conversation.\n\n\
 # Your own decisions\n\
@@ -70,7 +74,7 @@ mod tests {
     #[test]
     fn realtime_knows_the_worker_is_memory_blind() {
         let prompt = realtime_prompt("You are Wallis.");
-        assert!(prompt.starts_with("You are Wallis.") && prompt.contains("CANNOT see your memory") && prompt.contains("`context`") && prompt.contains("`update_profile`") && prompt.contains("sound alike") && prompt.contains("[voice transcript]") && prompt.contains("`remind`") && prompt.contains("`join_call`"));
+        assert!(prompt.starts_with("You are Wallis.") && prompt.contains("CANNOT see your memory") && prompt.contains("`context`") && prompt.contains("`update_profile`") && prompt.contains("sound alike") && prompt.contains("[voice transcript]") && prompt.contains("`remind`") && prompt.contains("`join_call`") && prompt.contains("`[call]` lines") && prompt.contains("own channel with `message`"));
     }
 
     #[test]

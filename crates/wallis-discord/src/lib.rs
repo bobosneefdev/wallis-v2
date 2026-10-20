@@ -49,6 +49,8 @@ pub enum Incoming {
     MediaDelete { channel: u64, messages: Vec<u64> },
     /// A finished utterance of 48 kHz interleaved stereo PCM from an allow-listed speaker.
     Voice { guild: u64, channel: u64, user: u64, speaker: String, pcm: Vec<i16> },
+    /// Someone joined, left or moved within Wallis's call. `from`/`to` are voice channel ids (0 = none); only changes touching his channel are sent.
+    Presence { guild: u64, user: u64, speaker: String, from: u64, to: u64 },
     /// Includes synthesis startup and mid-stream playback failures.
     SpeechFailed { guild: u64, text: String, tuning: wallis_core::tuning::Tuning, generation: u64, retried: bool, error: String },
 }
@@ -233,6 +235,17 @@ impl Out {
             self.songbird.remove(guild).await.map_err(|error| format!("Could not leave: {error}"))
         })
     }
+
+    /// Names of everyone (but Wallis) in voice channel `channel` right now, from Discord's voice-state cache.
+    pub fn voice_members(&self, channel: u64) -> Vec<(u64, String)> {
+        let Some(channel) = Id::new_checked(channel) else { return vec![] };
+        let me = self.cache.current_user().map(|user| user.id);
+        let mut members: Vec<(u64, String)> = self.cache.voice_channel_states(channel).into_iter().flatten().map(|state| state.user_id()).filter(|id| Some(*id) != me).map(|id| (id.get(), self.name(id.get()))).collect();
+        members.sort();
+        members
+    }
+
+    fn name(&self, user: u64) -> String { Id::<UserMarker>::new_checked(user).and_then(|id| self.cache.user(id).map(|u| u.name.clone())).unwrap_or_else(|| user.to_string()) }
 
     /// The voice channel Wallis is in, if any.
     /// Sentences queued or being spoken right now.
@@ -443,8 +456,18 @@ pub async fn run(settings: Settings, ready: impl FnOnce(Out) + std::marker::Send
             Ok(event) => event,
             Err(_) => continue,
         };
+        // The cache overwrites the old channel, so read it before updating.
+        let before = if let Gateway::VoiceStateUpdate(update) = &event { update.guild_id.map(|guild| (guild, cache.voice_state(update.user_id, guild).map(|state| state.channel_id().get()).unwrap_or(0))) } else { None };
         cache.update(&event);
         songbird.process(&event).await;
+        if let (Gateway::VoiceStateUpdate(update), Some((guild, from))) = (&event, before) {
+            let (user, to) = (update.user_id.get(), update.channel_id.map(|id| id.get()).unwrap_or(0));
+            let mine = match songbird.get(guild) { Some(call) => call.lock().await.current_channel().map(|channel| channel.0.get()), None => None };
+            if update.user_id != me.id && from != to && mine.is_some_and(|mine| mine == from || mine == to) && allowed(&bot.settings.allowed_users, user) {
+                let speaker = update.member.as_ref().and_then(|member| member.nick.clone()).unwrap_or_else(|| update.member.as_ref().map(|member| member.user.name.clone()).unwrap_or_else(|| user.to_string()));
+                (bot.send)(Incoming::Presence { guild: guild.get(), user, speaker, from, to });
+            }
+        }
         match event {
             Gateway::Ready(ready) => (bot.send)(Incoming::Ready { bot_id: ready.user.id.get() }),
             Gateway::MessageCreate(message) => bot.message(&message).await,

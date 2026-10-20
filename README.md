@@ -55,6 +55,10 @@ Wallis (realtime) is the only face people see. `delegate` takes a brief that say
 
 Every turn starts with local time. `remind`, `cancel_reminder` and `list_reminders` store first-person notes in `jobs.sqlite`. A due reminder arrives as a normal turn (`[reminder] …`); it fires once and survives restarts. Wallis chooses whether to join or leave voice through conversation.
 
+### Voice and text stay separate rooms
+
+Wallis has one memory but gives every conversation its own audience. While he is in a call, each turn carries `[call]` lines: the roster the first time he hears the call, then quiet joins, leaves and moves (never greetings), and, for text messages, whether the author is in the call. Text is answered in its own channel and must read sensibly from that channel's history. Only speech from the same call steers an active voice reply, and each voice or text channel keeps its own cooldown and follow-up window. Reminders and finished worker jobs remember the text channel (or call) where they began and return there.
+
 ## Development checks
 
 ```sh
