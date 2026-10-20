@@ -9,7 +9,6 @@ use wallis_core::{update, wsl::Session};
 
 const CONFIG_FILE: &str = "config.json";
 const TOKEN_FILE: &str = "discord-token.dpapi";
-const HF_TOKEN_FILE: &str = "huggingface-token.dpapi";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Default)]
@@ -116,9 +115,7 @@ fn start_inner(state: &AppState) -> Result<RuntimeStatus,String> {
     validate_voice(&mut config)?; validate_discord_channels(&mut config)?; validate_allowed_users(&config.discord_allowed_users)?;
     roles(&data)?;
     set_progress(state,"Starting the Linux runtime…");
-    // Cloning needs both the host's acceptance and their own Hugging Face token; without either the bot switches it off.
-    let hf = if config.cloning_consent { unprotect_token(&data.join(HF_TOKEN_FILE)).ok() } else { None };
-    let result = request(state,"start_wallis",serde_json::json!({"token":token,"hfToken":hf}));
+    let result = request(state,"start_wallis",serde_json::json!({"token":token}));
     set_progress(state,"");
     serde_json::from_value(result?).map_err(|e|e.to_string())
 }
@@ -273,33 +270,14 @@ async fn save_discord_token(token: String, app: tauri::AppHandle) -> Result<Secr
     }).await.map_err(|e|e.to_string())?
 }
 
-/// Stores (or with an empty value removes) the Hugging Face token used only to download Kyutai's gated cloning weights.
-#[tauri::command(rename_all = "camelCase")]
-async fn save_hf_token(token: String, app: tauri::AppHandle) -> Result<SecretStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let path = app_data(&state)?.join(HF_TOKEN_FILE);
-        reset_runtime(&state)?;
-        if token.is_empty() { let _ = std::fs::remove_file(&path); return Ok(SecretStatus { has_token: false }); }
-        validate_secret(&token, "Hugging Face token")?;
-        protect_token(&path, &token)?;
-        Ok(SecretStatus { has_token: true })
-    }).await.map_err(|e|e.to_string())?
-}
-
-#[tauri::command]
-fn get_hf_token_status(state: State<'_, AppState>) -> Result<SecretStatus, String> {
-    Ok(SecretStatus { has_token: app_data(&state)?.join(HF_TOKEN_FILE).is_file() })
-}
-
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VoiceOption { id: String, label: String, megabytes: u32 }
 
 #[tauri::command]
 fn get_voice_options() -> (Vec<VoiceOption>, Vec<VoiceOption>) {
-    let map = |list: &[(&str, &str, &str, u32)]| list.iter().map(|(id, label, _, megabytes)| VoiceOption { id: (*id).to_string(), label: (*label).to_string(), megabytes: *megabytes }).collect();
-    (map(&STT_MODELS), map(&TTS_VOICES))
+    let stt = STT_MODELS.iter().map(|(id, label, _, megabytes)| VoiceOption { id: (*id).to_string(), label: (*label).to_string(), megabytes: *megabytes }).collect();
+    (stt, TTS_VOICES.iter().map(|(id, label)| VoiceOption { id: (*id).to_string(), label: (*label).to_string(), megabytes: 0 }).collect())
 }
 
 #[tauri::command]
@@ -352,7 +330,7 @@ pub fn run() {
             std::thread::spawn(move || { let _ = start_inner(&handle.state::<AppState>()); });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_runtime_status, get_stats, get_audit_log, start_wallis, stop_wallis, get_config, save_config, get_secret_status, save_discord_token, save_hf_token, get_hf_token_status, get_profile, generate_wallis, lobotomize_wallis, get_progress, check_update, install_update, get_voice_options, get_jobs, retry_job, get_mods, set_mod_enabled, delete_mod, codex::codex_signed_in, codex::codex_sign_in, codex::codex_sign_out, codex::codex_models, codex::get_roles, codex::save_roles, codex::get_provider, codex::save_provider, codex::refresh_provider_models]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_runtime_status, get_stats, get_audit_log, start_wallis, stop_wallis, get_config, save_config, get_secret_status, save_discord_token, get_profile, generate_wallis, lobotomize_wallis, get_progress, check_update, install_update, get_voice_options, get_jobs, retry_job, get_mods, set_mod_enabled, delete_mod, codex::codex_signed_in, codex::codex_sign_in, codex::codex_sign_out, codex::codex_models, codex::get_roles, codex::save_roles, codex::get_provider, codex::save_provider, codex::refresh_provider_models]).run(tauri::generate_context!()).expect("error while running Wallis");
 }
 
 #[cfg(test)]
@@ -376,10 +354,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!("wallis-speech-migration-{}.json", std::process::id()));
         std::fs::write(&path, r#"{"sttModel":"small.en","ttsVoice":"high","ttsSpeed":0.7,"sttThreads":2,"discordAllowedUsers":"*"}"#).unwrap();
         let config = load_config_file(&path).unwrap();
-        assert_eq!((config.stt_model.as_str(), config.tts_voice.as_str(), config.tts_speed, config.stt_threads, config.discord_allowed_users.as_str()), ("parakeet-0.6b-v3-int8", "alba", 1.0, 2, "*"));
-        std::fs::write(&path, r#"{"sttModel":"parakeet-110m-int8","ttsVoice":"marius","ttsSpeed":0.8,"sttThreads":6,"discordAllowedUsers":"*"}"#).unwrap();
+        assert_eq!((config.stt_model.as_str(), config.tts_voice.as_str(), config.tts_speed, config.stt_threads, config.discord_allowed_users.as_str()), ("parakeet-0.6b-v3-int8", "emily", 1.0, 2, "*"));
+        std::fs::write(&path, r#"{"sttModel":"parakeet-110m-int8","ttsVoice":"paul","ttsSpeed":0.8,"sttThreads":6,"discordAllowedUsers":"*"}"#).unwrap();
         let config = load_config_file(&path).unwrap();
-        assert_eq!((config.stt_model.as_str(), config.tts_voice.as_str(), config.tts_speed, config.stt_threads), ("parakeet-0.6b-v3-int8", "marius", 0.8, 6));
+        assert_eq!((config.stt_model.as_str(), config.tts_voice.as_str(), config.tts_speed, config.stt_threads), ("parakeet-0.6b-v3-int8", "paul", 0.8, 6));
         save_config_file(&path, &config).unwrap();
         assert_eq!(load_config_file(&path).unwrap().stt_model, "parakeet-0.6b-v3-int8");
         std::fs::remove_file(path).unwrap();

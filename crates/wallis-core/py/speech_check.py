@@ -8,7 +8,6 @@ import time
 import urllib.request
 import wave
 import io
-import tempfile
 
 import torch
 assert torch.version.cuda is None, "Expected CPU-only PyTorch"
@@ -16,9 +15,8 @@ assert torch.version.cuda is None, "Expected CPU-only PyTorch"
 root = Path(sys.argv[1]).resolve()
 script = root / "tools/speech_server.py"
 model = root / "models/parakeet-0.6b-v3-int8/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
-voices = tempfile.TemporaryDirectory()
 children = [subprocess.Popen([sys.executable, str(script), "stt", str(model), "4"]),
-            subprocess.Popen([sys.executable, str(script), "tts", str(root / "models/pocket/alba.safetensors"), "4", voices.name])]
+            subprocess.Popen([sys.executable, str(script), "tts", str(root / "models/neutts-2e"), "4"])]
 
 
 def request(port, path, body):
@@ -29,7 +27,7 @@ def request(port, path, body):
 
 try:
     for port in (8085, 8086):
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + (60 if port == 8085 else 180)
         while True:
             assert all(child.poll() is None for child in children), "Speech server exited"
             try:
@@ -43,18 +41,15 @@ try:
         assert response.status == 400, response.status
         response.read()
         connection.close()
-    # The model must reject unknown/corrupt voices and remain usable after each rejection.
-    (Path(voices.name) / "broken.safetensors").write_bytes(b"not a voice state")
-    for body, status in [(b'{"voice":"missing"}', 400), (b'{"voice":"broken"}', 500), (b'[]', 400), (b'{"voice":"../alba"}', 400), (b'{"voice":"alba"}', 200)]:
-        connection, response = request(8086, "/voice", body)
-        assert response.status == status, (body, response.status)
+    # Unknown speakers, emotions and temperatures are rejected, and every speaker and emotion still speaks afterwards.
+    for body in (b'{"text":"Hi.","voice":"missing"}', b'{"text":"Hi.","emotion":"bored"}', b'{"text":"Hi.","temp":9}', b'{"text":"Hi.","voice":"../emily"}'):
+        connection, response = request(8086, "/synthesize", body)
+        assert response.status == 400, (body, response.status)
         response.read()
         connection.close()
-    for voice in ("alba", "marius", "javert", "alba"):
-        if not (root / f"models/pocket/{voice}.safetensors").is_file():
-            continue
-        connection, response = request(8086, "/synthesize", json.dumps({"text": "I can still speak.", "voice": voice}))
-        assert response.status == 200 and len(response.read()) > 24000, voice
+    for voice, emotion in (("emily", "neutral"), ("paul", "angry"), ("sophie", "happy"), ("steven", "sad"), ("emily", "surprised")):
+        connection, response = request(8086, "/synthesize", json.dumps({"text": "I can still speak.", "voice": voice, "emotion": emotion}))
+        assert response.status == 200 and len(response.read()) > 24000, (voice, emotion)
         connection.close()
     start = time.monotonic()
     connection, response = request(8086, "/synthesize", json.dumps({"text": "Hello, this is a test of the Wallis voice."}))
@@ -86,10 +81,9 @@ try:
     connection, response = request(8086, "/synthesize", json.dumps({"text": "We can speak again."}))
     assert response.status == 200 and len(response.read()) > 24000
     connection.close()
-    print(f"PASS: first sample {first_ms:.0f} ms; {len(samples) / 24000:.2f} s audio; transcript {text!r}; cancellation, voice switching and invalid/corrupt voice recovery")
+    print(f"PASS: first sample {first_ms:.0f} ms; {len(samples) / 24000:.2f} s audio; transcript {text!r}; cancellation, speaker and emotion switching, invalid settings recovery")
 finally:
     for child in children:
         child.terminate()
     for child in children:
         child.wait(timeout=10)
-    voices.cleanup()

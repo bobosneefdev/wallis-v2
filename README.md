@@ -29,15 +29,19 @@ Mod format: `mods/<name>/{mod.json,index.ts}`. See [the mod guide](skills/wallis
 
 ## Local speech
 
-Parakeet TDT 0.6B v3 INT8 runs through Sherpa-ONNX; Pocket TTS 3.3.0 uses English September 2026 preset-only weights. Both run on CPU with pinned CPU PyTorch. No GPU is required, and no Hugging Face account unless you enable voice cloning (below). Speech models total approximately 712 MB for one preset, plus Python packages. The rootfs includes Alba, Marius and Javert.
+Parakeet TDT 0.6B v3 INT8 runs through Sherpa-ONNX on CPU. Speech is [NeuTTS-2E](https://huggingface.co/neuphonic/neutts-2e-q4-gguf) (Q4 GGUF backbone, about 125M active parameters) with the NeuCodec decoder, run through a bundled [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server`. That one build carries every x86 CPU variant plus Vulkan, so it uses an NVIDIA, AMD or Intel GPU when WSL exposes one and falls back to the CPU otherwise. English only, four speakers (Emily, Paul, Sophie, Steven) and seven emotions (angry, disgusted, fearful, happy, neutral, sad, surprised); there is no whisper.
 
-Pocket streams 24 kHz mono float PCM directly into Songbird. Speaking speed adjusts playback rate and pitch; 1.0 preserves the voice. Saved Whisper, Parakeet 110M and Piper settings migrate to the current defaults. STT supports 25 European languages with automatic detection. New transcriptions reach Wallis while he responds without stopping playback. He normally finishes his thought, but can choose `stop_speaking` to stop current and queued speech before saying something else.
+Measured on a Ryzen 5 3600X with a 3 GB NVIDIA P106 (Vulkan): first audio about 0.7 s, generation at roughly 0.7x real time. CPU-only on six cores is close to real time, so a GPU helps. AMD GPUs are untested. The models are baked into the runtime image at build time, so users need no Hugging Face account. Every sentence is watermarked with Resemble's Perth watermarker, as NeuTTS requires.
 
-## Self-tuning voice and cloning
+NeuTTS streams 24 kHz mono float PCM directly into Songbird. Speaking speed adjusts playback rate and pitch; 1.0 preserves the voice. STT supports 25 European languages with automatic detection. New transcriptions reach Wallis while he responds without stopping playback. He normally finishes his thought, but can choose `stop_speaking` to stop current and queued speech before saying something else.
 
-Wallis adjusts his own delivery live, with no restart: the `tune` tool changes speed, voice, temperature, end-of-speech threshold, how eager he is to chime in (`cooldownSecs`, `followUpSecs`), pause length before he answers (`silenceMs`) and how easily he can be interrupted (`bargeInMs`). Changes persist in `tuning.json` and last until you change the matching setting in the desktop app. `list_voices` shows presets and clones. Voice changes must load successfully before they are saved. If speech fails, Wallis restores safe speech settings and retries once; if that also fails, he posts the reply in the configured voice text channel (or first allowed write channel). Recovery persists across restarts, and Wallis receives a failure note on his next turn. `eosThreshold` controls generation length: higher allows longer generation; lower ends sooner.
+## Self-tuning voice
 
-Voice cloning is off until you enable it in the desktop app's Discord and voice settings. Enabling it requires accepting that you, the host, are fully responsible for ensuring every clone is consensual and lawful, and a Hugging Face token whose account has accepted the terms of [kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts) (stored with Windows DPAPI like the Discord token). The cloning weights (checksummed) download on demand. Once enabled, Wallis clones from a clean WAV clip the worker prepares (for example from a YouTube video) with `clone_voice` and can switch to it immediately. Everything else works without a token.
+Wallis adjusts his own delivery live, with no restart: the `tune` tool changes speaker (`voice`), `emotion`, speed, temperature, how eager he is to chime in (`cooldownSecs`, `followUpSecs`), pause length before he answers (`silenceMs`) and how easily he can be interrupted (`bargeInMs`). Changes persist in `tuning.json` and last until you change the matching setting in the desktop app. `list_voices` shows the speakers and emotions. If speech fails, Wallis restores safe speech settings and retries once; if that also fails, he posts the reply in the configured voice text channel (or first allowed write channel). Recovery persists across restarts, and Wallis receives a failure note on his next turn.
+
+## Building the runtime image
+
+CI downloads NeuTTS-2E and NeuCodec from Hugging Face, where both are gated. Add a repository secret `HF_TOKEN`: a read token from an account that has accepted the terms of [neuphonic/neutts-2e-q4-gguf](https://huggingface.co/neuphonic/neutts-2e-q4-gguf) and [neuphonic/neucodec](https://huggingface.co/neuphonic/neucodec). For a local build, export `HF_TOKEN` before `scripts/rootfs/build.sh`.
 
 ## Staying in the conversation
 
@@ -89,5 +93,5 @@ Each turn examines at most four media items and twelve frames (at most six per i
 - [Clearcote](https://github.com/clearcotelabs/clearcote-browser): BSD-3-Clause and Chromium third-party notices; pinned open build 150.0.7871.114.
 - [agent-browser](https://github.com/vercel-labs/agent-browser): Apache-2.0; 0.39.1.
 - [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3): CC BY 4.0; Sherpa-ONNX export/quantization: Apache 2.0.
-- [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts): MIT code, CC BY 4.0 [ungated preset-only weights](https://huggingface.co/kyutai/pocket-tts-without-voice-cloning).
-- [Preset recordings](https://huggingface.co/kyutai/tts-voices): Alba MacKenna's casual voice is CC BY 4.0. Marius (Selfie) and Javert (Butter) are CC0 volunteer donations. Kyutai supplies preset states; source recordings are unchanged.
+- [NeuTTS-2E](https://huggingface.co/neuphonic/neutts-2e-q4-gguf) by Neuphonic: NeuTTS Open License v1.0 (copy in `licenses/` and in the image). Free for non-commercial use and for commercial use below US$5M annual revenue; above that a paid licence is required. Outputs are watermarked with [Perth](https://github.com/resemble-ai/Perth) (MIT).
+- [NeuCodec](https://huggingface.co/neuphonic/neucodec): Apache-2.0. [llama.cpp](https://github.com/ggml-org/llama.cpp): MIT, pinned to `dd002b9`.

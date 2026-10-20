@@ -33,7 +33,6 @@ export type WallisConfig = {
   ttsVoice: string;
   ttsSpeed: number;
   silenceMs: number;
-  cloningConsent: boolean;
 };
 
 export type Job = { id: number; task: string; channelId: string; status: string };
@@ -81,8 +80,6 @@ type Commands = {
   save_config: WallisConfig;
   get_secret_status: SecretStatus;
   save_discord_token: SecretStatus;
-  get_hf_token_status: SecretStatus;
-  save_hf_token: SecretStatus;
   get_profile: Profile;
   generate_wallis: Profile;
   lobotomize_wallis: void;
@@ -109,10 +106,9 @@ const fallback: WallisConfig = {
   onboarded: false,
   sttModel: "parakeet-0.6b-v3-int8",
   sttThreads: 4,
-  ttsVoice: "alba",
+  ttsVoice: "emily",
   ttsSpeed: 1,
   silenceMs: 350,
-  cloningConsent: false,
 };
 
 export function invoke<K extends keyof Commands>(command: K, args?: unknown): Promise<Commands[K]> {

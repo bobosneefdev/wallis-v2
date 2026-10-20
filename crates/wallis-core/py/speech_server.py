@@ -1,15 +1,14 @@
-"""CPU-only, loopback speech servers. Models and preset states are local files."""
+"""Loopback speech servers: Parakeet speech recognition and NeuTTS-2E speech. Models are local files."""
 import io
 import json
 from pathlib import Path
 import socket
 import sys
-import tempfile
 import wave
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
-def load(mode, path, threads, voices_dir=None):
+def load(mode, path, threads):
     if mode == "stt":
         import numpy as np
         import sherpa_onnx
@@ -34,89 +33,135 @@ def load(mode, path, threads, voices_dir=None):
             return json.dumps({"text": stream.result.text}).encode()
         return transcribe
 
-    import yaml
-    from pocket_tts import TTSModel
-    from pocket_tts.models.model_state import export_model_state
-    from pocket_tts.utils.config import CONFIGS_DIR
-    pocket = path.parent
-    voices = voices_dir  # Cloned voices: <name>.safetensors. Presets live beside the model.
+    return load_tts(path, threads)
 
-    def build(weights):
-        # Reuse the pinned package's architecture, replacing every network source.
-        config = yaml.safe_load((CONFIGS_DIR / "english_2026-09.yaml").read_text())
-        config["weights_path"] = str(weights)
-        config.pop("weights_path_without_voice_cloning", None)
-        config["flow_lm"]["lookup_table"]["tokenizer_path"] = str(pocket / "tokenizer.json")
-        with tempfile.TemporaryDirectory() as temporary:
-            local_config = Path(temporary) / "local.yaml"
-            local_config.write_text(yaml.safe_dump(config))
-            return TTSModel.load_model(config=local_config)
+SPEAKERS = ("emily", "paul", "sophie", "steven")
+EMOTIONS = ("angry", "disgusted", "fearful", "happy", "neutral", "sad", "surprised")
+LLAMA_PORT, HOP, CHUNK, LOOKAHEAD, LOOKBACK, OVERLAP = 8087, 480, 25, 5, 50, 1
 
-    model = build(pocket / "model.safetensors")
-    model.has_voice_cloning = False
-    default_temp, default_eos = model.temp, model.eos_threshold
-    cache = {}
+def load_tts(path, threads):
+    """NeuTTS-2E: a GGUF backbone served by a local llama-server (Vulkan GPU when there is one, else CPU), decoded by NeuCodec
+    and watermarked with Perth, as the model's licence requires. `path` holds the GGUF, NeuCodec's weights and the speakers' reference codes."""
+    import ctypes
+    import os
+    import re
+    import signal
+    import subprocess
+    import time
+    import unicodedata
+    import urllib.request
+    import numpy as np
+    import requests
+    import torch
+    import perth
+    from neucodec.codec_decoder_vocos import CodecDecoderVocos
 
-    def voice_state(name):
-        if not isinstance(name, str) or not name.isascii() or not name.replace("_", "").replace("-", "").isalnum() or len(name) > 40:
-            raise ValueError("Invalid voice name.")
-        if name not in cache:
-            for folder in (voices, pocket):
-                if folder and (folder / f"{name}.safetensors").is_file():
-                    if len(cache) >= 8:
-                        cache.pop(next(iter(cache)))
-                    cache[name] = model.get_state_for_audio_prompt(folder / f"{name}.safetensors")
-                    break
-            else:
-                raise ValueError(f"No voice named {name}.")
-        return cache[name]
+    torch.set_num_threads(max(1, threads // 2))
+    refs = json.loads((path / "speakers.json").read_text())
+    server = subprocess.Popen(
+        [str(path.parent.parent / "tools/llama/llama-server"), "-m", str(path / "neutts-2e-Q4_0.gguf"), "-ngl", "99", "-t", str(threads), "-c", "2048",
+         "--port", str(LLAMA_PORT), "--host", "127.0.0.1", "--no-webui", "-np", "1"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=sys.stderr,
+        preexec_fn=lambda: ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL))  # The backbone dies with this server, however this one ends.
+    deadline = time.monotonic() + 120
+    while True:
+        if server.poll() is not None:
+            raise RuntimeError("llama-server exited while loading the voice model.")
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{LLAMA_PORT}/health", timeout=1).close()
+            break
+        except OSError:
+            if time.monotonic() > deadline:
+                raise RuntimeError("llama-server did not start.")
+            time.sleep(0.2)
 
-    voice_state(path.stem)
-    cloner = []
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.generator = CodecDecoderVocos(hop_length=HOP)
+            self.fc_post_a = torch.nn.Linear(2048, 1024)
 
-    def validate_voice(body):
-        request = json.loads(body)
-        voice_state(request.get("voice") if isinstance(request, dict) else None)
-        return b"{}"
+        def forward(self, codes):
+            emb = self.generator.quantizer.get_output_from_indices(codes.transpose(1, 2)).transpose(1, 2)
+            return self.generator(self.fc_post_a(emb.transpose(1, 2)), vq=False)[0]
 
-    def clone(body):
-        request = json.loads(body)
-        name, audio = request.get("name"), Path(str(request.get("audio")))
-        if not isinstance(name, str) or (pocket / f"{name}.safetensors").is_file():
-            raise ValueError("Pick a new voice name that is not a built-in preset.")
-        voice_state_check = name.replace("_", "").replace("-", "")
-        if not voice_state_check.isalnum() or len(name) > 40 or not audio.is_file() or audio.suffix.lower() != ".wav":
-            raise ValueError("Cloning needs a voice name and a 16-bit WAV file.")
-        weights = voices.parent / "cloning" / "model.safetensors"
-        if not weights.is_file():
-            raise ValueError("Voice cloning is not enabled: the cloning weights are not installed.")
-        if not cloner:
-            cloner.append(build(weights))
-        state = cloner[0].get_state_for_audio_prompt(audio, truncate=True)
-        voices.mkdir(parents=True, exist_ok=True)
-        export_model_state(state, voices / f"{name}.safetensors")
-        cache.pop(name, None)
-        return json.dumps({"voice": name}).encode()
+    decoder = Decoder().eval()
+    weights = torch.load(path / "neucodec.bin", map_location="cpu", weights_only=True)
+    decoder.load_state_dict({k: v for k, v in weights.items() if k.startswith(("generator.", "fc_post_a."))}, strict=False)
+    del weights
+    watermark = perth.PerthImplicitWatermarker().apply_watermark
+
+    def decode(ids):
+        with torch.no_grad():
+            wav = decoder(torch.tensor(ids, dtype=torch.long)[None, None, :])[0, 0].numpy()
+        return watermark(wav, sample_rate=24_000)
+
+    def overlap_add(frames, stride):
+        total = max(stride * i + len(f) for i, f in enumerate(frames))
+        out, weight = np.zeros(total, np.float32), np.zeros(total, np.float32)
+        for i, frame in enumerate(frames):
+            w = (0.5 - np.abs(np.linspace(0, 1, len(frame) + 2, dtype=np.float32)[1:-1] - 0.5))
+            out[stride * i:stride * i + len(frame)] += w * frame
+            weight[stride * i:stride * i + len(frame)] += w
+        return out / weight
+
+    def tokens(prompt, temp, limit):
+        body = {"prompt": prompt, "n_predict": limit, "temperature": temp, "top_k": 50, "seed": int.from_bytes(os.urandom(4), "little"),
+                "stop": ["<|SPEECH_GENERATION_END|>"], "stream": True, "cache_prompt": True}
+        with requests.post(f"http://127.0.0.1:{LLAMA_PORT}/completion", json=body, stream=True, timeout=60) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith(b"data: "):
+                    found = re.findall(r"<\|speech_(\d+)\|>", json.loads(line[6:]).get("content", ""))
+                    yield from map(int, found)
+
+    def normalize(text):
+        return unicodedata.normalize("NFKC", text.translate(str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'})))
+
+    def stream(text, speaker, emotion, temp):
+        ref = refs[speaker]
+        mark = "" if emotion == "neutral" else f"<|{emotion.upper()}|>"
+        prompt = (f"<|TEXT_PROMPT_START|>{normalize(ref['text'])}{mark}{normalize(text)}<|TEXT_PROMPT_END|>"
+                  f"<|SPEECH_GENERATION_START|>{''.join(f'<|speech_{i}|>' for i in ref['codes'])}")
+        cache, frames, done_samples, done_tokens, stride = list(ref["codes"]), [], 0, len(ref["codes"]), CHUNK * HOP
+        # Speech runs about 15 characters a second; allow generously more than that so a model that fails to stop cannot ramble.
+        for token in tokens(prompt, temp, min(1200, 50 * (2 + len(text) // 6))):
+            cache.append(token)
+            if len(cache) - done_tokens >= CHUNK + LOOKAHEAD:
+                start = max(done_tokens - LOOKBACK - OVERLAP, 0)
+                wav = decode(cache[start:done_tokens + CHUNK + LOOKAHEAD + OVERLAP])
+                first = (done_tokens - start) * HOP
+                frames.append(wav[first:first + (CHUNK + 2 * OVERLAP) * HOP])
+                merged = overlap_add(frames, stride)[done_samples:len(frames) * stride]
+                done_samples, done_tokens = len(frames) * stride, done_tokens + CHUNK
+                yield merged.clip(-1, 1).astype("<f4").tobytes()
+        if len(cache) > done_tokens:
+            left = len(cache) - done_tokens
+            start = max(len(cache) - (LOOKBACK + OVERLAP + left), 0)
+            wav = decode(cache[start:])[(len(cache) - start - left - OVERLAP) * HOP:]
+            frames.append(wav)
+            yield overlap_add(frames, stride)[done_samples:].clip(-1, 1).astype("<f4").tobytes()
 
     def synthesize(body):
         request = json.loads(body)
-        text = request.get("text") if isinstance(request, dict) else None
-        if not isinstance(text, str) or not text.strip() or len(text) > 16000:
-            raise ValueError("Text must contain 1–16000 characters.")
-        state = voice_state(request.get("voice") or path.stem)
-        # The server handles one request at a time, so per-request sampling is safe to set here.
-        model.temp = float(request.get("temp") or default_temp)
-        model.eos_threshold = float(request.get("eos_threshold", default_eos))
-        if not 0.05 <= model.temp <= 1.5 or not -8.0 <= model.eos_threshold <= 0.0:
+        if not isinstance(request, dict):
+            raise ValueError("Expected a JSON object.")
+        text, speaker, emotion, temp = request.get("text"), request.get("voice", "emily"), request.get("emotion", "neutral"), request.get("temp", 1.0)
+        if not isinstance(text, str) or not text.strip() or len(text) > 2000:
+            raise ValueError("Text must contain 1\u20132000 characters.")
+        if speaker not in SPEAKERS or emotion not in EMOTIONS:
+            raise ValueError(f"Voice is one of {', '.join(SPEAKERS)}; emotion is one of {', '.join(EMOTIONS)}.")
+        if not isinstance(temp, (int, float)) or not 0.3 <= temp <= 1.5:
             raise ValueError("Sampling settings out of range.")
-        return (chunk.detach().cpu().numpy().astype("<f4").tobytes()
-                for chunk in model.generate_audio_stream(state, text))
-    synthesize.clone = clone
-    synthesize.validate_voice = validate_voice
+        return stream(text, speaker, emotion, float(temp))
+
+    for _ in synthesize(json.dumps({"text": "Warming up."}).encode()):
+        pass
     return synthesize
 
-def serve(mode, path, threads, voices_dir=None):
-    inference = load(mode, path.resolve(), threads, voices_dir and voices_dir.resolve())
+
+def serve(mode, path, threads):
+    inference = load(mode, path.resolve(), threads)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -129,10 +174,6 @@ def serve(mode, path, threads, voices_dir=None):
             self.end_headers()
 
         def do_POST(self):
-            if mode == "tts" and self.path == "/clone":
-                return self.control(inference.clone, "Voice cloning failed.")
-            if mode == "tts" and self.path == "/voice":
-                return self.control(inference.validate_voice, "Voice validation failed.")
             if self.path != ("/inference" if mode == "stt" else "/synthesize"):
                 return self.send_error(404)
             self.connection.settimeout(30)
@@ -173,27 +214,6 @@ def serve(mode, path, threads, voices_dir=None):
                 print(error, file=sys.stderr, flush=True)
                 self.close_connection = True  # No terminal chunk: the reader sees a failed stream.
 
-        def control(self, action, failure):
-            self.connection.settimeout(300)
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                if not 0 < length <= 10_000:
-                    raise ValueError("Invalid body size.")
-                request = self.rfile.read(length)
-                if len(request) != length:
-                    raise ValueError("Truncated request.")
-                body = action(request)
-            except (ValueError, KeyError) as error:
-                return self.send_error(400, "Invalid voice request.", explain=str(error))
-            except Exception as error:
-                print(error, file=sys.stderr, flush=True)
-                return self.send_error(500, failure)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
         def log_message(self, *_):
             pass
 
@@ -201,7 +221,7 @@ def serve(mode, path, threads, voices_dir=None):
 
 
 if __name__ == "__main__":
-    mode, path, threads, *rest = sys.argv[1:]
+    mode, path, threads = sys.argv[1:]
     if mode not in ("stt", "tts") or not 1 <= int(threads) <= 64:
         raise ValueError("Invalid speech settings.")
-    serve(mode, Path(path), int(threads), Path(rest[0]) if rest else None)
+    serve(mode, Path(path), int(threads))

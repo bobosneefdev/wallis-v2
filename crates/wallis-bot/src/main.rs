@@ -118,18 +118,14 @@ impl Server {
         for role in [&self.init.roles.realtime, &self.init.roles.worker] { role.validate()?; }
         Ok(BotConfig { pi_program: layout.pi().to_string_lossy().into(), worker_program: layout.pi().to_string_lossy().into(), data_dir: data.clone(), persona: persona(&data), realtime: self.init.roles.realtime.clone(), worker: self.init.roles.worker.clone(), write_channels: list(&c.discord_write_channels), voice_text_channel: c.discord_voice_text_channel.clone(), python: layout.python().to_string_lossy().into(), voice_participation: mode(&c.voice_participation), text_participation: mode(&c.text_participation), sandbox_read: vec![layout.tools()], shell: layout.shell() })
     }
-    fn start(&mut self, token: &str, args: &Value) -> Result<Value, String> {
+    fn start(&mut self, token: &str) -> Result<Value, String> {
         if self.running.is_some() { return self.handle("get_runtime_status", &json!({})); }
         if token.is_empty() { return Err("Save the Discord token first.".into()); }
         read_profile(Path::new(DATA))?;
         let config = self.config()?;
         let c = &self.init.config;
-        // Voice cloning is on only with the host's recorded acceptance and a Hugging Face token. The weights download in the background.
-        let hf = args["hfToken"].as_str().filter(|t| c.cloning_consent && !t.is_empty()).map(String::from);
-        if hf.is_none() { let _ = wallis_core::provision::set_cloning(Path::new(DATA), None); }
-        else { std::thread::spawn(move || if let Err(error) = wallis_core::provision::set_cloning(Path::new(DATA), hf.as_deref()) { eprintln!("wallis: voice cloning unavailable: {error}"); }); }
         wallis_core::tuning::load(Path::new(DATA), wallis_core::tuning::Tuning { voice: c.tts_voice.clone(), speed: c.tts_speed, cooldown_secs: c.participation_cooldown_secs, ..Default::default() });
-        let speech = SpeechServers::start(&Layout(DATA.into()), &c.stt_model, c.stt_threads, &c.tts_voice)?;
+        let speech = SpeechServers::start(&Layout(DATA.into()), &c.stt_model, c.stt_threads)?;
         let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
         let (bot, out, failure) = (Arc::new(Mutex::new(None::<Bot>)), Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)));
         let (ready_bot, event_bot, ready_out, startup_failure, end_failure) = (bot.clone(), bot.clone(), out.clone(), failure.clone(), failure.clone());
@@ -150,7 +146,7 @@ impl Server {
     fn handle(&mut self, command: &str, args: &Value) -> Result<Value, String> {
         let data = Path::new(DATA);
         match command {
-            "start_wallis" => self.start(args["token"].as_str().unwrap_or(""), args),
+            "start_wallis" => self.start(args["token"].as_str().unwrap_or("")),
             "stop_wallis" => { self.running.take(); Ok(json!({"state":"stopped","message":"Wallis is stopped."})) }
             "get_runtime_status" => Ok(match &self.running { None => json!({"state":"stopped","message":"Wallis is stopped."}), Some(r) => match r.failure.lock().unwrap().as_ref() { Some(e) => json!({"state":"unavailable","message":e}), None => json!({"state":"running","message":"Wallis is online."}) } }),
             "get_stats" => Ok(self.running.as_ref().and_then(|r| r.bot.lock().unwrap().as_ref().map(|b| json!(b.stats.snapshot()))).unwrap_or(Value::Null)),
@@ -241,7 +237,7 @@ fn serve() -> Result<(), String> {
     if std::env::args().any(|arg|arg == "--self-check") { return self_check(); }
     if std::env::args().any(|arg| arg == "--provision") {
         let layout = Layout("/opt/wallis".into());
-        for voice in ["alba","marius","javert"] { wallis_core::provision::ensure_all(&layout,"parakeet-0.6b-v3-int8",voice,&|s| eprintln!("{s}"))?; }
+        wallis_core::provision::ensure_all(&layout,"parakeet-0.6b-v3-int8",std::env::var("HF_TOKEN").ok().as_deref(),&|s| eprintln!("{s}"))?;
         return Ok(());
     }
     #[cfg(target_os = "linux")]
