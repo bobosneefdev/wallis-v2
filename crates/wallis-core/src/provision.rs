@@ -231,6 +231,7 @@ pub fn ensure_all(layout: &Layout, stt: &str, hf_token: Option<&str>, progress: 
     let tts = layout.tts_model();
     if !["neucodec.bin", "speakers.json"].iter().all(|f| tts.join(f).is_file()) {
         let token = hf_token.ok_or("Hugging Face token missing: NeuTTS-2E's gated files are downloaded with one (HF_TOKEN).")?;
+        std::fs::create_dir_all(&tts).map_err(|error| format!("Unable to create {}: {error}", tts.display()))?;
         let full = tools.join("downloads/neucodec-full.bin");
         download_verified_as(CODEC_URL, CODEC_SHA256, &full, Some(token))?;
         run(&layout.python(), &["-c", PREPARE_TTS, &full.to_string_lossy(), &tts.to_string_lossy()].into_iter().chain(TTS_VOICES.iter().map(|v| v.0)).collect::<Vec<_>>(), "prepare the NeuTTS codec")?;
