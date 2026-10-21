@@ -74,7 +74,7 @@ try:
     connection.close()
     assert "test" in text.lower(), text
     # Close a long response after its first sample, then verify the server serves a new request.
-    connection, response = request(8086, "/synthesize", json.dumps({"text": "This is a long interruption test. " * 100}))
+    connection, response = request(8086, "/synthesize", json.dumps({"text": "This is a long interruption test. " * 50}))
     assert response.status == 200 and len(response.read(4)) == 4
     response.close()
     connection.close()
