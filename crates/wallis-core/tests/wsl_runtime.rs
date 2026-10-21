@@ -14,7 +14,7 @@ fn manager_migrates_native_data_and_preserves_runtime_changes() {
     std::fs::write(data.join("roles.json"), serde_json::to_vec(&Roles::default()).unwrap()).unwrap();
     std::fs::write(data.join("profile.json"), r#"{"name":"Wallis Test"}"#).unwrap();
     std::fs::write(data.join("pi/worker/auth.json"), r#"{"probe":"desktop"}"#).unwrap();
-    Jobs::open(data.join("jobs.sqlite").to_str().unwrap()).unwrap().enqueue_scoped("native-job", "10", 1, 2).unwrap();
+    Jobs::open(data.join("jobs.sqlite").to_str().unwrap()).unwrap().enqueue_scoped("native-job", "10", 1, 2, 0).unwrap();
     let start = || Session::start(&data, WallisConfig::default(), "0.4.0", &|_| {}).unwrap_or_else(|error| {
         panic!("{error}\n{}", std::fs::read_to_string(data.join("runtime.log")).unwrap_or_default())
     });

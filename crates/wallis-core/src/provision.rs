@@ -9,9 +9,15 @@ pub struct Artifact { pub name: &'static str, pub url: &'static str, pub sha256:
 pub const PI: Artifact = Artifact { name: "pi", url: "https://github.com/earendil-works/pi/releases/download/v1.2.0/pi-linux-x64.tar.gz", sha256: "00fc36cffdebceea5a48230da62cf3fb463178f8fe185766652f96002a246847", strip: "pi" };
 pub const UV: Artifact = Artifact { name: "uv", url: "https://github.com/astral-sh/uv/releases/download/0.13.0/uv-x86_64-unknown-linux-gnu.tar.gz", sha256: "1468ebd5a5541121837c5a2817b9972ba6090fa6caa3d142620850a47fb75154", strip: "uv-x86_64-unknown-linux-gnu" };
 /// Python packages installed into the app's own virtual environment (voice and realtime memory).
-pub const POCKET_PACKAGE: &str = "pocket-tts==3.3.0";
 pub const SHERPA_PACKAGE: &str = "sherpa-onnx==1.13.8";
 pub const TORCH_PACKAGE: &str = "torch==2.14.1+cpu";
+pub const TORCHAUDIO_PACKAGE: &str = "torchaudio==2.11.0+cpu";
+/// NeuTTS-2E's codec and watermarker. torchao is pinned because newer releases break torchtune, setuptools because Perth needs `pkg_resources`.
+pub const NEUTTS_PACKAGES: [&str; 11] = ["local-attention==1.11.2", "torchtune==0.6.1", "transformers==5.20.2", "vector-quantize-pytorch==1.17.8", "torchao==0.11.0", "resemble-perth==1.0.1", "librosa==0.11.0", "soundfile==0.13.1", "setuptools==78.1.0", "requests==2.34.0", "einops==0.8.2"];
+/// Installed without dependencies: only its four speakers' reference codes are used.
+pub const NEUTTS_SAMPLES_PACKAGE: &str = "neutts==1.4.1";
+/// Installed with `--no-deps` alongside the samples: it declares `torchao>=0.12`, which the pin above deliberately contradicts.
+pub const NEUCODEC_PACKAGE: &str = "neucodec==0.0.6";
 pub const MEMORY_PACKAGE: &str = "mnemosyne-memory[all]==3.15.1";
 pub const MEDIA_PACKAGE: &str = "av==19.0.1";
 pub const PYTHON_VERSION: &str = "3.12";
@@ -36,7 +42,7 @@ pub fn download_verified_as(url: &str, sha256: &str, dest: &Path, token: Option<
     let part = dest.with_extension("part");
     let mut request = ureq::get(url);
     if let Some(token) = token { request = request.header("Authorization", &format!("Bearer {token}")); }
-    let mut response = request.call().map_err(|error| format!("Unable to download {url}: {}", if token.is_some() && error.to_string().contains("40") { "Hugging Face refused the token. Accept the Kyutai terms for kyutai/pocket-tts with that account and use a read token.".to_string() } else { error.to_string() }))?;
+    let mut response = request.call().map_err(|error| format!("Unable to download {url}: {}", if token.is_some() && error.to_string().contains("40") { "Hugging Face refused the token. Accept the NeuTTS-2E and NeuCodec terms with that account and use a read token.".to_string() } else { error.to_string() }))?;
     let (mut file, mut hasher, mut buffer) = (std::fs::File::create(&part).map_err(|error| error.to_string())?, Sha256::new(), [0u8; 65536]);
     let mut reader = response.body_mut().as_reader();
     loop {
@@ -135,17 +141,26 @@ mod tests {
 pub const STT_MODELS: [(&str, &str, &str, u32); 1] = [
     ("parakeet-0.6b-v3-int8", "Parakeet 0.6B v3 INT8 — multilingual, CPU", "5793d0fd397c5778d2cf2126994d58e9d56b1be7c04d13c7a15bb1b4eafb16bf", 487),
 ];
-/// Permanent Pocket preset states; no voice cloning or Hugging Face account required.
-pub const TTS_VOICES: [(&str, &str, &str, u32); 3] = [
-    ("alba", "Alba", "d291428b416d6c36a1de7835e51dbe1e334b75e5af512bb18dd23a1047fe8f3b", 6),
-    ("marius", "Marius", "b05946f39371f8853902b0486231f2d401c8a9570da9978329120d4ecfd009e9", 6),
-    ("javert", "Javert", "580e4b72d4065e906c14e580f97da478c9707bead74b0ef9c049e0ca8de997d9", 6),
-];
+/// NeuTTS-2E's four fixed speakers and seven emotions (neuphonic/neutts-2e-q4-gguf).
+pub const TTS_VOICES: [(&str, &str); 4] = [("emily", "Emily"), ("paul", "Paul"), ("sophie", "Sophie"), ("steven", "Steven")];
+pub const EMOTIONS: [&str; 7] = ["angry", "disgusted", "fearful", "happy", "neutral", "sad", "surprised"];
 const STT_ARCHIVE: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
-const POCKET_BASE: &str = "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/4e1e0a3e611c51c0b4ed8174fc10f32a54644303/languages/english_2026-09";
-/// Voice cloning needs Kyutai's gated weights, fetched only with the host's own Hugging Face token (pinned, checksummed).
-pub const CLONING_WEIGHTS_URL: &str = "https://huggingface.co/kyutai/pocket-tts/resolve/983151f13aaeab1b13c1e5e3c2c383d49a9edf3f/languages/english_2026-09/model.safetensors";
-pub const CLONING_WEIGHTS_SHA256: &str = "fb0dc01b0d4d2e1c905b7a3e0676e3d9c96d5ae460e24e3ab94981805babf997";
+/// Gated on Hugging Face: CI downloads them with its own token under the NeuTTS Open License v1.0 and bakes them into the image.
+pub const TTS_GGUF_URL: &str = "https://huggingface.co/neuphonic/neutts-2e-q4-gguf/resolve/021bd72d8eeff6f548e5c9209d03db6b6dff4939/neutts-2e-Q4_0.gguf";
+pub const TTS_GGUF_SHA256: &str = "ccc2a33941aa3787d232c608e9a60f6cd74a2d2af0e1e35afce0aedccef38b1d";
+pub const CODEC_URL: &str = "https://huggingface.co/neuphonic/neucodec/resolve/a940021324df13a07f44185f0a17c6dac3698179/pytorch_model.bin";
+pub const CODEC_SHA256: &str = "30c3ea13ceeb2de693c56e5e33a1b7e00d44c95dcdd08a4ed0d552d0bf59ebdf";
+/// Keeps only the decoder half of NeuCodec (the encoder is for cloning, which Wallis does not do) and the speakers' reference codes.
+const PREPARE_TTS: &str = r#"
+import importlib.util, json, sys, torch
+from pathlib import Path
+source, out = Path(sys.argv[1]), Path(sys.argv[2])
+weights = torch.load(source, map_location="cpu", weights_only=True)
+torch.save({k: v for k, v in weights.items() if k.startswith(("generator.", "fc_post_a."))}, out / "neucodec.bin")
+samples = Path(importlib.util.find_spec("neutts").submodule_search_locations[0]) / "samples"
+speakers = {n: {"codes": torch.load(samples / f"{n}.pt", weights_only=True).tolist(), "text": (samples / f"{n}.txt").read_text().strip()} for n in sys.argv[3:]}
+(out / "speakers.json").write_text(json.dumps(speakers))
+"#;
 pub const SPEECH_SERVER: &str = include_str!("../py/speech_server.py");
 
 /// Where everything lives under the app data folder.
@@ -161,7 +176,8 @@ impl Layout {
     pub fn python(&self) -> PathBuf { if cfg!(windows) { self.venv().join("Scripts").join("python.exe") } else { self.venv().join("bin").join("python") } }
     pub fn speech_script(&self) -> PathBuf { self.tools().join("speech_server.py") }
     pub fn stt_model(&self, id: &str) -> PathBuf { self.0.join("models").join(id) }
-    pub fn tts_model(&self, id: &str) -> PathBuf { self.0.join("models/pocket").join(format!("{id}.safetensors")) }
+    pub fn tts_model(&self) -> PathBuf { self.0.join("models/neutts-2e") }
+
 }
 
 fn run(program: &Path, args: &[&str], what: &str) -> Result<(), String> {
@@ -175,9 +191,9 @@ fn run(program: &Path, args: &[&str], what: &str) -> Result<(), String> {
 }
 
 /// Installs every runtime piece (idempotent): Pi, uv, a CPU Python environment with speech and memory packages, and pinned models.
-/// `progress` receives a one-line description of each step.
-pub fn ensure_all(layout: &Layout, stt: &str, tts: &str, progress: &dyn Fn(&str)) -> Result<(), String> {
-    let (stt_entry, tts_entry) = (STT_MODELS.iter().find(|m| m.0 == stt).ok_or("Unknown speech model.")?, TTS_VOICES.iter().find(|m| m.0 == tts).ok_or("Unknown voice.")?);
+/// `hf_token` is only needed for the gated NeuTTS-2E files, and not at all once they are on disk. `progress` receives a one-line description of each step.
+pub fn ensure_all(layout: &Layout, stt: &str, hf_token: Option<&str>, progress: &dyn Fn(&str)) -> Result<(), String> {
+    let stt_entry = STT_MODELS.iter().find(|m| m.0 == stt).ok_or("Unknown speech model.")?;
     let tools = layout.tools();
     progress("Installing the agent runtime…");
     install(&PI, &tools, &Layout::exe("pi"))?;
@@ -188,12 +204,16 @@ pub fn ensure_all(layout: &Layout, stt: &str, tts: &str, progress: &dyn Fn(&str)
         progress("Setting up Python for voice and memory…");
         run(&layout.uv(), &["venv", "--python", PYTHON_VERSION, &layout.venv().to_string_lossy()], "create the Python environment")?;
     }
-    let packages = format!("{POCKET_PACKAGE} {SHERPA_PACKAGE} {TORCH_PACKAGE} {MEMORY_PACKAGE} {MEDIA_PACKAGE}");
+    let packages = format!("{SHERPA_PACKAGE} {TORCH_PACKAGE} {TORCHAUDIO_PACKAGE} {} {NEUCODEC_PACKAGE} {NEUTTS_SAMPLES_PACKAGE} {MEMORY_PACKAGE} {MEDIA_PACKAGE}", NEUTTS_PACKAGES.join(" "));
     let marker = layout.venv().join("wallis-packages.txt");
     if std::fs::read_to_string(&marker).ok().as_deref() != Some(&packages) {
         progress("Installing CPU speech and memory packages…");
-        run(&layout.uv(), &["pip", "install", "--python", &layout.python().to_string_lossy(), "--index-url", "https://download.pytorch.org/whl/cpu", TORCH_PACKAGE], "install CPU PyTorch")?;
-        run(&layout.uv(), &["pip", "install", "--python", &layout.python().to_string_lossy(), TORCH_PACKAGE, POCKET_PACKAGE, SHERPA_PACKAGE, MEMORY_PACKAGE, MEDIA_PACKAGE], "install speech and memory packages")?;
+        let python = layout.python().to_string_lossy().into_owned();
+        run(&layout.uv(), &["pip", "install", "--python", &python, "--index-url", "https://download.pytorch.org/whl/cpu", TORCH_PACKAGE, TORCHAUDIO_PACKAGE], "install CPU PyTorch")?;
+        let mut install = vec!["pip", "install", "--python", &python, TORCH_PACKAGE, TORCHAUDIO_PACKAGE, SHERPA_PACKAGE, MEMORY_PACKAGE, MEDIA_PACKAGE];
+        install.extend(NEUTTS_PACKAGES);
+        run(&layout.uv(), &install, "install speech and memory packages")?;
+        run(&layout.uv(), &["pip", "install", "--python", &python, "--no-deps", NEUCODEC_PACKAGE, NEUTTS_SAMPLES_PACKAGE], "install the NeuTTS codec and speaker samples")?;
         std::fs::write(marker, packages).map_err(|error| error.to_string())?;
     }
     std::fs::write(layout.speech_script(), SPEECH_SERVER).map_err(|error| format!("Unable to write the speech server: {error}"))?;
@@ -208,28 +228,24 @@ pub fn ensure_all(layout: &Layout, stt: &str, tts: &str, progress: &dyn Fn(&str)
         }
         std::fs::write(stt_dir.join("installed.txt"), stt_entry.2).map_err(|error| error.to_string())?;
     }
-    let pocket = layout.tts_model(tts).parent().unwrap().to_path_buf();
-    download_verified(&format!("{POCKET_BASE}/model.safetensors"), "916ccd2686e9311cb40054893a3c4284393d658825ffc714a276f3e9b152344f", &pocket.join("model.safetensors"))?;
-    download_verified(&format!("{POCKET_BASE}/tokenizer.json"), "f498428e1eafee50492f7be13dc9bfafcfc12e508cd0eb1b01c92ecd5d8c6687", &pocket.join("tokenizer.json"))?;
-    download_verified(&format!("{POCKET_BASE}/embeddings/{tts}.safetensors"), tts_entry.2, &layout.tts_model(tts))?;
+    let tts = layout.tts_model();
+    if !["neucodec.bin", "speakers.json"].iter().all(|f| tts.join(f).is_file()) {
+        let token = hf_token.ok_or("Hugging Face token missing: NeuTTS-2E's gated files are downloaded with one (HF_TOKEN).")?;
+        std::fs::create_dir_all(&tts).map_err(|error| format!("Unable to create {}: {error}", tts.display()))?;
+        let full = tools.join("downloads/neucodec-full.bin");
+        download_verified_as(CODEC_URL, CODEC_SHA256, &full, Some(token))?;
+        run(&layout.python(), &["-c", PREPARE_TTS, &full.to_string_lossy(), &tts.to_string_lossy()].into_iter().chain(TTS_VOICES.iter().map(|v| v.0)).collect::<Vec<_>>(), "prepare the NeuTTS codec")?;
+    }
+    download_verified_as(TTS_GGUF_URL, TTS_GGUF_SHA256, &tts.join("neutts-2e-Q4_0.gguf"), hf_token)?;
     progress("");
     Ok(())
-}
-
-/// Enables voice cloning: downloads the gated weights with `token` (resumes instantly once they are verified on disk) and
-/// leaves a `cloning-enabled` marker the `clone_voice` tool checks. Without consent and a token it removes the marker.
-pub fn set_cloning(data: &Path, consent_and_token: Option<&str>) -> Result<(), String> {
-    let marker = data.join("cloning-enabled");
-    let Some(token) = consent_and_token else { let _ = std::fs::remove_file(&marker); return Ok(()) };
-    download_verified_as(CLONING_WEIGHTS_URL, CLONING_WEIGHTS_SHA256, &data.join("cloning/model.safetensors"), Some(token))?;
-    std::fs::write(marker, "1").map_err(|error| error.to_string())
 }
 
 /// The two local speech servers. Dropping this stops them.
 pub struct SpeechServers(Vec<std::process::Child>);
 
 impl SpeechServers {
-    pub fn start(layout: &Layout, stt: &str, threads: u32, tts: &str) -> Result<Self, String> {
+    pub fn start(layout: &Layout, stt: &str, threads: u32) -> Result<Self, String> {
         std::fs::create_dir_all(layout.0.join("logs")).map_err(|e| e.to_string())?;
         let spawn = |program: &Path, args: Vec<String>, what: &str, port: u16| {
             let mut command = std::process::Command::new(program);
@@ -239,13 +255,13 @@ impl SpeechServers {
             { use std::os::windows::process::CommandExt; command.creation_flags(0x0800_0000); }
             command.spawn().map_err(|error| format!("Unable to start {what}: {error}"))
         };
-        if !STT_MODELS.iter().any(|m| m.0 == stt) || !TTS_VOICES.iter().any(|m| m.0 == tts) || !(1..=64).contains(&threads) { return Err("Invalid speech settings.".into()); }
+        if !STT_MODELS.iter().any(|m| m.0 == stt) || !(1..=64).contains(&threads) { return Err("Invalid speech settings.".into()); }
         let stt_server = spawn(&layout.python(), vec!["-u".into(), layout.speech_script().to_string_lossy().into(), "stt".into(), layout.stt_model(stt).join(STT_ARCHIVE).to_string_lossy().into(), threads.to_string()], "speech recognition", 8085)?;
         let mut servers = Self(vec![stt_server]);
-        servers.0.push(spawn(&layout.python(), vec!["-u".into(), layout.speech_script().to_string_lossy().into(), "tts".into(), layout.tts_model(tts).to_string_lossy().into(), threads.to_string(), layout.0.join("voices").to_string_lossy().into()], "the voice", 8086)?);
+        servers.0.push(spawn(&layout.python(), vec!["-u".into(), layout.speech_script().to_string_lossy().into(), "tts".into(), layout.tts_model().to_string_lossy().into(), threads.to_string()], "the voice", 8086)?);
         for (name, port) in [("speech recognition", 8085u16), ("the voice", 8086)] {
             let mut up = false;
-            for _ in 0..300 {
+            for _ in 0..900 {
                 for (index, child) in servers.0.iter_mut().enumerate() {
                     if child.try_wait().map_err(|error| error.to_string())?.is_some() {
                         let log = std::fs::read_to_string(layout.0.join("logs").join(format!("speech-{}.log", 8085 + index))).unwrap_or_default();
@@ -272,9 +288,9 @@ mod layout_tests {
     #[test]
     fn layout_keeps_models_and_tools_apart_and_voices_are_pinned() {
         let layout = Layout(PathBuf::from("data"));
-        assert!(layout.stt_model("parakeet-0.6b-v3-int8").ends_with("models/parakeet-0.6b-v3-int8") && layout.tts_model("alba").ends_with("models/pocket/alba.safetensors"));
+        assert!(layout.stt_model("parakeet-0.6b-v3-int8").ends_with("models/parakeet-0.6b-v3-int8") && layout.tts_model().ends_with("models/neutts-2e"));
         assert!(layout.python().starts_with("data/tools/venv"));
-        assert!(STT_MODELS.iter().chain(TTS_VOICES.iter()).all(|m| m.2.len() == 64));
-        assert!(SPEECH_SERVER.contains("TTSModel.load_model"));
+        assert!(STT_MODELS.iter().map(|m| m.2).chain([TTS_GGUF_SHA256, CODEC_SHA256]).all(|sum| sum.len() == 64));
+        assert!(SPEECH_SERVER.contains("PerthImplicitWatermarker") && SPEECH_SERVER.contains(&format!("SPEAKERS = {:?}", TTS_VOICES.map(|v| v.0)).replace('[', "(").replace(']', ")")));
     }
 }

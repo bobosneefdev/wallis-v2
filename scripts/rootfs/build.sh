@@ -21,11 +21,11 @@ tar -xf "$output/ubuntu.wsl" -C "$root"
 chmod 0755 "$root"
 mkdir -p "$root/opt/wallis/bin" "$root/opt/wallis/source"
 install -m 0755 "$bot" "$root/opt/wallis/bin/wallis-bot"
-tar -C "$repo" --exclude=.git --exclude=node_modules --exclude=target --exclude=dist --exclude=.turbo -cf - mods skills scripts/rootfs crates/wallis-core/py/speech_check.py | tar -xf - -C "$root/opt/wallis/source"
+tar -C "$repo" --exclude=.git --exclude=node_modules --exclude=target --exclude=dist --exclude=.turbo -cf - mods skills licenses scripts/rootfs crates/wallis-core/py/speech_check.py | tar -xf - -C "$root/opt/wallis/source"
 rm -f "$root/etc/resolv.conf"
 cp -L /etc/resolv.conf "$root/etc/resolv.conf"
 for fs in proc sys dev; do mount --rbind "/$fs" "$root/$fs"; mounted+=("$root/$fs"); mount --make-rslave "$root/$fs"; done
-chroot "$root" /usr/bin/env WALLIS_VERSION="$version" /bin/bash /opt/wallis/source/scripts/rootfs/provision.sh
+chroot "$root" /usr/bin/env WALLIS_VERSION="$version" HF_TOKEN="${HF_TOKEN:?HF_TOKEN needs access to the NeuTTS-2E and NeuCodec repositories}" /bin/bash /opt/wallis/source/scripts/rootfs/provision.sh
 # Creating user namespaces inside chroot is forbidden by Linux. Give the sandbox
 # checks a real mount-namespace root, as they have in WSL, without weakening them.
 unshare --mount --propagation private /bin/bash -euc '

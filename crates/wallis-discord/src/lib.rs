@@ -49,6 +49,8 @@ pub enum Incoming {
     MediaDelete { channel: u64, messages: Vec<u64> },
     /// A finished utterance of 48 kHz interleaved stereo PCM from an allow-listed speaker.
     Voice { guild: u64, channel: u64, user: u64, speaker: String, pcm: Vec<i16> },
+    /// Someone joined, left or moved within Wallis's call. `from`/`to` are voice channel ids (0 = none); only changes touching his channel are sent.
+    Presence { guild: u64, user: u64, speaker: String, from: u64, to: u64 },
     /// Includes synthesis startup and mid-stream playback failures.
     SpeechFailed { guild: u64, text: String, tuning: wallis_core::tuning::Tuning, generation: u64, retried: bool, error: String },
 }
@@ -61,9 +63,9 @@ pub struct Out { http: Arc<Client>, songbird: Arc<Songbird>, runtime: tokio::run
 
 // Songbird opens the request when this track starts, so queued speech cannot block interruption.
 #[derive(Clone)]
-struct Pocket { text: String, tuning: Arc<Mutex<wallis_core::tuning::Tuning>>, send: Send, guild: u64, generation: u64, retried: bool, reported: Arc<std::sync::atomic::AtomicBool> }
+struct Speech { text: String, tuning: Arc<Mutex<wallis_core::tuning::Tuning>>, send: Send, guild: u64, generation: u64, retried: bool, reported: Arc<std::sync::atomic::AtomicBool> }
 
-impl Pocket {
+impl Speech {
     fn report(&self, error: String) {
         if self.reported.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
         (self.send)(Incoming::SpeechFailed { guild: self.guild, text: self.text.clone(), tuning: self.tuning.lock().expect("speech tuning poisoned").clone(), generation: self.generation, retried: self.retried, error });
@@ -71,17 +73,17 @@ impl Pocket {
 }
 
 // Songbird treats next_packet I/O errors as EOF, so report stream failures before it reads them.
-struct PocketStream<R> { stream: R, pocket: Pocket, bytes: usize }
-impl<R: std::io::Read> std::io::Read for PocketStream<R> {
+struct SpeechStream<R> { stream: R, speech: Speech, bytes: usize }
+impl<R: std::io::Read> std::io::Read for SpeechStream<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self.stream.read(buf) {
             Ok(n) => {
                 self.bytes += n;
-                if n == 0 && !buf.is_empty() && (self.bytes == 0 || !self.bytes.is_multiple_of(4)) { self.pocket.report("Speech returned empty or incomplete PCM.".into()); }
+                if n == 0 && !buf.is_empty() && (self.bytes == 0 || !self.bytes.is_multiple_of(4)) { self.speech.report("Speech returned empty or incomplete PCM.".into()); }
                 Ok(n)
             }
             Err(error) => {
-                if error.kind() != std::io::ErrorKind::Interrupted { self.pocket.report(error.to_string()); }
+                if error.kind() != std::io::ErrorKind::Interrupted { self.speech.report(error.to_string()); }
                 Err(error)
             }
         }
@@ -89,7 +91,7 @@ impl<R: std::io::Read> std::io::Read for PocketStream<R> {
 }
 
 #[async_trait::async_trait]
-impl Compose for Pocket {
+impl Compose for Speech {
     fn create(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
         let tuning = wallis_core::tuning::current();
         *self.tuning.lock().expect("speech tuning poisoned") = tuning.clone();
@@ -99,7 +101,7 @@ impl Compose for Pocket {
         })?;
         // ponytail: speed changes pitch; add time stretching when pitch-preserving speed is required.
         let rate = (24_000.0 / tuning.speed).round() as u32;
-        let stream = PocketStream { stream, pocket: self.clone(), bytes: 0 };
+        let stream = SpeechStream { stream, speech: self.clone(), bytes: 0 };
         Ok(AudioStream { input: Box::new(RawAdapter::new(ReadOnlySource::new(stream), rate, 1)) })
     }
     async fn create_async(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> { Err(AudioStreamError::Unsupported) }
@@ -107,7 +109,7 @@ impl Compose for Pocket {
 }
 
 #[async_trait::async_trait]
-impl VoiceHandler for Pocket {
+impl VoiceHandler for Speech {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         let error = match ctx {
             EventContext::Track(tracks) => tracks.first().map(|(state, _)| format!("{:?}", state.playing)).unwrap_or_else(|| "Speech playback failed.".into()),
@@ -174,7 +176,7 @@ impl Out {
         self.runtime.block_on(async { self.http.interaction(self.application).set_global_commands(&commands).await }).map(|_| ()).map_err(|e| e.to_string())
     }
 
-    /// Queues a live Pocket PCM stream. Songbird resamples to Discord's 48 kHz stereo.
+    /// Queues a live Speech PCM stream. Songbird resamples to Discord's 48 kHz stereo.
     /// Voice, speed and sampling are read when each sentence starts playing, so a tuning change reaches speech already queued.
     pub fn speak(&self, guild: u64, text: &str) -> Result<(), String> {
         self.speak_retry(guild, text, false)
@@ -185,10 +187,10 @@ impl Out {
         if text.trim().is_empty() || text.chars().count() > 16_000 { return Err("Speech must contain 1–16000 characters.".into()); }
         self.runtime.block_on(async {
             let end = self.music.speaking(guild).await;
-            let pocket = Pocket { text: text.into(), tuning: Arc::new(Mutex::new(wallis_core::tuning::current())), send: self.send.clone(), guild, generation: end.generation, retried, reported: Default::default() };
-            let mut track = songbird::tracks::Track::new(Input::Lazy(Box::new(pocket.clone())));
+            let speech = Speech { text: text.into(), tuning: Arc::new(Mutex::new(wallis_core::tuning::current())), send: self.send.clone(), guild, generation: end.generation, retried, reported: Default::default() };
+            let mut track = songbird::tracks::Track::new(Input::Lazy(Box::new(speech.clone())));
             // Register before enqueueing: a lazy source can fail as soon as it starts.
-            track.events.add_event(songbird::events::EventData::new(Event::Track(songbird::events::TrackEvent::Error), pocket), std::time::Duration::ZERO);
+            track.events.add_event(songbird::events::EventData::new(Event::Track(songbird::events::TrackEvent::Error), speech), std::time::Duration::ZERO);
             track.events.add_event(songbird::events::EventData::new(Event::Track(songbird::events::TrackEvent::End), end), std::time::Duration::ZERO);
             call.lock().await.enqueue_with_preload(track, None);
         });
@@ -233,6 +235,17 @@ impl Out {
             self.songbird.remove(guild).await.map_err(|error| format!("Could not leave: {error}"))
         })
     }
+
+    /// Names of everyone (but Wallis) in voice channel `channel` right now, from Discord's voice-state cache.
+    pub fn voice_members(&self, channel: u64) -> Vec<(u64, String)> {
+        let Some(channel) = Id::new_checked(channel) else { return vec![] };
+        let me = self.cache.current_user().map(|user| user.id);
+        let mut members: Vec<(u64, String)> = self.cache.voice_channel_states(channel).into_iter().flatten().map(|state| state.user_id()).filter(|id| Some(*id) != me).map(|id| (id.get(), self.name(id.get()))).collect();
+        members.sort();
+        members
+    }
+
+    fn name(&self, user: u64) -> String { Id::<UserMarker>::new_checked(user).and_then(|id| self.cache.user(id).map(|u| u.name.clone())).unwrap_or_else(|| user.to_string()) }
 
     /// The voice channel Wallis is in, if any.
     /// Sentences queued or being spoken right now.
@@ -443,8 +456,18 @@ pub async fn run(settings: Settings, ready: impl FnOnce(Out) + std::marker::Send
             Ok(event) => event,
             Err(_) => continue,
         };
+        // The cache overwrites the old channel, so read it before updating.
+        let before = if let Gateway::VoiceStateUpdate(update) = &event { update.guild_id.map(|guild| (guild, cache.voice_state(update.user_id, guild).map(|state| state.channel_id().get()).unwrap_or(0))) } else { None };
         cache.update(&event);
         songbird.process(&event).await;
+        if let (Gateway::VoiceStateUpdate(update), Some((guild, from))) = (&event, before) {
+            let (user, to) = (update.user_id.get(), update.channel_id.map(|id| id.get()).unwrap_or(0));
+            let mine = match songbird.get(guild) { Some(call) => call.lock().await.current_channel().map(|channel| channel.0.get()), None => None };
+            if update.user_id != me.id && from != to && mine.is_some_and(|mine| mine == from || mine == to) && allowed(&bot.settings.allowed_users, user) {
+                let speaker = update.member.as_ref().and_then(|member| member.nick.clone()).unwrap_or_else(|| update.member.as_ref().map(|member| member.user.name.clone()).unwrap_or_else(|| user.to_string()));
+                (bot.send)(Incoming::Presence { guild: guild.get(), user, speaker, from, to });
+            }
+        }
         match event {
             Gateway::Ready(ready) => (bot.send)(Incoming::Ready { bot_id: ready.user.id.get() }),
             Gateway::MessageCreate(message) => bot.message(&message).await,
@@ -530,16 +553,16 @@ mod speech_tests {
         for prefix in [0, 24_000] {
             let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
             let failed = wallis_core::tuning::Tuning { voice: "test-voice".into(), temp: 0.8, ..Default::default() };
-            let pocket = Pocket { text: "Keep this reply".into(), tuning: Arc::new(Mutex::new(failed.clone())), send: Arc::new(move |event| { let _ = send.send(event); }), guild: 1, generation: 7, retried: prefix > 0, reported: Default::default() };
+            let speech = Speech { text: "Keep this reply".into(), tuning: Arc::new(Mutex::new(failed.clone())), send: Arc::new(move |event| { let _ = send.send(event); }), guild: 1, generation: 7, retried: prefix > 0, reported: Default::default() };
             let source = std::io::Read::chain(std::io::Read::take(std::io::repeat(0), prefix), Broken);
-            let mut stream = PocketStream { stream: source, pocket: pocket.clone(), bytes: 0 };
+            let mut stream = SpeechStream { stream: source, speech: speech.clone(), bytes: 0 };
             let mut audio = Vec::new();
             assert!(std::io::Read::read_to_end(&mut stream, &mut audio).is_err());
             assert_eq!(audio.len(), prefix as usize);
             let event = receive.try_recv().unwrap();
             let Incoming::SpeechFailed { guild, text, tuning, generation, retried, .. } = event else { panic!("expected speech failure") };
             assert_eq!((guild, text.as_str(), tuning, generation, retried), (1, "Keep this reply", failed, 7, prefix > 0));
-            pocket.act(&EventContext::Track(&[])).await;
+            speech.act(&EventContext::Track(&[])).await;
             assert!(receive.try_recv().is_err(), "a stream error and track error must trigger only one recovery");
         }
     }
@@ -558,7 +581,7 @@ mod speech_tests {
     }
 
     #[test]
-    fn songbird_decodes_live_pocket_pcm_before_the_stream_ends() {
+    fn songbird_decodes_live_speech_pcm_before_the_stream_ends() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let socket = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         socket.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();

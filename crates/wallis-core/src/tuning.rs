@@ -3,20 +3,21 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::RwLock;
+use crate::provision::{EMOTIONS, TTS_VOICES};
 
 pub const FILE: &str = "tuning.json";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Tuning {
-    /// Preset or cloned voice name.
+    /// One of the four speakers (`TTS_VOICES`).
     pub voice: String,
+    /// How he sounds: one of `EMOTIONS`.
+    pub emotion: String,
     /// Playback speed, 0.5–2.0 (also raises pitch).
     pub speed: f32,
-    /// Pocket sampling temperature: higher is livelier and more varied, lower is flatter and steadier.
+    /// Sampling temperature: higher is livelier and more varied, lower is flatter and steadier.
     pub temp: f32,
-    /// Pocket end-of-speech threshold: higher allows longer generation, lower ends sooner.
-    pub eos_threshold: f32,
     /// Seconds between unprompted contributions.
     pub cooldown_secs: u32,
     /// Seconds after an answer in which the same person's voice follow-up needs no name.
@@ -28,17 +29,18 @@ pub struct Tuning {
 }
 
 impl Default for Tuning {
-    fn default() -> Self { Self { voice: "alba".into(), speed: 1.0, temp: 0.3, eos_threshold: -4.0, cooldown_secs: 5, follow_up_secs: 20, silence_ms: 150, barge_in_ms: 0 } }
+    fn default() -> Self { Self { voice: "emily".into(), emotion: "neutral".into(), speed: 1.0, temp: 1.0, cooldown_secs: 5, follow_up_secs: 20, silence_ms: 150, barge_in_ms: 0 } }
 }
 
 impl Tuning {
     /// Every value comes from a model, so validate it before applying it.
     pub fn validate(&self) -> Result<(), String> {
-        let ranges = [("speed", self.speed, 0.5, 2.0), ("temp", self.temp, 0.05, 1.5), ("eos_threshold", self.eos_threshold, -8.0, 0.0)];
+        let ranges = [("speed", self.speed, 0.5, 2.0), ("temp", self.temp, 0.3, 1.5)];
         for (name, value, low, high) in ranges { if !(low..=high).contains(&value) { return Err(format!("{name} must be between {low} and {high}.")); } }
         let counts = [("cooldown_secs", self.cooldown_secs, 5, 300), ("follow_up_secs", self.follow_up_secs, 0, 120), ("silence_ms", self.silence_ms, 100, 2000), ("barge_in_ms", self.barge_in_ms, 0, 5000)];
         for (name, value, low, high) in counts { if !(low..=high).contains(&value) { return Err(format!("{name} must be between {low} and {high}.")); } }
-        if self.voice.is_empty() || !self.voice.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') || self.voice.len() > 40 { return Err("Voice names use letters, digits, - and _ (up to 40).".into()); }
+        if !TTS_VOICES.iter().any(|v| v.0 == self.voice) { return Err(format!("voice must be one of: {}.", TTS_VOICES.map(|v| v.0).join(", "))); }
+        if !EMOTIONS.contains(&self.emotion.as_str()) { return Err(format!("emotion must be one of: {}.", EMOTIONS.join(", "))); }
         Ok(())
     }
 
@@ -51,9 +53,9 @@ impl Tuning {
             let count = || value.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| format!("{key} must be a whole number."));
             match key.as_str() {
                 "voice" => { next.voice = value.as_str().ok_or("voice must be text.")?.into(); changed.push("voice"); }
+                "emotion" => { next.emotion = value.as_str().ok_or("emotion must be text.")?.into(); changed.push("emotion"); }
                 "speed" => { next.speed = float()?; changed.push("speed"); }
                 "temp" => { next.temp = float()?; changed.push("temp"); }
-                "eosThreshold" => { next.eos_threshold = float()?; changed.push("eosThreshold"); }
                 "cooldownSecs" => { next.cooldown_secs = count()?; changed.push("cooldownSecs"); }
                 "followUpSecs" => { next.follow_up_secs = count()?; changed.push("followUpSecs"); }
                 "silenceMs" => { next.silence_ms = count()?; changed.push("silenceMs"); }
@@ -83,21 +85,13 @@ pub fn load(dir: &Path, seed: Tuning) -> Tuning {
     let seed_json = serde_json::to_string(&seed).unwrap_or_default();
     let fresh = std::fs::read_to_string(&marker).ok().as_deref() != Some(&seed_json);
     if fresh { let _ = std::fs::write(&marker, &seed_json); let _ = std::fs::remove_file(dir.join(FILE)); }
-    let mut tuning = std::fs::read_to_string(dir.join(FILE)).ok().and_then(|text| serde_json::from_str::<Tuning>(&text).ok()).filter(|t| t.validate().is_ok()).unwrap_or(seed.clone());
-    if !dir.join("voices").join(format!("{}.safetensors", tuning.voice)).is_file() && !dir.join("models/pocket").join(format!("{}.safetensors", tuning.voice)).is_file() {
-        tuning.voice = seed.voice;
-    }
+    let tuning = std::fs::read_to_string(dir.join(FILE)).ok().and_then(|text| serde_json::from_str::<Tuning>(&text).ok()).filter(|t| t.validate().is_ok()).unwrap_or(seed);
     if let Ok(mut slot) = CURRENT.write() { *slot = Some(tuning.clone()); }
     tuning
 }
 
 /// Applies `changes`, saves them and makes them current.
 pub fn update(dir: &Path, changes: &serde_json::Map<String, serde_json::Value>) -> Result<(Tuning, Vec<&'static str>), String> {
-    if changes.contains_key("voice") {
-        let mut next = current();
-        next.apply(changes)?;
-        crate::speech::validate_voice(&next.voice)?;
-    }
     let mut slot = CURRENT.write().map_err(|_| "Tuning is unavailable.".to_string())?;
     let mut tuning = slot.clone().unwrap_or_default();
     let changed = tuning.apply(changes)?;
@@ -116,12 +110,12 @@ fn save(dir: &Path, tuning: &Tuning) -> Result<(), String> {
 pub fn recover(dir: &Path, failed: &Tuning) -> Result<(), String> {
     let mut slot = CURRENT.write().map_err(|_| "Tuning is unavailable.".to_string())?;
     let mut next = slot.clone().unwrap_or_default();
-    if (next.voice.as_str(), next.speed, next.temp, next.eos_threshold) != (failed.voice.as_str(), failed.speed, failed.temp, failed.eos_threshold) { return Ok(()); }
+    if (next.voice.as_str(), next.emotion.as_str(), next.speed, next.temp) != (failed.voice.as_str(), failed.emotion.as_str(), failed.speed, failed.temp) { return Ok(()); }
     let seed = std::fs::read_to_string(dir.join("tuning.seed")).ok().and_then(|s| serde_json::from_str::<Tuning>(&s).ok()).filter(|t| t.validate().is_ok()).unwrap_or_default();
     next.voice = seed.voice;
+    next.emotion = Tuning::default().emotion;
     next.speed = 1.0;
     next.temp = Tuning::default().temp;
-    next.eos_threshold = Tuning::default().eos_threshold;
     *slot = Some(next.clone());
     save(dir, &next)
 }
@@ -136,10 +130,10 @@ mod tests {
     #[test]
     fn applies_valid_changes_atomically_and_rejects_the_rest() {
         let mut t = Tuning::default();
-        assert_eq!(t.apply(&changes(json!({"speed":1.2,"temp":0.6,"bargeInMs":600}))).unwrap().len(), 3);
-        assert_eq!((t.speed, t.temp, t.barge_in_ms), (1.2, 0.6, 600));
+        assert_eq!(t.apply(&changes(json!({"speed":1.2,"temp":0.6,"bargeInMs":600,"emotion":"happy","voice":"paul"}))).unwrap().len(), 5);
+        assert_eq!((t.speed, t.temp, t.barge_in_ms, t.emotion.as_str(), t.voice.as_str()), (1.2, 0.6, 600, "happy", "paul"));
         let before = t.clone();
-        for bad in [json!({"speed":3.0}), json!({"speed":1.1,"silenceMs":5}), json!({"voice":"../x"}), json!({"nope":1}), json!({}), json!({"cooldownSecs":-1})] {
+        for bad in [json!({"speed":3.0}), json!({"speed":1.1,"silenceMs":5}), json!({"voice":"../x"}), json!({"emotion":"sleepy"}), json!({"nope":1}), json!({}), json!({"cooldownSecs":-1})] {
             assert!(t.apply(&changes(bad)).is_err());
             assert_eq!(t, before, "a rejected call changes nothing");
         }
@@ -158,13 +152,13 @@ mod tests {
         assert_eq!(current().speed, 1.1);
         assert_eq!(load(&dir, Tuning::default()).speed, 1.1, "read back from disk");
         assert_eq!(load(&dir, Tuning { speed: 0.9, ..Tuning::default() }).speed, 0.9, "a changed desktop setting wins");
-        let failed = Tuning { voice: "missing".into(), temp: 1.5, speed: 2.0, eos_threshold: 0.0, cooldown_secs: 42, ..Default::default() };
+        let failed = Tuning { voice: "missing".into(), emotion: "angry".into(), temp: 1.5, speed: 2.0, cooldown_secs: 42, ..Default::default() };
         save(&dir, &failed).unwrap();
-        assert_eq!(load(&dir, Tuning { speed: 0.9, ..Tuning::default() }).voice, "alba", "a missing saved voice cannot disable speech on startup");
+        assert_eq!(load(&dir, Tuning { speed: 0.9, ..Tuning::default() }).voice, "emily", "an invalid saved voice cannot disable speech on startup");
         *CURRENT.write().unwrap() = Some(failed.clone());
         recover(&dir, &failed).unwrap();
         let recovered = current();
-        assert_eq!((recovered.voice.as_str(), recovered.speed, recovered.temp, recovered.eos_threshold, recovered.cooldown_secs), ("alba", 1.0, 0.3, -4.0, 42));
+        assert_eq!((recovered.voice.as_str(), recovered.emotion.as_str(), recovered.speed, recovered.temp, recovered.cooldown_secs), ("emily", "neutral", 1.0, 1.0, 42));
         assert_eq!(load(&dir, Tuning { speed: 0.9, ..Tuning::default() }), recovered, "recovery survives restart");
         update(&dir, &changes(json!({"temp":0.6}))).unwrap();
         recover(&dir, &failed).unwrap();
@@ -172,6 +166,6 @@ mod tests {
         let live = current();
         std::fs::remove_dir_all(dir).unwrap();
         assert!(recover(&std::env::temp_dir().join("wallis-no-such-recovery-directory").join("child"), &live).is_err());
-        assert_eq!(current().temp, 0.3, "disk failure cannot prevent live recovery");
+        assert_eq!(current().temp, 1.0, "disk failure cannot prevent live recovery");
     }
 }

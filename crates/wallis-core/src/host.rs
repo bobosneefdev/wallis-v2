@@ -40,6 +40,8 @@ pub struct Host<'a, D: Discord> {
     pub write_channels: Vec<String>,
     /// Set when the agent chose to stay silent this turn.
     pub skipped: bool,
+    /// The text channel this turn answers, or 0 in the voice call. Reminders and jobs remember it so their results go back there.
+    pub origin: u64,
     /// `profile.json`. Only Wallis' own `update_profile` call writes it; the UI never edits it after creation.
     pub profile: PathBuf,
 }
@@ -70,21 +72,8 @@ impl<D: Discord> Host<'_, D> {
     fn data(&self) -> &Path { self.profile.parent().unwrap_or(Path::new(".")) }
 
     fn voices(&self) -> String {
-        let names = |dir: PathBuf| std::fs::read_dir(dir).into_iter().flatten().filter_map(|e| e.ok()?.path().file_stem().map(|s| s.to_string_lossy().into_owned())).collect::<std::collections::BTreeSet<_>>();
-        let (presets, cloned) = (crate::provision::TTS_VOICES.map(|v| v.0.to_string()).join(", "), names(self.data().join("voices")).into_iter().collect::<Vec<_>>().join(", "));
-        format!("Presets: {presets}. Cloned: {}. Speaking now in: {}.", if cloned.is_empty() { "none".into() } else { cloned }, crate::tuning::current().voice)
-    }
-
-    /// Turns a WAV in the media folder (the worker prepares it) into a voice, and by default switches to it.
-    fn clone_voice(&self, name: &str, path: &str, switch: bool) -> Result<String, String> {
-        let name = name.trim().to_lowercase();
-        if crate::provision::TTS_VOICES.iter().any(|v| v.0 == name) { return Err("That name belongs to a built-in voice; pick another.".into()); }
-        if !self.data().join("cloning-enabled").is_file() { return Err("Voice cloning is not enabled. The host turns it on in the desktop app's voice settings.".into()); }
-        let wav = crate::mods::confined_path(&self.data().join("media"), Path::new(path))?;
-        if wav.extension().and_then(|e| e.to_str()) != Some("wav") { return Err("Pass a 16-bit WAV of the voice (a clean 10–30 s clip) from the media folder; ask the worker to prepare it.".into()); }
-        crate::speech::clone_voice(&name, &wav)?;
-        if switch { crate::tuning::update(self.data(), json!({"voice": name}).as_object().expect("object"))?; }
-        Ok(format!("Cloned the voice as {name}{}.", if switch { " and switched to it from the next sentence" } else { "" }))
+        let now = crate::tuning::current();
+        format!("Voices: {}. Emotions: {}. Speaking now as {} sounding {}.", crate::provision::TTS_VOICES.map(|v| v.0).join(", "), crate::provision::EMOTIONS.join(", "), now.voice, now.emotion)
     }
 
     /// The returned string is the tool result the model sees, including failures (the model can recover from those).
@@ -116,8 +105,7 @@ impl<D: Discord> Host<'_, D> {
             "tune" => call.args.as_object().ok_or_else(|| "Pass the settings to change.".to_string()).and_then(|changes| crate::tuning::update(self.data(), changes))
                 .map(|(t, changed)| format!("Changed {}. Applies from the next sentence. Now: {}", changed.join(", "), serde_json::to_string(&t).unwrap_or_default())),
             "list_voices" => Ok(self.voices()),
-            "clone_voice" => self.clone_voice(&text("name"), &text("path"), call.args.get("use").and_then(Value::as_bool).unwrap_or(true)),
-            "channel_history" => {
+                "channel_history" => {
                 let limit = call.args.get("limit").and_then(Value::as_u64).unwrap_or(20).clamp(1, 50) as u8;
                 self.discord.history(&channel, limit)
             }
@@ -127,7 +115,7 @@ impl<D: Discord> Host<'_, D> {
             }.map(|id| format!("Joined voice channel {id}. Say hello, or carry on where you left off.")),
             "leave_call" => self.discord.leave().map(|_| "Left the call.".to_string()),
             "remind" => call.args.get("minutes").and_then(Value::as_f64).ok_or_else(|| "`minutes` is required.".to_string())
-                .and_then(|minutes| self.reminders.add(schedule::now(), minutes, &text("note"), self.guild, self.user, self.discord.voice_channel()))
+                .and_then(|minutes| self.reminders.add(schedule::now(), minutes, &text("note"), self.guild, self.user, self.discord.voice_channel(), self.origin))
                 .map(|r| format!("Reminder {} set for {} (in {}). It will reach you as a message when it is due.", r.id, schedule::stamp(r.due_at), schedule::span(r.due_at - r.created_at))),
             "cancel_reminder" => match call.args.get("id").and_then(Value::as_i64) {
                 Some(id) => self.reminders.cancel(id, self.guild).and_then(|found| if found { Ok(format!("Cancelled reminder {id}.")) } else { Err(format!("No pending reminder {id}.")) }),
@@ -145,7 +133,7 @@ impl<D: Discord> Host<'_, D> {
             "delegate" => {
                 let (task, context) = (text("task"), text("context"));
                 if task.is_empty() { Err("`task` is required.".into()) } else {
-                    self.jobs.enqueue_scoped(&format!("{task}\n\nContext:\n{context}"), &channel, self.guild, self.user).map(|id| format!("Queued as job {id}. The user does not see the worker: the full result comes back to you privately as a `[job finished]` message, and you tell them yourself. Say briefly that you are on it, then carry on."))
+                    self.jobs.enqueue_scoped(&format!("{task}\n\nContext:\n{context}"), &channel, self.guild, self.user, self.origin).map(|id| format!("Queued as job {id}. The user does not see the worker: the full result comes back to you privately as a `[job finished]` message, and you tell them yourself. Say briefly that you are on it, then carry on."))
                 }
             }
             other => Err(format!("Unknown tool {other:?}.")),
@@ -186,7 +174,7 @@ mod tests {
         std::fs::write(root.join("outside.webm"), "private").unwrap();
         std::fs::File::create(root.join("media/large.webm")).unwrap().set_len(50 * 1024 * 1024 + 1).unwrap();
         let (mut fake, jobs, reminders) = (Fake::default(), Jobs::open(":memory:").unwrap(), Reminders::open(":memory:").unwrap());
-        let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec!["10".into()], skipped: false, profile: root.join("profile.json") };
+        let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec!["10".into()], skipped: false, origin: 0, profile: root.join("profile.json") };
         for path in [root.join("outside.webm"), root.join("media/large.webm"), root.join("media")] {
             assert!(host.handle(call("queue", json!({"path":path,"title":"bad"}))).starts_with("Failed:"));
         }
@@ -205,7 +193,7 @@ mod tests {
     #[test]
     fn speech_continues_until_wallis_explicitly_stops_it() {
         let (mut fake, jobs, reminders) = (Fake::default(), Jobs::open(":memory:").unwrap(), Reminders::open(":memory:").unwrap());
-        let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec![], skipped: false, profile: PathBuf::new() };
+        let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec![], skipped: false, origin: 0, profile: PathBuf::new() };
         host.handle(call("say", json!({ "text": "Keep going." })));
         host.handle(call("skip", json!({})));
         assert!(!host.discord.stopped);
@@ -219,7 +207,7 @@ mod tests {
     #[test]
     fn routes_tools_enforces_write_channels_and_queues_delegations() {
         let (mut fake, jobs, reminders) = (Fake::default(), Jobs::open(":memory:").unwrap(), Reminders::open(":memory:").unwrap());
-        let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec!["10".into()], skipped: false, profile: std::env::temp_dir().join(format!("wallis-host-profile-{}.json", std::process::id())) };
+        let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec!["10".into()], skipped: false, origin: 0, profile: std::env::temp_dir().join(format!("wallis-host-profile-{}.json", std::process::id())) };
         assert!(host.handle(call("say", json!({ "text": "hi" }))).starts_with("Queued for speech."));
         assert_eq!(host.handle(call("message", json!({ "channelId": "10", "text": "yo" }))), "Posted.");
         assert!(host.handle(call("message", json!({ "channelId": "99", "text": "no" }))).starts_with("Failed: Channel"));
@@ -251,19 +239,30 @@ mod tests {
     }
 
     #[test]
-    fn voice_tools_tune_live_and_cloning_needs_the_hosts_switch() {
+    fn delayed_work_remembers_the_text_channel_it_was_asked_in() {
+        let (mut fake, jobs, reminders) = (Fake::default(), Jobs::open(":memory:").unwrap(), Reminders::open(":memory:").unwrap());
+        let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec!["10".into()], skipped: false, origin: 10, profile: PathBuf::new() };
+        assert!(host.handle(call("delegate", json!({ "task": "jokes", "context": "", "channelId": "10" }))).starts_with("Queued as job"));
+        assert!(host.handle(call("remind", json!({ "minutes": 5, "note": "ping them" }))).starts_with("Reminder"));
+        host.origin = 0;
+        assert!(host.handle(call("delegate", json!({ "task": "from voice", "context": "", "channelId": "10" }))).starts_with("Queued as job"));
+        assert_eq!(reminders.list(1).unwrap()[0].origin, 10);
+        assert_eq!(jobs.with_status(&["queued"]).unwrap().iter().map(|job| job.origin).collect::<Vec<_>>(), [10, 0]);
+    }
+
+    #[test]
+    fn voice_tools_tune_live() {
         let _guard = crate::tuning::TEST_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!("wallis-host-voice-{}", std::process::id()));
         std::fs::create_dir_all(root.join("media")).unwrap();
-        std::fs::write(root.join("media/johnny.wav"), "RIFF").unwrap();
         let (mut fake, jobs, reminders) = (Fake::default(), Jobs::open(":memory:").unwrap(), Reminders::open(":memory:").unwrap());
-        let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec![], skipped: false, profile: root.join("profile.json") };
+        let mut host = Host { discord: &mut fake, jobs: &jobs, reminders: &reminders, guild: 1, user: 2, write_channels: vec![], skipped: false, origin: 0, profile: root.join("profile.json") };
         assert!(host.handle(call("tune", json!({ "speed": 1.1, "temp": 0.6 }))).starts_with("Changed speed, temp."));
         assert!(host.handle(call("tune", json!({ "speed": 9 }))).starts_with("Failed"));
         assert!(host.handle(call("tune", json!({ "nope": 1 }))).starts_with("Failed"));
-        assert!(host.handle(call("list_voices", json!({}))).contains("Presets: "));
-        assert!(host.handle(call("clone_voice", json!({ "name": "johnny", "path": "johnny.wav" }))).contains("not enabled"));
-        assert!(host.handle(call("clone_voice", json!({ "name": "alba", "path": "johnny.wav" }))).contains("built-in"));
+        assert!(host.handle(call("list_voices", json!({}))).contains("Voices: emily"));
+        assert!(host.handle(call("tune", json!({ "emotion": "happy", "voice": "sophie" }))).starts_with("Changed emotion, voice."));
+        assert!(host.handle(call("tune", json!({ "emotion": "bored" }))).starts_with("Failed"));
         assert!(host.handle(call("channel_history", json!({ "channelId": "10" }))).starts_with("Failed"));
         std::fs::remove_dir_all(root).unwrap();
     }

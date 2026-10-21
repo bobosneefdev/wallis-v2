@@ -21,13 +21,11 @@ pub struct WallisConfig {
     pub tts_voice: String,
     pub tts_speed: f32,
     pub silence_ms: u32,
-    /// The host accepted that they alone are responsible for every voice clone being consensual. Cloning needs this and a Hugging Face token.
-    pub cloning_consent: bool,
 }
 
 impl Default for WallisConfig {
     fn default() -> Self {
-        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), discord_read_channels: String::new(), discord_write_channels: String::new(), discord_voice_text_channel: String::new(), voice_participation: "natural".into(), text_participation: "natural".into(), participation_cooldown_secs: 5, auto_start: false, onboarded: false, stt_model: "parakeet-0.6b-v3-int8".into(), stt_threads: 4, tts_voice: "alba".into(), tts_speed: 1.0, silence_ms: 350, cloning_consent: false }
+        Self { discord_application_id: String::new(), discord_allowed_users: String::new(), discord_read_channels: String::new(), discord_write_channels: String::new(), discord_voice_text_channel: String::new(), voice_participation: "natural".into(), text_participation: "natural".into(), participation_cooldown_secs: 5, auto_start: false, onboarded: false, stt_model: "parakeet-0.6b-v3-int8".into(), stt_threads: 4, tts_voice: "emily".into(), tts_speed: 1.0, silence_ms: 350 }
     }
 }
 
@@ -52,7 +50,7 @@ pub fn load_config_file(path: &Path) -> Result<WallisConfig, String> {
     let mut config: WallisConfig = serde_json::from_slice(&std::fs::read(path).map_err(|error| format!("Unable to read Wallis configuration: {error}"))?)
         .map_err(|error| format!("Wallis configuration is invalid: {error}"))?;
     if ["tiny.en", "base.en", "small.en", "parakeet-110m-int8"].contains(&config.stt_model.as_str()) { config.stt_model = "parakeet-0.6b-v3-int8".into(); }
-    if ["medium", "high"].contains(&config.tts_voice.as_str()) { config.tts_voice = "alba".into(); config.tts_speed = 1.0; }
+    if !TTS_VOICES.iter().any(|(id, _)| *id == config.tts_voice) { config.tts_voice = "emily".into(); config.tts_speed = 1.0; }
     Ok(config)
 }
 
@@ -93,7 +91,7 @@ pub fn sanitize_profile(mut profile: Profile) -> Profile {
 /// Voice knobs come from the GUI, so clamp them to what the runtimes actually accept.
 pub fn validate_voice(config: &mut WallisConfig) -> Result<(), String> {
     if !STT_MODELS.iter().any(|(id, ..)| *id == config.stt_model) { return Err("Choose a supported speech recognition model.".into()); }
-    if !TTS_VOICES.iter().any(|(id, ..)| *id == config.tts_voice) { return Err("Choose a supported voice.".into()); }
+    if !TTS_VOICES.iter().any(|(id, _)| *id == config.tts_voice) { return Err("Choose a supported voice.".into()); }
     if !(1..=64).contains(&config.stt_threads) { return Err("Use between 1 and 64 speech recognition threads.".into()); }
     if !(0.5..=2.0).contains(&config.tts_speed) { return Err("Voice speed must be between 0.5 and 2.0.".into()); }
     if !(100..=2000).contains(&config.silence_ms) { return Err("The silence window must be between 100 and 2000 milliseconds.".into()); }

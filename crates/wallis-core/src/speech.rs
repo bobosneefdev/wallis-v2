@@ -1,4 +1,4 @@
-//! Speech plumbing between Discord (48 kHz stereo PCM), Parakeet (16 kHz mono WAV) and Pocket TTS (24 kHz mono f32 PCM).
+//! Speech plumbing between Discord (48 kHz stereo PCM), Parakeet (16 kHz mono WAV) and NeuTTS-2E (24 kHz mono f32 PCM).
 use std::io::Read;
 
 pub const STT_URL: &str = "http://127.0.0.1:8085";
@@ -22,8 +22,8 @@ pub fn wav16k(samples: &[i16]) -> Vec<u8> {
     wav
 }
 
-/// Pocket TTS output -> Discord voice: linear-interpolate 24 kHz mono up to 48 kHz and duplicate to stereo.
-pub fn pocket_to_discord(mono: &[i16]) -> Vec<i16> {
+/// NeuTTS output -> Discord voice: linear-interpolate 24 kHz mono up to 48 kHz and duplicate to stereo.
+pub fn tts_to_discord(mono: &[i16]) -> Vec<i16> {
     if mono.is_empty() { return vec![]; }
     let frames = mono.len() * 48_000 / TTS_RATE;
     let mut out = Vec::with_capacity(frames * 2);
@@ -58,35 +58,18 @@ pub fn transcribe(pcm_48k_stereo: &[i16]) -> Result<String, String> {
 
 /// Streaming 24 kHz mono little-endian f32 PCM. Dropping the reader cancels the HTTP stream.
 pub fn synthesize_stream(text: &str, tuning: &crate::tuning::Tuning) -> Result<impl Read + Send + Sync + 'static, String> {
-    let response = ureq::post(format!("{TTS_URL}/synthesize")).config().timeout_recv_response(Some(std::time::Duration::from_secs(30))).timeout_recv_body(Some(std::time::Duration::from_secs(600))).build().send_json(serde_json::json!({ "text": text, "voice": tuning.voice, "temp": tuning.temp, "eos_threshold": tuning.eos_threshold }))
-        .map_err(|error| format!("Pocket TTS failed: {error}"))?;
+    let response = ureq::post(format!("{TTS_URL}/synthesize")).config().timeout_recv_response(Some(std::time::Duration::from_secs(30))).timeout_recv_body(Some(std::time::Duration::from_secs(600))).build().send_json(serde_json::json!({ "text": text, "voice": tuning.voice, "emotion": tuning.emotion, "temp": tuning.temp }))
+        .map_err(|error| format!("Speech synthesis failed: {error}"))?;
     Ok(response.into_body().into_reader())
-}
-
-/// Ask the running model to load the voice before accepting a persistent change.
-pub fn validate_voice(name: &str) -> Result<(), String> {
-    ureq::post(format!("{TTS_URL}/voice")).config().timeout_global(Some(std::time::Duration::from_secs(30))).build()
-        .send_json(serde_json::json!({ "voice": name })).map(|_| ())
-        .map_err(|error| format!("Unable to load voice {name:?}: {error}. Use list_voices to choose an installed voice; your settings have not changed."))
-}
-
-/// Turns a WAV already in the media folder into a voice named `name`, via the speech server. Needs cloning enabled.
-pub fn clone_voice(name: &str, wav: &std::path::Path) -> Result<(), String> {
-    ureq::post(format!("{TTS_URL}/clone")).config().timeout_global(Some(std::time::Duration::from_secs(300))).http_status_as_error(false).build()
-        .send_json(serde_json::json!({ "name": name, "audio": wav })).map_err(|error| format!("Voice cloning failed: {error}")).and_then(|mut response| {
-            if response.status().is_success() { return Ok(()); }
-            let body = response.body_mut().read_to_string().unwrap_or_default();
-            Err(body.split("Error code explanation:").nth(1).and_then(|rest| rest.split("</p>").next()).map(|s| s.trim().trim_end_matches('.').to_string()).unwrap_or_else(|| "Voice cloning failed.".into()))
-        })
 }
 
 /// Buffered roundtrip helper for the provisioning check; Discord uses synthesize_stream directly.
 pub fn synthesize(text: &str) -> Result<Vec<i16>, String> {
     let mut bytes = Vec::new();
-    synthesize_stream(text, &crate::tuning::current())?.read_to_end(&mut bytes).map_err(|error| format!("Pocket TTS stream failed: {error}"))?;
-    if bytes.len() % 4 != 0 { return Err("Pocket TTS returned incomplete PCM.".into()); }
+    synthesize_stream(text, &crate::tuning::current())?.read_to_end(&mut bytes).map_err(|error| format!("Speech stream failed: {error}"))?;
+    if bytes.len() % 4 != 0 { return Err("Speech returned incomplete PCM.".into()); }
     let mono: Vec<i16> = bytes.chunks_exact(4).map(|sample| (f32::from_le_bytes(sample.try_into().unwrap()).clamp(-1.0, 1.0) * 32767.0) as i16).collect();
-    Ok(pocket_to_discord(&mono))
+    Ok(tts_to_discord(&mono))
 }
 
 #[cfg(test)]
@@ -108,11 +91,11 @@ mod tests {
     }
 
     #[test]
-    fn upsamples_pocket_audio_to_discord_stereo() {
-        let out = pocket_to_discord(&vec![1000; 2400]);
+    fn upsamples_tts_audio_to_discord_stereo() {
+        let out = tts_to_discord(&vec![1000; 2400]);
         assert_eq!(out.len(), 4800 * 2, "0.1 s at 48 kHz stereo");
         assert!(out.iter().all(|&s| s == 1000) && out.chunks(2).all(|f| f[0] == f[1]));
-        assert!(pocket_to_discord(&[]).is_empty());
+        assert!(tts_to_discord(&[]).is_empty());
     }
 
     #[test]

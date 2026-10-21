@@ -12,12 +12,9 @@
   let sttOptions = $state<VoiceOption[]>([]);
   let ttsOptions = $state<VoiceOption[]>([]);
   let note = $state("");
-  let hasHfToken = $state(false);
-  let hfToken = $state("");
-  let consent: HTMLDialogElement;
 
   async function load() {
-    try { [config, hasToken, hasHfToken, [sttOptions, ttsOptions]] = await Promise.all([invoke("get_config"), invoke("get_secret_status").then((s) => s.hasToken), invoke("get_hf_token_status").then((s) => s.hasToken), invoke("get_voice_options")]); }
+    try { [config, hasToken, [sttOptions, ttsOptions]] = await Promise.all([invoke("get_config"), invoke("get_secret_status").then((s) => s.hasToken), invoke("get_voice_options")]); }
     catch (error) { note = message(error); }
   }
 
@@ -30,16 +27,9 @@
       config = await invoke("save_config", { config: clean });
       if (token) hasToken = (await invoke("save_discord_token", { token })).hasToken;
       token = "";
-      if (hfToken || (!config.cloningConsent && hasHfToken)) hasHfToken = (await invoke("save_hf_token", { token: config.cloningConsent ? hfToken : "" })).hasToken;
-      hfToken = "";
       note = "Saved. Restart Wallis to apply Discord and voice changes.";
       refresh();
     } catch (error) { note = message(error); }
-  }
-
-  function toggleCloning(event: Event) {
-    const box = event.currentTarget as HTMLInputElement;
-    if (box.checked) { box.checked = false; consent.showModal(); } else config.cloningConsent = false;
   }
 
   void load();
@@ -71,24 +61,12 @@
     <select id="stt" bind:value={config.sttModel}>{#each sttOptions as option (option.id)}<option value={option.id}>{option.label} · {option.megabytes} MB</option>{/each}</select>
     <label for="threads">Recognition threads</label>
     <input id="threads" type="number" min="1" max="64" bind:value={config.sttThreads} />
-    <label for="tts">Voice</label>
-    <select id="tts" bind:value={config.ttsVoice}>{#each ttsOptions as option (option.id)}<option value={option.id}>{option.label} · {option.megabytes} MB</option>{/each}</select>
+    <label for="tts">Voice <span>(Wallis picks his own emotion)</span></label>
+    <select id="tts" bind:value={config.ttsVoice}>{#each ttsOptions as option (option.id)}<option value={option.id}>{option.label}</option>{/each}</select>
     <label for="speed">Speaking speed <span>(lower is faster; also changes pitch)</span></label>
     <input id="speed" type="number" min="0.5" max="2" step="0.05" bind:value={config.ttsSpeed} />
-    <label class="check"><input type="checkbox" checked={config.cloningConsent} onchange={toggleCloning} /> Allow Wallis to clone voices <span>(needs a Hugging Face token)</span></label>
-    {#if config.cloningConsent}
-      <label for="hf-token">Hugging Face token <span>(account must have accepted the kyutai/pocket-tts terms)</span></label>
-      <input id="hf-token" type="password" bind:value={hfToken} placeholder={hasHfToken ? "Stored securely — type to replace" : "Paste the Hugging Face token"} autocomplete="off" />
-    {/if}
     <label class="check"><input type="checkbox" bind:checked={config.autoStart} /> Start Wallis when the app opens</label>
     <button type="submit">Save</button>
   </form>
   <p class="hint" role="status" aria-live="polite">{note}</p>
 </section>
-
-<dialog bind:this={consent} aria-labelledby="consent-title">
-  <h2 id="consent-title">Voice cloning responsibility</h2>
-  <p>Wallis will clone any voice he is asked to, with no per-request check. You, the host, are fully and solely responsible for ensuring every voice clone is consensual and lawful. Kyutai's terms prohibit cloning anyone's voice without their explicit consent.</p>
-  <button type="button" onclick={() => { config.cloningConsent = true; consent.close(); }}>I accept full responsibility</button>
-  <button type="button" onclick={() => consent.close()}>Cancel</button>
-</dialog>

@@ -7,7 +7,8 @@ apt-get update
 apt-get install -y --no-install-recommends ca-certificates curl git unzip xz-utils sudo bubblewrap ffmpeg e2fsprogs mount python3 build-essential cmake \
   libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64 libdrm2 libdbus-1-3 \
   libxkbcommon0 libx11-6 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 \
-  libasound2t64 libpango-1.0-0 libcairo2 fonts-liberation fonts-noto-color-emoji libglib2.0-0t64
+  libasound2t64 libpango-1.0-0 libcairo2 fonts-liberation fonts-noto-color-emoji libglib2.0-0t64 \
+  glslc glslang-tools spirv-headers libvulkan-dev libvulkan1 mesa-vulkan-drivers
 # Official WSL images may already have an ubuntu user at uid 1000.
 if getent passwd 1000 >/dev/null && ! id wallis >/dev/null 2>&1; then
   old_user=$(getent passwd 1000 | cut -d: -f1)
@@ -60,6 +61,17 @@ cp -R "$source_dir/skills/." /opt/wallis/tools/skills/
 cp -R "$source_dir/mods" /opt/wallis/stock-mods
 # Source tarballs omit node_modules; dependencies are root-owned and read-only to worker code.
 ln -s /opt/wallis/tools/node/node_modules /opt/wallis/stock-mods/node_modules
+# NeuTTS-2E's backbone runs in llama.cpp: one portable build with every x86 CPU variant plus Vulkan (NVIDIA, AMD and Intel GPUs), picked at runtime.
+fetch https://github.com/ggml-org/llama.cpp/archive/dd002b91f583af0b80140f9a140dc04856bfc2e0.tar.gz 758da90e044707fc9880dfa22ad353bc4b67e2f2cb4aadfbb6e322c3a6eade2b
+mkdir /tmp/llama-src && tar -xzf /tmp/wallis-download --strip-components=1 -C /tmp/llama-src
+(cd /tmp/llama-src && cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_VULKAN=ON \
+  -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN' -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON \
+  && cmake --build build --target llama-server -j"$(nproc)")
+mkdir -p /opt/wallis/tools/llama
+cp -a /tmp/llama-src/build/bin/. /opt/wallis/tools/llama/
+cp /tmp/llama-src/LICENSE /opt/wallis/tools/llama/LICENSE
+cp "$source_dir/licenses/NeuTTS-Open-License-v1.0.txt" /opt/wallis/tools/llama/NeuTTS-Open-License-v1.0.txt
+/opt/wallis/tools/llama/llama-server --version
 export UV_PYTHON_INSTALL_DIR=/opt/wallis/tools/python
 # Mnemosyne's llama-cpp-python builds from source. Do not bake the CI host's CPU into the release.
 export CMAKE_ARGS=-DGGML_NATIVE=OFF
@@ -71,4 +83,4 @@ chmod -R go-w /opt/wallis
 chown wallis:wallis /var/lib/wallis
 printf '%s\n' "${WALLIS_VERSION:?}" > /etc/wallis-release
 rm -f /tmp/wallis-download
-rm -rf /tmp/wallis-bun /root/.cache /opt/wallis/tools/downloads /var/lib/apt/lists/*
+rm -rf /tmp/wallis-bun /tmp/llama-src /root/.cache /opt/wallis/tools/downloads /var/lib/apt/lists/*
