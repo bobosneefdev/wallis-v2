@@ -13,9 +13,11 @@ pub const SHERPA_PACKAGE: &str = "sherpa-onnx==1.13.8";
 pub const TORCH_PACKAGE: &str = "torch==2.14.1+cpu";
 pub const TORCHAUDIO_PACKAGE: &str = "torchaudio==2.11.0+cpu";
 /// NeuTTS-2E's codec and watermarker. torchao is pinned because newer releases break torchtune, setuptools because Perth needs `pkg_resources`.
-pub const NEUTTS_PACKAGES: [&str; 8] = ["neucodec==0.0.6", "torchao==0.11.0", "resemble-perth==1.0.1", "librosa==0.11.0", "soundfile==0.13.1", "setuptools==78.1.0", "requests==2.34.0", "einops==0.8.2"];
+pub const NEUTTS_PACKAGES: [&str; 11] = ["local-attention==1.11.2", "torchtune==0.6.1", "transformers==5.20.2", "vector-quantize-pytorch==1.17.8", "torchao==0.11.0", "resemble-perth==1.0.1", "librosa==0.11.0", "soundfile==0.13.1", "setuptools==78.1.0", "requests==2.34.0", "einops==0.8.2"];
 /// Installed without dependencies: only its four speakers' reference codes are used.
 pub const NEUTTS_SAMPLES_PACKAGE: &str = "neutts==1.4.1";
+/// Installed with `--no-deps` alongside the samples: it declares `torchao>=0.12`, which the pin above deliberately contradicts.
+pub const NEUCODEC_PACKAGE: &str = "neucodec==0.0.6";
 pub const MEMORY_PACKAGE: &str = "mnemosyne-memory[all]==3.15.1";
 pub const MEDIA_PACKAGE: &str = "av==19.0.1";
 pub const PYTHON_VERSION: &str = "3.12";
@@ -202,7 +204,7 @@ pub fn ensure_all(layout: &Layout, stt: &str, hf_token: Option<&str>, progress: 
         progress("Setting up Python for voice and memory…");
         run(&layout.uv(), &["venv", "--python", PYTHON_VERSION, &layout.venv().to_string_lossy()], "create the Python environment")?;
     }
-    let packages = format!("{SHERPA_PACKAGE} {TORCH_PACKAGE} {TORCHAUDIO_PACKAGE} {} {NEUTTS_SAMPLES_PACKAGE} {MEMORY_PACKAGE} {MEDIA_PACKAGE}", NEUTTS_PACKAGES.join(" "));
+    let packages = format!("{SHERPA_PACKAGE} {TORCH_PACKAGE} {TORCHAUDIO_PACKAGE} {} {NEUCODEC_PACKAGE} {NEUTTS_SAMPLES_PACKAGE} {MEMORY_PACKAGE} {MEDIA_PACKAGE}", NEUTTS_PACKAGES.join(" "));
     let marker = layout.venv().join("wallis-packages.txt");
     if std::fs::read_to_string(&marker).ok().as_deref() != Some(&packages) {
         progress("Installing CPU speech and memory packages…");
@@ -211,7 +213,7 @@ pub fn ensure_all(layout: &Layout, stt: &str, hf_token: Option<&str>, progress: 
         let mut install = vec!["pip", "install", "--python", &python, TORCH_PACKAGE, TORCHAUDIO_PACKAGE, SHERPA_PACKAGE, MEMORY_PACKAGE, MEDIA_PACKAGE];
         install.extend(NEUTTS_PACKAGES);
         run(&layout.uv(), &install, "install speech and memory packages")?;
-        run(&layout.uv(), &["pip", "install", "--python", &python, "--no-deps", NEUTTS_SAMPLES_PACKAGE], "install the NeuTTS speaker samples")?;
+        run(&layout.uv(), &["pip", "install", "--python", &python, "--no-deps", NEUCODEC_PACKAGE, NEUTTS_SAMPLES_PACKAGE], "install the NeuTTS codec and speaker samples")?;
         std::fs::write(marker, packages).map_err(|error| error.to_string())?;
     }
     std::fs::write(layout.speech_script(), SPEECH_SERVER).map_err(|error| format!("Unable to write the speech server: {error}"))?;
