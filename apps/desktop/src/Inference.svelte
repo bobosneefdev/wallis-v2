@@ -1,9 +1,10 @@
 <script lang="ts">
   import ProviderPanel from "./ProviderPanel.svelte";
+  import SpeechPanel from "./SpeechPanel.svelte";
   import RolePanel from "./RolePanel.svelte";
   import { invoke, type CodexModel, type Provider, type Roles } from "./invoke";
 
-  const tabs = [["realtime", "Realtime"], ["worker", "Worker"], ["provider", "Provider"]] as const;
+  const tabs = [["realtime", "Realtime"], ["worker", "Worker"], ["provider", "Provider"], ["stt", "STT"], ["tts", "TTS"]] as const;
   const empty = () => ({ provider: "", model: "", effort: "medium", fast: false, packages: [] });
 
   let tab = $state<(typeof tabs)[number][0]>("realtime");
@@ -38,6 +39,8 @@
 
 {#if tab === "provider"}
   <ProviderPanel bind:signedIn bind:codex bind:provider {report} {message} />
+{:else if tab === "stt" || tab === "tts"}
+  <SpeechPanel mode={tab} />
 {:else}
   <RolePanel
     title={tab === "realtime" ? "Realtime — conversation, with memory" : "Worker — background tasks, sandboxed, no memory"}
