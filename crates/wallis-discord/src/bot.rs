@@ -13,7 +13,7 @@ use wallis_core::schedule::{self, Reminders};
 use wallis_core::participation::{should_consider, sounds_like_wallis, Mode, Participation, State, Turn};
 use wallis_core::{pi_config, prompts};
 use wallis_core::role::{Role, RoleConfig};
-use wallis_core::stats::Stats;
+use wallis_core::stats::{log, secs, Stats};
 use wallis_core::{speech, worker, media, tuning};
 
 #[derive(Clone)]
@@ -64,16 +64,28 @@ pub fn turn_prompt(at: i64, mode: Mode, channel: u64, speaker: &str, said: &str)
     }
 }
 
-/// Transcribes finished utterances, dropping silence and failures.
-fn hear(events: Vec<Incoming>, stats: &Stats) -> Vec<(String, String)> {
-    events.into_iter().filter_map(|event| {
-        let Incoming::Voice { speaker, pcm, .. } = event else { return None };
-        match speech::transcribe(&pcm) {
-            Ok(said) if !said.is_empty() => { stats.audit("heard", &format!("{speaker}: {said}")); Some((speaker, said)) }
-            Ok(_) => None,
-            Err(error) => { eprintln!("wallis: {error}"); None }
-        }
-    }).collect()
+/// Speech older than this is no longer worth answering unless it named him; the room has moved on.
+const VOICE_STALE: Duration = Duration::from_secs(20);
+/// The same for typed messages, which people expect answers to for longer.
+const TEXT_STALE: Duration = Duration::from_secs(120);
+/// The longest one realtime turn may run before it is stopped, so the conversation never waits behind it.
+const TURN_LIMIT: Duration = Duration::from_secs(45);
+
+/// The unix time an event arrived, so a delayed turn shows when things were actually said.
+fn arrived(at: Instant) -> i64 { schedule::now() - at.elapsed().as_secs() as i64 }
+
+/// Takes the transcripts from `queue` that may steer a turn answering in `call`, in the order they were said, and when the newest was.
+/// Utterances are transcribed in parallel, so a short one can finish before a longer one said earlier.
+fn take_heard(queue: &mut Queue, guild: u64, call: Option<u64>) -> (Vec<(String, String)>, Option<Instant>) {
+    queue.later.extend(queue.rx.try_iter());
+    let mut heard = Vec::new();
+    queue.later.retain(|(at, event)| match event {
+        Incoming::Heard { speaker, said, .. } if steers(event, guild, call) => { heard.push((*at, speaker.clone(), said.clone())); false }
+        _ => true,
+    });
+    heard.sort_by_key(|(at, ..)| *at);
+    let newest = heard.last().map(|(at, ..)| *at);
+    (heard.into_iter().map(|(_, speaker, said)| (speaker, said)).collect(), newest)
 }
 
 /// Everything heard in the same moment as one message. Consecutive lines from one speaker join into a single line.
@@ -104,7 +116,10 @@ pub fn spawn_realtime_with(config: &BotConfig, persona: bool, system_prompt: &st
     std::fs::write(dir.join("mcp.json"), mcp.to_string()).map_err(|error| error.to_string())?;
     if persona { write_persona(&dir, &config.persona)?; }
     let packages = if persona { pi_config::with_persona(&config.realtime.packages) } else { config.realtime.packages.clone() };
-    pi_config::write_settings(&dir, &packages, serde_json::json!({}))?;
+    // Every transcript that queued up arrives in one steer, not one model call each; failures retry quickly instead of
+    // backing off for up to a minute while the room waits.
+    pi_config::write_settings(&dir, &packages, serde_json::json!({ "steeringMode": "all", "followUpMode": "all",
+        "retry": { "maxRetries": 2, "baseDelayMs": 500, "maxAgentDelayMs": 2000, "provider": { "maxRetries": 1, "maxRetryDelayMs": 2000 } } }))?;
     let cwd = config.data_dir.join("realtime-cwd");
     std::fs::create_dir_all(&cwd).map_err(|error| error.to_string())?;
     Agent::spawn(&config.pi_program, Role::Realtime, &config.realtime, &dir, system_prompt, &cwd, None)
@@ -130,7 +145,7 @@ fn text_context(voice: u64, members: &[(u64, String)], user: u64, channel: u64) 
 }
 
 /// Only speech from the call he is answering in (same guild and voice channel) may steer a running voice turn.
-fn steers(event: &Incoming, guild: u64, call: Option<u64>) -> bool { matches!(event, Incoming::Voice { guild: g, channel, .. } if *g == guild && Some(*channel) == call) }
+fn steers(event: &Incoming, guild: u64, call: Option<u64>) -> bool { matches!(event, Incoming::Heard { guild: g, channel, .. } if *g == guild && Some(*channel) == call) }
 
 /// When Wallis last spoke up in one conversation (a voice or text channel id) and when he may next. Conversations never share a cooldown.
 #[derive(Default)]
@@ -138,17 +153,21 @@ struct Convo { last_reply_at: Option<Instant>, last_reply_user: Option<u64>, nex
 
 struct Brain { config: BotConfig, out: Out, jobs: Jobs, reminders: Reminders, stats: Arc<Stats>, agent: Option<Agent>, convos: std::collections::HashMap<u64, Convo>, started: Instant, media: media::History, last_text_reply: Option<(u64, u64, Instant)>, speech_notes: std::collections::HashMap<u64, String>,
     /// Joins and leaves in his call not yet shown to him (per guild), and the voice channel whose roster he was last given.
-    presence: std::collections::HashMap<u64, Vec<String>>, announced: std::collections::HashMap<u64, u64> }
+    presence: std::collections::HashMap<u64, Vec<String>>, announced: std::collections::HashMap<u64, u64>,
+    /// Typed lines folded into a newer message from the same channel (whether each named him), so a backlog is one turn.
+    backlog: std::collections::HashMap<u64, Vec<(Instant, bool, String)>>,
+    /// When the last realtime turn ended, and whether the context has been checked for compaction since.
+    last_turn: Instant, compact_checked: bool }
 
 /// A new voice transcript is delivered by whether the agent is busy: `steer` into the running turn, or a fresh `prompt`.
-/// `rx` is read between Pi's events while it works; events that are not speech wait in `later` until the turn ends.
-struct Queue<'a> { rx: &'a Receiver<Incoming>, later: Vec<Incoming> }
+/// `rx` is read between Pi's events while it works; events that are not speech wait in `later` (with their arrival time) until the turn ends.
+struct Queue<'a> { rx: &'a Receiver<(Instant, Incoming)>, later: Vec<(Instant, Incoming)> }
 
 impl Brain {
     fn ms(&self, at: Instant) -> u64 { at.duration_since(self.started).as_millis() as u64 }
 
     fn agent(&mut self) -> Result<&mut Agent, String> {
-        if self.agent.is_none() { self.agent = Some(spawn_realtime(&self.config)?); }
+        if self.agent.is_none() { let mut agent = spawn_realtime(&self.config)?; agent.limit = TURN_LIMIT; self.agent = Some(agent); }
         Ok(self.agent.as_mut().expect("agent just created"))
     }
 
@@ -186,7 +205,7 @@ impl Brain {
         let convo = if origin != 0 { origin } else { steer_channel.unwrap_or(0) };
         if let Some(note) = self.speech_notes.remove(&guild) { prompt.push_str(&format!("\n[speech recovery] {note}")); }
         // Take the agent out for the turn so the host can borrow the job store at the same time.
-        let mut agent = match self.agent() { Ok(_) => self.agent.take().expect("agent present"), Err(error) => return eprintln!("wallis: realtime agent unavailable: {error}") };
+        let mut agent = match self.agent() { Ok(_) => self.agent.take().expect("agent present"), Err(error) => return log("error", format!("realtime agent unavailable: {error}")) };
         let (out, write_channels) = (self.out.clone(), self.config.write_channels.clone());
         let mut sink = Sink { out: &out, guild, user };
         let mut host = Host { discord: &mut sink, jobs: &self.jobs, reminders: &self.reminders, guild, user, write_channels, skipped: false, origin, profile: self.config.data_dir.join("profile.json") };
@@ -194,21 +213,27 @@ impl Brain {
         // Several people talk at once in a fast room: transcribe everything that arrived and hand it over as ONE message, with
         // how far behind his speech is, so he can drop what is stale instead of working through each line in order.
         let mut steer = || {
-            let (voices, others): (Vec<_>, Vec<_>) = queue.rx.try_iter().partition(|event| steers(event, guild, steer_channel));
-            queue.later.extend(others);
-            let heard = hear(voices, &stats);
+            let (heard, _) = take_heard(queue, guild, steer_channel);
             if heard.is_empty() { return vec![]; }
             let behind = out.pending_speech(guild);
             let note = if behind >= 2 { format!("\n[you still have {behind} sentences queued to speak; if they are stale, call stop_speaking and catch up in one short line]") } else { String::new() };
             let text = format!("{}{note}", merge_voice(schedule::now(), &heard));
-            stats.steered(); stats.audit("steer", &text);
+            stats.steered(); log("steer", text.replace('\n', " ⏎ "));
             vec![text]
         };
-        self.stats.audit("prompt", &prompt);
-        let audit = self.stats.clone();
+        let where_ = if origin != 0 { format!("text {origin}") } else { format!("voice {}", steer_channel.unwrap_or(0)) };
+        log("turn", format!("start ({where_}, {} images, {} chars) {}", images.len(), prompt.len(), prompt.replace('\n', " ⏎ ")));
         let left = std::cell::Cell::new(false);
         let result = agent.turn_with_images(&prompt, images, Duration::from_secs(60), &mut steer, &mut |call| {
-            if call.tool == "delegate" { audit.audit("delegate", call.args.get("task").and_then(serde_json::Value::as_str).unwrap_or("")); }
+            // What he decided, in his words: what he says and posts, and what he hands to the worker.
+            let arg = |key: &str| call.args.get(key).and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+            match call.tool.as_str() {
+                "say" => log("say", arg("text")),
+                "message" => log("message", format!("#{} {}", arg("channelId"), arg("text"))),
+                "delegate" => log("job", format!("delegated: {}", arg("task"))),
+                "run_mod" => log("mod", format!("/{} {}", arg("name"), call.args.get("options").map(|o| o.to_string()).unwrap_or_default())),
+                _ => {}
+            }
             if call.tool == "leave_call" { left.set(true); }
             host.handle(call)
         }, &mut |_| {});
@@ -217,9 +242,12 @@ impl Brain {
         // Leaving and later rejoining, even the same channel, is a new call: he is told the roster again.
         if left.get() { self.announced.remove(&guild); self.presence.remove(&guild); }
         stats.turn(started.elapsed().as_millis() as u64, result.is_ok());
+        log("turn", format!("end {} {}{}", secs(started.elapsed()), if spoke { "replied" } else { "silent" }, result.as_ref().err().map(|e| format!(" — {e}")).unwrap_or_default()));
+        (self.last_turn, self.compact_checked) = (Instant::now(), false);
         match result {
             Ok(_) => { self.agent = Some(agent); }
-            Err(error) => { eprintln!("wallis: realtime turn failed: {error}"); }
+            // A turn stopped for running too long settled normally, so Pi keeps the conversation.
+            Err(error) => { if error.contains("too long") { self.agent = Some(agent); } else { log("error", "realtime agent restarts on the next turn"); } }
         }
         if spoke {
             let now = Instant::now();
@@ -227,12 +255,29 @@ impl Brain {
         }
     }
 
+    /// Once he has been quiet for a while, summarises a large context now rather than in the middle of someone's turn.
+    fn compact_when_idle(&mut self) {
+        if self.compact_checked || self.last_turn.elapsed() < Duration::from_secs(30) { return; }
+        self.compact_checked = true;
+        let Some(agent) = self.agent.as_mut() else { return };
+        let usage = agent.command("get_session_stats", Duration::from_secs(5)).ok().and_then(|stats| stats.get("contextUsage").cloned()).unwrap_or_default();
+        let (tokens, percent) = (usage["tokens"].as_f64().unwrap_or(0.0), usage["percent"].as_f64().unwrap_or(0.0));
+        // Every turn re-reads the whole context, so a long one slows every reply even far below the model's limit.
+        if tokens < 100_000.0 && percent < 60.0 { return; }
+        log("compact", format!("idle: {tokens:.0} tokens ({percent:.0}% of the context window)"));
+        let started = Instant::now();
+        match agent.command("compact", Duration::from_secs(120)) {
+            Ok(result) => log("compact", format!("done in {}: {} → {} tokens", secs(started.elapsed()), result["tokensBefore"], result["estimatedTokensAfter"])),
+            Err(error) => log("error", format!("compaction: {error}")),
+        }
+    }
+
     /// Wakes Wallis for every reminder that has come due: each is an ordinary turn whose prompt is his own note.
     fn fire_due(&mut self, queue: &mut Queue) {
         let now = schedule::now();
-        let due = match self.reminders.take_due(now) { Ok(due) => due, Err(error) => return eprintln!("wallis: {error}") };
+        let due = match self.reminders.take_due(now) { Ok(due) => due, Err(error) => return log("error", error) };
         for reminder in due {
-            self.stats.audit("reminder", &reminder.note);
+            log("remind", &reminder.note);
             let prompt = reminder.prompt(now, self.out.voice_channel(reminder.guild), &self.config.write_channels);
             self.respond(reminder.guild, reminder.user, prompt, &[], reminder.origin, queue);
         }
@@ -240,21 +285,20 @@ impl Brain {
 
     /// Hands every finished worker job to Wallis privately: an ordinary turn whose prompt carries the full report. Nothing is posted to the channel.
     fn deliver_jobs(&mut self, queue: &mut Queue) {
-        let jobs = match self.jobs.take_finished() { Ok(jobs) => jobs, Err(error) => return eprintln!("wallis: {error}") };
+        let jobs = match self.jobs.take_finished() { Ok(jobs) => jobs, Err(error) => return log("error", error) };
         for job in jobs {
-            self.stats.audit("job", &format!("{} {}", job.id, job.status));
+            log("job", format!("{} {} → back to Wallis", job.id, job.status));
             let prompt = job.prompt(schedule::now(), self.out.voice_channel(job.guild), &self.config.write_channels);
             self.respond(job.guild, job.user, prompt, &[], job.origin, queue);
         }
     }
 
-    fn handle(&mut self, event: Incoming, queue: &mut Queue) {
+    fn handle(&mut self, at: Instant, event: Incoming, queue: &mut Queue) {
         match event {
             Incoming::SpeechFailed { guild, text, tuning: failed, generation, retried, error } => {
                 // Ignore failures from speech that was deliberately stopped, including stale queued errors.
                 if self.out.speech_generation(guild) != generation { return; }
-                eprintln!("wallis: speech: {error}");
-                self.stats.audit("speech_error", &error);
+                log("error", format!("speech: {error}"));
                 self.out.stop_speaking(guild);
                 if !retried {
                     let saved = tuning::recover(&self.config.data_dir, &failed);
@@ -267,15 +311,25 @@ impl Brain {
                     let message: Vec<char> = format!("Voice playback is unavailable. Here is what I was saying:\n{text}").chars().collect();
                     message.chunks(1900).try_for_each(|chunk| self.out.message(channel, &chunk.iter().collect::<String>()))
                 } else { Err("No allowed text output channel is configured.".into()) };
-                let delivery = match delivered { Ok(()) => "The failed reply was sent to an allowed text channel.".to_string(), Err(error) => { eprintln!("wallis: speech text fallback: {error}"); format!("Text fallback also failed: {error}") } };
+                let delivery = match delivered { Ok(()) => "The failed reply was sent to an allowed text channel.".to_string(), Err(error) => { log("error", format!("speech text fallback: {error}")); format!("Text fallback also failed: {error}") } };
                 self.speech_notes.insert(guild, format!("Speech failed even after recovery. {delivery} Use message for now; do not keep trying say or the failed tuning."));
             }
             Incoming::Text { guild, channel, message, user, speaker, said, direct, mut media, reply } => {
-                self.stats.audit("typed", &format!("{speaker}: {said}"));
+                log("typed", format!("#{channel} {speaker}: {said}{}{}", if media.is_empty() { String::new() } else { format!(" [+{} media]", media.len()) }, if direct { " [named]" } else { "" }));
                 self.media.remember(channel, message, user, &media);
+                // A newer message from this channel is already waiting: fold this one into it, so a backlog becomes one turn.
+                queue.later.extend(queue.rx.try_iter());
+                if media.is_empty() && queue.later.iter().any(|(_, event)| matches!(event, Incoming::Text { channel: c, .. } if *c == channel)) {
+                    log("merge", format!("#{channel} {speaker}: newer message waiting; folded into it"));
+                    return self.backlog.entry(channel).or_default().push((at, direct, format!("{speaker}: {said}")));
+                }
+                // A folded line outlives its turn only briefly: if the newer message was not answered, it is not raised later.
+                let earlier: Vec<_> = self.backlog.remove(&channel).unwrap_or_default().into_iter().filter(|(when, ..)| when.elapsed() <= TEXT_STALE).collect();
+                let direct = direct || earlier.iter().any(|(_, named, _)| *named);
+                if !direct && at.elapsed() > TEXT_STALE { return log("stale", format!("#{channel} dropped after waiting {}: {speaker}: {said}", secs(at.elapsed()))); }
                 // An upload immediately after Wallis answered is a follow-up, including in mentions-only mode.
                 let follow_up = !media.is_empty() && self.last_text_reply.is_some_and(|(last_channel, last_user, at)| last_channel == channel && last_user == user && at.elapsed() < Duration::from_secs(120));
-                if !self.consider(Mode::Text, channel, user, direct || follow_up) { return; }
+                if !self.consider(Mode::Text, channel, user, direct || follow_up) { return log("pass", format!("#{channel} cooling down; not answering")); }
                 let media_started = Instant::now();
                 if said.contains("https://") {
                     let refreshed = self.out.media(channel, message);
@@ -286,7 +340,8 @@ impl Brain {
                         reply.map(|id| (id, self.out.media(channel, id))).unwrap_or((message, vec![]))
                     })
                 } else { (message, media) };
-                let mut prompt = turn_prompt(schedule::now(), Mode::Text, channel, &speaker, &said);
+                let mut prompt = turn_prompt(arrived(at), Mode::Text, channel, &speaker, &said);
+                if !earlier.is_empty() { prompt = format!("[earlier in text channel {channel}, while you were busy]\n{}\n{prompt}", earlier.into_iter().map(|(.., line)| line).collect::<Vec<_>>().join("\n")); }
                 let mut images = Vec::new();
                 let frame_limit = (12 / sources.len().max(1)).min(6);
                 for (index, source) in sources.iter().enumerate() {
@@ -302,6 +357,7 @@ impl Brain {
                         Err(error) => prompt.push_str(&format!("\n[media {} from message {source_message} unavailable] {error}", index + 1)),
                     }
                 }
+                if !sources.is_empty() { log("media", format!("{} items → {} frames in {}", sources.len(), images.len(), secs(media_started.elapsed()))); }
                 prompt.push_str(&self.text_prompt_context(guild, user, channel));
                 let before = self.convos.get(&channel).and_then(|c| c.last_reply_at);
                 self.respond(guild, user, prompt, &images, channel, queue);
@@ -310,15 +366,20 @@ impl Brain {
             }
             Incoming::MediaUpdate { channel, message, user, media } => self.media.remember(channel, message, user, &media),
             Incoming::MediaDelete { channel, messages } => self.media.forget(channel, &messages),
-            Incoming::Voice { guild, channel, user, speaker, pcm } => {
+            // Transcription happens as audio arrives (`Bot::send`), so this thread only ever waits on the agent.
+            Incoming::Voice { .. } => {}
+            Incoming::Heard { guild, channel, user, speaker, said } => {
                 // Utterances that piled up while the last turn ran are heard together, not answered one by one.
-                let (voices, others): (Vec<_>, Vec<_>) = queue.rx.try_iter().partition(|event| steers(event, guild, Some(channel)));
-                queue.later.extend(others);
-                let mut heard = hear(std::iter::once(Incoming::Voice { guild, channel, user, speaker, pcm }).chain(voices).collect(), &self.stats);
-                if heard.is_empty() { return; }
+                let (more, newest) = take_heard(queue, guild, Some(channel));
+                let mut heard = vec![(speaker, said)];
+                heard.extend(more);
                 let direct = heard.iter().any(|(_, said)| sounds_like_wallis(said));
-                if self.consider(Mode::Voice, channel, user, direct) {
-                    let prompt = if heard.len() == 1 { let (speaker, said) = heard.remove(0); turn_prompt(schedule::now(), Mode::Voice, channel, &speaker, &said) } else { merge_voice(schedule::now(), &heard) };
+                // When even the newest line is stale, the moment has passed.
+                let waited = newest.unwrap_or(at).max(at).elapsed();
+                if !direct && waited > VOICE_STALE { return log("stale", format!("voice {channel} dropped {} lines after waiting {}", heard.len(), secs(waited))); }
+                if heard.len() > 1 { log("merge", format!("voice {channel}: {} lines heard together", heard.len())); }
+                if !self.consider(Mode::Voice, channel, user, direct) { log("pass", format!("voice {channel} cooling down; not answering")); } else {
+                    let prompt = if heard.len() == 1 { let (speaker, said) = heard.remove(0); turn_prompt(arrived(at), Mode::Voice, channel, &speaker, &said) } else { merge_voice(schedule::now(), &heard) };
                     let prompt = format!("{prompt}{}", self.voice_prompt_context(guild));
                     self.respond(guild, user, prompt, &[], 0, queue);
                 }
@@ -331,6 +392,7 @@ impl Brain {
                 if notes.len() > 8 { notes.remove(0); }
             }
             Incoming::Mod { guild, channel, user, name, options, token } => {
+                log("mod", format!("/{name} {options} (slash command)"));
                 let (out, config) = (self.out.clone(), self.config.clone());
                 // Downloads must not block live conversation or other interactions.
                 std::thread::spawn(move || {
@@ -341,7 +403,7 @@ impl Brain {
                         let mut host = Host { discord: &mut sink, jobs: &jobs, reminders: &reminders, guild, user, write_channels: vec![channel.to_string()], skipped: false, origin: channel, profile: config.data_dir.join("profile.json") };
                         wallis_core::mods::run(&config.data_dir, &name, serde_json::json!({"options":options,"guild":guild.to_string(),"user":user.to_string(),"channel":channel.to_string()}), &mut |call| host.handle(call))
                     })();
-                    if let Err(error) = out.reply_mod(&token, &result.unwrap_or_else(|e| format!("Failed: {e}"))) { eprintln!("wallis: {error}"); }
+                    if let Err(error) = out.reply_mod(&token, &result.unwrap_or_else(|e| format!("Failed: {e}"))) { log("error", error); }
                 });
             }
             Incoming::Ready { .. } => {}
@@ -350,7 +412,22 @@ impl Brain {
 }
 
 /// The running brain and worker threads. Dropping it stops them (the worker after its current job).
-pub struct Bot { pub sender: Sender<Incoming>, pub stats: Arc<Stats>, stop: Arc<AtomicBool> }
+pub struct Bot { sender: Sender<(Instant, Incoming)>, pub stats: Arc<Stats>, stop: Arc<AtomicBool> }
+
+impl Bot {
+    /// Hands a Discord event to the brain, stamped with when it arrived. Speech is transcribed on its own thread first,
+    /// in parallel with whatever the brain is doing, and keeps the time the person stopped talking.
+    pub fn send(&self, event: Incoming) {
+        let (at, sender) = (Instant::now(), self.sender.clone());
+        let Incoming::Voice { guild, channel, user, speaker, pcm } = event else { let _ = sender.send((at, event)); return };
+        let audio = Duration::from_millis(pcm.len() as u64 / 96);
+        std::thread::spawn(move || match speech::transcribe(&pcm) {
+            Ok(said) if !said.is_empty() => { log("heard", format!("{speaker} ({} audio, stt {}): {said}", secs(audio), secs(at.elapsed()))); let _ = sender.send((at, Incoming::Heard { guild, channel, user, speaker, said })); }
+            Ok(_) => log("heard", format!("{speaker} ({} audio, stt {}): no words", secs(audio), secs(at.elapsed()))),
+            Err(error) => log("error", format!("stt: {error}")),
+        });
+    }
+}
 
 impl Drop for Bot {
     fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); }
@@ -363,25 +440,25 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
     // Interrupted jobs are marked failed and reach Wallis like any other finished job, so he tells the user.
     Jobs::open(&db)?.fail_interrupted()?;
 
-    let (sender, receiver): (Sender<Incoming>, Receiver<Incoming>) = channel();
+    let (sender, receiver) = channel::<(Instant, Incoming)>();
     let (brain_config, brain_out, brain_db) = (config.clone(), out.clone(), db.clone());
     let stats = Arc::new(Stats::default());
     let brain_stats = stats.clone();
     std::thread::spawn(move || {
         let (Ok(jobs), Ok(reminders)) = (Jobs::open(&brain_db), Reminders::open(&brain_db)) else { return };
         let now = Instant::now();
-        let mut brain = Brain { config: brain_config, out: brain_out, jobs, reminders, stats: brain_stats, agent: None, convos: Default::default(), started: now, media: media::History::default(), last_text_reply: None, speech_notes: Default::default(), presence: Default::default(), announced: Default::default() };
+        let mut brain = Brain { config: brain_config, out: brain_out, jobs, reminders, stats: brain_stats, agent: None, convos: Default::default(), started: now, media: media::History::default(), last_text_reply: None, speech_notes: Default::default(), presence: Default::default(), announced: Default::default(), backlog: Default::default(), last_turn: now, compact_checked: true };
         let mut queue = Queue { rx: &receiver, later: Vec::new() };
         // Waking once a second is the reminder clock; events still arrive immediately.
         loop {
             match receiver.recv_timeout(Duration::from_secs(1)) {
-                Ok(event) => brain.handle(event, &mut queue),
-                Err(RecvTimeoutError::Timeout) => {}
+                Ok((at, event)) => brain.handle(at, event, &mut queue),
+                Err(RecvTimeoutError::Timeout) => brain.compact_when_idle(),
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             brain.fire_due(&mut queue);
             brain.deliver_jobs(&mut queue);
-            while !queue.later.is_empty() { let next = queue.later.remove(0); brain.handle(next, &mut queue); }
+            while !queue.later.is_empty() { let (at, next) = queue.later.remove(0); brain.handle(at, next, &mut queue); }
         }
     });
 
@@ -400,9 +477,9 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
                 Agent::spawn(&config.worker_program, Role::Worker, &config.worker, &dir, &prompts::worker_prompt(), &scratch, Some(&access))
             };
             match worker::run_next(&jobs, &mut sink, &mut start, Duration::from_secs(300), &config.data_dir) {
-                Ok(Some(_)) => { if let Err(error) = out.set_commands() { eprintln!("wallis: {error}"); } }
+                Ok(Some(_)) => { if let Err(error) = out.set_commands() { log("error", error); } }
                 Ok(None) => std::thread::sleep(Duration::from_secs(1)),
-                Err(error) => { eprintln!("wallis: {error}"); std::thread::sleep(Duration::from_secs(5)); }
+                Err(error) => { log("error", format!("worker: {error}")); std::thread::sleep(Duration::from_secs(5)); }
             }
         }
     });
@@ -427,7 +504,7 @@ mod tests {
         assert_eq!(turn_prompt(0, Mode::Text, 42, "Jake", "hi"), format!("[{time}] [text channel 42] Jake: hi"));
     }
 
-    fn voice(guild: u64, channel: u64) -> Incoming { Incoming::Voice { guild, channel, user: 1, speaker: "A".into(), pcm: vec![] } }
+    fn voice(guild: u64, channel: u64) -> Incoming { Incoming::Heard { guild, channel, user: 1, speaker: "A".into(), said: "hi".into() } }
 
     #[test]
     fn a_text_author_outside_the_call_is_told_and_pointed_at_the_text_channel() {
@@ -454,6 +531,24 @@ mod tests {
         let later = voice_context(7, &members, false, &["Zed just joined the call; they did not hear anything said before.".into()]);
         assert!(later.contains("[call] Zed just joined") && !later.contains("with Jake"));
         assert_eq!(voice_context(7, &members, false, &[]), "");
+    }
+
+    #[test]
+    fn queued_speech_is_taken_in_spoken_order_and_everything_else_waits() {
+        let (sender, rx) = channel();
+        let start = Instant::now();
+        let heard = |channel, said: &str| Incoming::Heard { guild: 1, channel, user: 1, speaker: "A".into(), said: said.into() };
+        // Transcription finished out of order: the later "two" was ready first.
+        sender.send((start + Duration::from_millis(20), heard(7, "two"))).unwrap();
+        sender.send((start, Incoming::Ready { bot_id: 1 })).unwrap();
+        sender.send((start + Duration::from_millis(10), heard(7, "one"))).unwrap();
+        sender.send((start, heard(8, "elsewhere"))).unwrap();
+        let mut queue = Queue { rx: &rx, later: Vec::new() };
+        let (said, newest) = take_heard(&mut queue, 1, Some(7));
+        assert_eq!(said.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(), ["one", "two"]);
+        assert_eq!(newest, Some(start + Duration::from_millis(20)));
+        assert_eq!(queue.later.len(), 2, "other events and other calls wait for their own turn");
+        assert!(take_heard(&mut queue, 1, None).0.is_empty(), "a text turn takes no speech");
     }
 
     #[test]

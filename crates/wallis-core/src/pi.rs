@@ -65,6 +65,32 @@ pub fn host_reply(request_id: &str, result: &str) -> Value {
     serde_json::json!({ "type": "extension_ui_response", "id": request_id, "value": result })
 }
 
+/// What the live log wants from one Pi event: a model request starting or streaming its first token, a finished model
+/// response (with its stop reason and token usage), or a notable runtime event such as a retry or compaction.
+#[derive(Debug, PartialEq)]
+pub enum Progress { Asked, Token, Answered(String), Note(&'static str, String) }
+
+pub fn progress(line: &str, note: &mut dyn FnMut(Progress)) {
+    let Ok(value) = serde_json::from_str::<Value>(line) else { return };
+    let text = |pointer: &str| value.pointer(pointer).and_then(Value::as_str).unwrap_or_default().to_string();
+    let number = |pointer: &str| value.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
+    match value["type"].as_str().unwrap_or_default() {
+        "message_start" if value.pointer("/message/role") == Some(&"assistant".into()) => note(Progress::Asked),
+        "message_update" if matches!(value.pointer("/assistantMessageEvent/type").and_then(Value::as_str), Some("text_delta" | "thinking_delta" | "toolcall_start")) => note(Progress::Token),
+        "message_end" if value.pointer("/message/role") == Some(&"assistant".into()) => {
+            let error = text("/message/errorMessage");
+            let tools: Vec<String> = value.pointer("/message/content").and_then(Value::as_array).into_iter().flatten().filter(|part| part["type"] == "toolCall").filter_map(|part| part["name"].as_str().map(String::from)).collect();
+            note(Progress::Answered(format!("{} in {} out {} cached {}{}{}", text("/message/stopReason"), number("/message/usage/input"), number("/message/usage/output"), number("/message/usage/cacheRead"),
+                if tools.is_empty() { String::new() } else { format!(" → {}", tools.join(", ")) }, if error.is_empty() { String::new() } else { format!(" — {error}") })));
+        }
+        "auto_retry_start" => note(Progress::Note("retry", format!("attempt {}/{} in {} ms: {}", number("/attempt"), number("/maxAttempts"), number("/delayMs"), text("/errorMessage")))),
+        "auto_retry_end" if value["success"] != true => note(Progress::Note("error", format!("gave up after {} retries: {}", number("/attempt"), text("/finalError")))),
+        "compaction_start" => note(Progress::Note("compact", format!("started ({})", text("/reason")))),
+        "compaction_end" => note(Progress::Note("compact", format!("ended ({}){}", text("/reason"), if value["errorMessage"].is_string() { format!(" — {}", text("/errorMessage")) } else { String::new() }))),
+        _ => {}
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Event {
     TextDelta(String),
@@ -126,6 +152,20 @@ mod tests {
         assert_eq!(parse_event(r#"{"type":"agent_settled","aborted":false}"#).unwrap(), Event::Settled { aborted: false });
         assert_eq!(parse_event(r#"{"type":"turn_end"}"#).unwrap(), Event::Other);
         assert!(parse_event("not json").is_err());
+    }
+
+    #[test]
+    fn reports_model_timing_usage_and_runtime_trouble_for_the_live_log() {
+        let mut notes = Vec::new();
+        for line in [
+            json!({"type":"message_start","message":{"role":"assistant"}}),
+            json!({"type":"message_start","message":{"role":"user"}}),
+            json!({"type":"message_update","assistantMessageEvent":{"type":"toolcall_start"}}),
+            json!({"type":"message_end","message":{"role":"assistant","stopReason":"toolUse","usage":{"input":900,"output":12,"cacheRead":800},"content":[{"type":"toolCall","name":"say"}]}}),
+            json!({"type":"auto_retry_start","attempt":1,"maxAttempts":2,"delayMs":500,"errorMessage":"overloaded"}),
+            json!({"type":"auto_retry_end","success":true,"attempt":1}),
+        ] { progress(&line.to_string(), &mut |note| notes.push(note)); }
+        assert_eq!(notes, [Progress::Asked, Progress::Token, Progress::Answered("toolUse in 900 out 12 cached 800 → say".into()), Progress::Note("retry", "attempt 1/2 in 500 ms: overloaded".into())]);
     }
 
     #[test]

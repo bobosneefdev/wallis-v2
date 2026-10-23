@@ -133,7 +133,7 @@ impl Server {
         let settings = wallis_discord::Settings { token: token.into(), data_dir: DATA.into(), allowed_users: list(&c.discord_allowed_users), read_channels: list(&c.discord_read_channels), write_channels: list(&c.discord_write_channels), profile: Arc::new(|| profile_json(Path::new(DATA))) };
         runtime.spawn(async move {
             let ready = move |out: wallis_discord::Out| { *ready_out.lock().unwrap() = Some(out.clone()); std::thread::spawn(move || match bot::start(config, out) { Ok(started) => *ready_bot.lock().unwrap() = Some(started), Err(e) => *startup_failure.lock().unwrap() = Some(e) }); };
-            let event = move |event| { if let Some(bot) = event_bot.lock().unwrap().as_ref() { let _ = bot.sender.send(event); } };
+            let event = move |event| { if let Some(bot) = event_bot.lock().unwrap().as_ref() { bot.send(event); } };
             if let Err(e) = wallis_discord::run(settings, ready, event).await { *end_failure.lock().unwrap() = Some(e); }
         });
         self.running = Some(Running { bot, out, failure, _runtime: runtime, _speech: speech });
@@ -150,7 +150,7 @@ impl Server {
             "stop_wallis" => { self.running.take(); Ok(json!({"state":"stopped","message":"Wallis is stopped."})) }
             "get_runtime_status" => Ok(match &self.running { None => json!({"state":"stopped","message":"Wallis is stopped."}), Some(r) => match r.failure.lock().unwrap().as_ref() { Some(e) => json!({"state":"unavailable","message":e}), None => json!({"state":"running","message":"Wallis is online."}) } }),
             "get_stats" => Ok(self.running.as_ref().and_then(|r| r.bot.lock().unwrap().as_ref().map(|b| json!(b.stats.snapshot()))).unwrap_or(Value::Null)),
-            "get_audit_log" => Ok(self.running.as_ref().and_then(|r| r.bot.lock().unwrap().as_ref().map(|b| json!(b.stats.audit_log()))).unwrap_or(json!([]))),
+            "get_log" => Ok(json!(wallis_core::stats::tail(args["since"].as_u64().unwrap_or(0)))),
             "get_profile" => serde_json::to_value(read_profile(data)?).map_err(|e| e.to_string()),
             "get_jobs" => Ok(json!(Jobs::open(&data.join("jobs.sqlite").to_string_lossy())?.with_status(&["queued","running","done","failed"])?)),
             "retry_job" => Ok(json!(Jobs::open(&data.join("jobs.sqlite").to_string_lossy())?.retry(args["id"].as_i64().ok_or("Missing job id.")?)?)),

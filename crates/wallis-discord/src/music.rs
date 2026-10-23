@@ -87,7 +87,7 @@ impl EventHandler for End {
         let mut guilds = self.player.guilds.lock().await;
         if let Some(state) = guilds.get_mut(&self.guild) {
             state.current = None;
-            if let Err(error) = self.player.next(self.guild, state).await { eprintln!("wallis: music: {error}"); }
+            if let Err(error) = self.player.next(self.guild, state).await { wallis_core::stats::log("error", format!("music: {error}")); }
         }
         None
     }

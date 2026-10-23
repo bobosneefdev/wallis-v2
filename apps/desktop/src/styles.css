@@ -27,7 +27,16 @@ main { flex: 1; min-width: 0; max-width: 860px; margin: 0 auto; padding: 32px 28
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; margin: 12px 0 0; }
 .hint.bad { color: var(--danger); }
 .jobs { margin: 8px 0 0; padding: 0; list-style: none; } .jobs li { margin: 8px 0; }
-.audit { max-height: 360px; overflow: auto; white-space: pre-wrap; word-break: break-word; } .audit time { color: var(--faint); font-size: .8rem; }
+/* live log: a terminal, not cards */
+.log-bar { display: flex; align-items: center; gap: 10px; margin-top: 12px; } .log-bar input[type="search"] { flex: 1; }
+.log-bar .check { margin: 0; white-space: nowrap; }
+.log { height: 420px; margin: 10px 0 0; padding: 10px 12px; overflow: auto; color: #e8e2d0; background: #1f1a1c; border-radius: 8px; font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+.log-empty { color: #9a8f86; }
+.log-line[data-tag="error"], .log-line[data-tag="limit"] { color: #ff8a8a; }
+.log-line[data-tag="retry"], .log-line[data-tag="stale"], .log-line[data-tag="barge"] { color: #ffc46b; }
+.log-line[data-tag="model"], .log-line[data-tag="tts"] { color: #8fd3ff; }
+.log-line[data-tag="say"], .log-line[data-tag="message"] { color: #a6e3a1; }
+.log-line[data-tag="heard"], .log-line[data-tag="typed"] { color: #fff; }
 
 header { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 28px; }
 header div { flex: 1 1 320px; }

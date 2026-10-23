@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { invoke, type AuditEvent, type Job, type RuntimeStatus, type Stats, type UpdateCheck } from "./invoke";
+  import { tick } from "svelte";
+  import { invoke, type Job, type LogLine, type RuntimeStatus, type Stats, type UpdateCheck } from "./invoke";
 
   let { runtime = $bindable(), hasProfile, hasToken }: { runtime: RuntimeStatus; hasProfile: boolean; hasToken: boolean } = $props();
 
@@ -8,8 +9,26 @@
 
   let jobs = $state<Job[]>([]);
   let stats = $state<Stats | null>(null);
-  let audit = $state<AuditEvent[]>([]);
-  const auditLabel = { heard: "Heard", typed: "Typed", prompt: "Prompt", steer: "Steer", delegate: "Delegated" };
+  // The live log: lines are fetched once and appended, so it reads like a terminal. Scrolled up = paused following.
+  let lines = $state<LogLine[]>([]);
+  let since = 0;
+  let filter = $state("");
+  let follow = $state(true);
+  let logBox = $state<HTMLPreElement>();
+  const shown = $derived(filter ? lines.filter((line) => `${line.tag} ${line.text}`.toLowerCase().includes(filter.toLowerCase())) : lines);
+  const clock = (ms: number) => { const d = new Date(ms); return `${d.toLocaleTimeString([], { hour12: false })}.${String(d.getMilliseconds()).padStart(3, "0")}`; };
+  const format = (line: LogLine) => `${clock(line.atMs)} ${line.tag.padEnd(7)} ${line.text}`;
+
+  async function pollLog() {
+    const tail = await invoke("get_log", { since });
+    if (tail.next < since) lines = []; // the runtime restarted and counts from zero again
+    since = tail.next;
+    if (!tail.lines.length) return;
+    lines = [...lines, ...tail.lines].slice(-2000);
+    if (follow) { await tick(); logBox?.scrollTo({ top: logBox.scrollHeight }); }
+  }
+  const scrolled = () => { if (logBox) follow = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 24; };
+  const copyLog = () => navigator.clipboard.writeText(shown.map(format).join("\n")).then(() => (note = "Log copied."), (error) => (note = message(error)));
   let progress = $state("");
   let busy = $state(false);
   let note = $state("");
@@ -17,7 +36,7 @@
 
   async function poll() {
     runtime = await invoke("get_runtime_status");
-    [jobs, stats, audit] = await Promise.all([invoke("get_jobs").catch(() => []), invoke("get_stats").catch(() => null), invoke("get_audit_log").catch(() => [])]);
+    [jobs, stats] = await Promise.all([invoke("get_jobs").catch(() => []), invoke("get_stats").catch(() => null)]);
   }
 
   /** Runs a long command while polling Rust for the current install step. */
@@ -36,6 +55,7 @@
 
   void poll().catch((error) => (note = message(error)));
   setInterval(() => { if (!busy) void poll().catch(() => {}); }, 5000);
+  setInterval(() => { if (!busy) void pollLog().catch(() => {}); }, 1000);
 </script>
 
 <h1>Home</h1>
@@ -63,15 +83,18 @@
   {:else}<p class="hint">Stats appear while Wallis is online.</p>{/if}
 </section>
 
-<section aria-labelledby="audit-title">
-  <h2 id="audit-title">Audit Log</h2>
-  {#if audit.length}
-    <ol class="jobs audit">
-      {#each audit.toReversed() as event}
-        <li><time>{new Date(event.atMs).toLocaleTimeString()}</time> <span class="pill" class:ok={event.kind === "delegate"}>{auditLabel[event.kind]}</span> {event.text}</li>
-      {/each}
-    </ol>
-  {:else}<p class="hint">The latest 256 messages, agent prompts, steers and delegations appear here while Wallis is online.</p>{/if}
+<section aria-labelledby="log-title">
+  <h2 id="log-title">Live log</h2>
+  <p class="hint">Everything Wallis hears and does, with timings: speech recognition, every model call (latency, first token, tokens), tools, speech synthesis, drops, retries and jobs. The full log since start is also kept as <code>runtime.log</code> in the app data folder.</p>
+  <div class="log-bar">
+    <input type="search" placeholder="Filter, e.g. model, error, tts" aria-label="Filter the log" bind:value={filter} />
+    <label class="check"><input type="checkbox" bind:checked={follow} /> Follow</label>
+    <button type="button" class="secondary" onclick={copyLog} disabled={!shown.length}>Copy</button>
+    <button type="button" class="secondary" onclick={() => (lines = [])} disabled={!lines.length}>Clear</button>
+  </div>
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+  <pre class="log" tabindex="0" aria-label="Live log" bind:this={logBox} onscroll={scrolled}>{#each shown as line (line.seq)}<span class="log-line" data-tag={line.tag}>{format(line)}</span>
+{:else}<span class="log-empty">{runtime.state === "running" ? "Waiting for activity…" : "Lines appear here while Wallis is online."}</span>{/each}</pre>
 </section>
 
 {#if jobs.length}
