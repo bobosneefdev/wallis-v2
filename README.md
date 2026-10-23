@@ -49,6 +49,8 @@ Speech is transcribed the moment someone stops talking, in parallel with whateve
 
 He never works through a backlog. Speech more than 20 seconds old and typed messages more than two minutes old are dropped unless they name him; several messages waiting in one text channel become a single turn. A reply may spend at most 45 seconds waiting on the model before it is stopped, failed model requests retry quickly instead of backing off for a minute, and his last `say` or `message` can end the turn at once (`done`) instead of costing another model call. A long conversation is summarised while he is quiet, not in the middle of someone's turn.
 
+The Home page's **Live log** streams what the runtime is doing, one timestamped line per event, for debugging speed and behaviour: speech recognition time per utterance, every turn's start and end, each model call (latency, time to first token, input/output/cached tokens, tools chosen), tool durations, time to first speech audio, merged and dropped input, retries, compaction, barge-ins, jobs and errors. Filter it by text, copy it, or read the full log since start in `runtime.log` in the Windows app-data folder.
+
 ## Realtime and worker
 
 Wallis (realtime) is the only face people see. `delegate` takes a brief that says what to find and what to bring back; the worker never posts to Discord. Its report returns privately to Wallis as a `[job finished]` turn and he tells you in his own words. `channel_history` lets him read recent messages in a channel. Realtime uses [@smoose/pi-persona](https://pi.dev/packages/@smoose/pi-persona) for a soul and moods; the worker stays a plain coding agent without it.

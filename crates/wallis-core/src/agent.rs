@@ -1,6 +1,7 @@
 //! One running Pi process in RPC mode: send a prompt, stream text, answer the extension's host calls.
 use crate::pi::{self, Event, HostCall, LineSplitter};
 use crate::role::{Role, RoleConfig};
+use crate::stats::{log, secs};
 use serde_json::json;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,8 @@ struct Handle { child: Child, confined: bool }
 const POLL: Duration = Duration::from_millis(100);
 
 pub struct Agent { handle: Handle, stdin: Box<dyn Write + Send>, lines: Receiver<String>, next_id: u64,
+    /// `realtime` or `worker`: which agent a live-log line is about.
+    role: &'static str,
     /// The longest one turn may spend waiting on the model before it is aborted (the worker's is five minutes). Time spent
     /// running Wallis' own tools (a song download, joining a call) does not count.
     pub limit: Duration }
@@ -60,7 +63,7 @@ impl Agent {
                 for line in splitter.push(&buffer[..read]) { if sender.send(line).is_err() { return; } }
             }
         });
-        Ok(Self { handle, stdin, lines, next_id: 0, limit: Duration::from_secs(300) })
+        Ok(Self { handle, stdin, lines, next_id: 0, limit: Duration::from_secs(300), role: if role == Role::Realtime { "realtime" } else { "worker" } })
     }
 
     fn send(&mut self, value: &serde_json::Value) -> Result<(), String> {
@@ -87,6 +90,8 @@ impl Agent {
         self.send(&json!({ "id": id, "type": "prompt", "message": message, "images": images }))?;
         let (mut reply, mut last_event) = (String::new(), Instant::now());
         let (started, mut overdue, mut tools) = (Instant::now(), false, Duration::ZERO);
+        // When the current model request started (for the live log), and when its first token arrived.
+        let (mut asked, mut first) = (started, None::<Duration>);
         loop {
             if self.handle.confined {
                 crate::mods::check_budget(Path::new("/var/lib/wallis"))?;
@@ -94,22 +99,34 @@ impl Agent {
             }
             // Past the limit, a live agent aborts and lets Pi settle, so it keeps its context for the next turn.
             // Queued steers survive an abort in Pi, so drop them first: what was said during this turn is stale by now.
-            if !overdue && started.elapsed().saturating_sub(tools) > self.limit { overdue = true; self.send(&json!({ "type": "clear_queue" }))?; self.abort(); }
+            if !overdue && started.elapsed().saturating_sub(tools) > self.limit {
+                overdue = true;
+                log("limit", format!("{} turn passed {} of model time; stopping it", self.role, secs(self.limit)));
+                self.send(&json!({ "type": "clear_queue" }))?; self.abort();
+            }
             for text in steer() { self.send(&json!({ "type": "steer", "message": text }))?; }
             let line = match self.lines.recv_timeout(POLL.min(timeout)) {
                 Ok(line) => { last_event = Instant::now(); line }
                 Err(RecvTimeoutError::Timeout) if last_event.elapsed() < timeout => continue,
-                Err(RecvTimeoutError::Timeout) => { let _ = self.send(&json!({ "type": "abort" })); return Err("Pi stopped responding.".into()); }
+                Err(RecvTimeoutError::Timeout) => { let _ = self.send(&json!({ "type": "abort" })); log("error", format!("{} Pi silent for {}; aborted", self.role, secs(timeout))); return Err("Pi stopped responding.".into()); }
                 Err(RecvTimeoutError::Disconnected) => return Err("Pi exited unexpectedly.".into()),
             };
             if let Some(call) = pi::parse_host_call(&line) {
                 let request_id = call.request_id.clone();
-                let running = Instant::now();
+                let (running, tool) = (Instant::now(), call.tool.clone());
                 let result = on_host(call);
                 (tools, last_event) = (tools + running.elapsed(), Instant::now());
+                let failed = if result.starts_with("Failed:") { format!(" — {result}") } else { String::new() };
+                log("tool", format!("{} {tool} {}{failed}", self.role, secs(running.elapsed())));
                 self.send(&pi::host_reply(&request_id, &result))?;
                 continue;
             }
+            pi::progress(&line, &mut |note| match note {
+                pi::Progress::Asked => (asked, first) = (Instant::now(), None),
+                pi::Progress::Token => { first.get_or_insert(asked.elapsed()); }
+                pi::Progress::Answered(summary) => log("model", format!("{} {} (first token {}) {summary}", self.role, secs(asked.elapsed()), first.map(secs).unwrap_or_else(|| "—".into()))),
+                pi::Progress::Note(tag, text) => log(tag, format!("{} {text}", self.role)),
+            });
             match pi::parse_event(&line)? {
                 Event::TextDelta(delta) => { on_delta(&delta); reply.push_str(&delta); }
                 Event::Response { id: Some(rid), success: false, error } if rid == id => return Err(error.unwrap_or_else(|| "Pi rejected the prompt.".into())),

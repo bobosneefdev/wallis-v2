@@ -141,22 +141,23 @@ async fn get_runtime_status(app: tauri::AppHandle) -> RuntimeStatus {
         }
     }).await.unwrap_or_else(|e|status("unavailable",e.to_string()))
 }
-fn poll(state: &AppState, command: &str, empty: serde_json::Value) -> Result<serde_json::Value,String> {
+fn poll(state: &AppState, command: &str, args: serde_json::Value, empty: serde_json::Value) -> Result<serde_json::Value,String> {
     let Ok(mut running) = state.running.try_lock() else { return Ok(empty) };
-    match running.as_mut() { Some(session) => session.request(command,serde_json::json!({})), None => Ok(empty) }
+    match running.as_mut() { Some(session) => session.request(command,args), None => Ok(empty) }
 }
 #[tauri::command]
 async fn get_stats(app: tauri::AppHandle) -> Result<serde_json::Value,String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        poll(&state,"get_stats",serde_json::Value::Null)
+        poll(&state,"get_stats",serde_json::json!({}),serde_json::Value::Null)
     }).await.map_err(|e|e.to_string())?
 }
+/// Live log lines after `since`; while the runtime is busy or offline, nothing new.
 #[tauri::command]
-async fn get_audit_log(app: tauri::AppHandle) -> Result<serde_json::Value,String> {
+async fn get_log(app: tauri::AppHandle, since: u64) -> Result<serde_json::Value,String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        poll(&state,"get_audit_log",serde_json::json!([]))
+        poll(&state,"get_log",serde_json::json!({"since":since}),serde_json::json!({"next":since,"lines":[]}))
     }).await.map_err(|e|e.to_string())?
 }
 
@@ -284,7 +285,7 @@ fn get_voice_options() -> (Vec<VoiceOption>, Vec<VoiceOption>) {
 async fn get_jobs(app: tauri::AppHandle) -> Result<serde_json::Value,String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        poll(&state,"get_jobs",serde_json::json!([]))
+        poll(&state,"get_jobs",serde_json::json!({}),serde_json::json!([]))
     }).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]
@@ -330,7 +331,7 @@ pub fn run() {
             std::thread::spawn(move || { let _ = start_inner(&handle.state::<AppState>()); });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![get_runtime_status, get_stats, get_audit_log, start_wallis, stop_wallis, get_config, save_config, get_secret_status, save_discord_token, get_profile, generate_wallis, lobotomize_wallis, get_progress, check_update, install_update, get_voice_options, get_jobs, retry_job, get_mods, set_mod_enabled, delete_mod, codex::codex_signed_in, codex::codex_sign_in, codex::codex_sign_out, codex::codex_models, codex::get_roles, codex::save_roles, codex::get_provider, codex::save_provider, codex::refresh_provider_models]).run(tauri::generate_context!()).expect("error while running Wallis");
+    }).invoke_handler(tauri::generate_handler![get_runtime_status, get_stats, get_log, start_wallis, stop_wallis, get_config, save_config, get_secret_status, save_discord_token, get_profile, generate_wallis, lobotomize_wallis, get_progress, check_update, install_update, get_voice_options, get_jobs, retry_job, get_mods, set_mod_enabled, delete_mod, codex::codex_signed_in, codex::codex_sign_in, codex::codex_sign_out, codex::codex_models, codex::get_roles, codex::save_roles, codex::get_provider, codex::save_provider, codex::refresh_provider_models]).run(tauri::generate_context!()).expect("error while running Wallis");
 }
 
 #[cfg(test)]

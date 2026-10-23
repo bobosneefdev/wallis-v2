@@ -9,6 +9,8 @@ use std::time::Duration;
 /// so a stuck or poisoned worker never leaks into the next task.
 pub fn run_next(jobs: &Jobs, discord: &mut impl Discord, start: &mut dyn FnMut() -> Result<Agent, String>, idle_timeout: Duration, data: &std::path::Path) -> Result<Option<Job>, String> {
     let Some(job) = jobs.claim()? else { return Ok(None) };
+    let started = std::time::Instant::now();
+    crate::stats::log("job", format!("{} started: {}", job.id, job.task.lines().next().unwrap_or_default()));
     discord.scope(job.guild, job.user);
     let outcome = (|| {
         crate::mods::check_budget(data)?;
@@ -20,6 +22,7 @@ pub fn run_next(jobs: &Jobs, discord: &mut impl Discord, start: &mut dyn FnMut()
         }, &mut |_| {})
     })();
     let (ok, result) = match outcome { Ok(text) if !text.trim().is_empty() => (true, text), Ok(_) => (false, "The worker finished without a result.".into()), Err(error) => (false, error) };
+    crate::stats::log("job", format!("{} {} in {}{}", job.id, if ok { "done" } else { "failed" }, crate::stats::secs(started.elapsed()), if ok { String::new() } else { format!(" — {result}") }));
     jobs.finish(job.id, ok, &result)?;
     Ok(Some(job))
 }

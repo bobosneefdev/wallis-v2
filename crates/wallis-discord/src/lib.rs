@@ -75,11 +75,12 @@ impl Speech {
 }
 
 // Songbird treats next_packet I/O errors as EOF, so report stream failures before it reads them.
-struct SpeechStream<R> { stream: R, speech: Speech, bytes: usize }
+struct SpeechStream<R> { stream: R, speech: Speech, bytes: usize, started: std::time::Instant }
 impl<R: std::io::Read> std::io::Read for SpeechStream<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self.stream.read(buf) {
             Ok(n) => {
+                if self.bytes == 0 && n > 0 { wallis_core::stats::log("tts", format!("first audio {} ({}): {}", wallis_core::stats::secs(self.started.elapsed()), self.speech.tuning.lock().expect("speech tuning poisoned").voice, self.speech.text)); }
                 self.bytes += n;
                 if n == 0 && !buf.is_empty() && (self.bytes == 0 || !self.bytes.is_multiple_of(4)) { self.speech.report("Speech returned empty or incomplete PCM.".into()); }
                 Ok(n)
@@ -97,13 +98,14 @@ impl Compose for Speech {
     fn create(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
         let tuning = wallis_core::tuning::current();
         *self.tuning.lock().expect("speech tuning poisoned") = tuning.clone();
+        let started = std::time::Instant::now();
         let stream = wallis_core::speech::synthesize_stream(&self.text, &tuning).map_err(|error| {
-            eprintln!("wallis: {error}");
+            wallis_core::stats::log("error", format!("tts: {error}"));
             AudioStreamError::Fail(error.into())
         })?;
         // ponytail: speed changes pitch; add time stretching when pitch-preserving speed is required.
         let rate = (24_000.0 / tuning.speed).round() as u32;
-        let stream = SpeechStream { stream, speech: self.clone(), bytes: 0 };
+        let stream = SpeechStream { stream, speech: self.clone(), bytes: 0, started };
         Ok(AudioStream { input: Box::new(RawAdapter::new(ReadOnlySource::new(stream), rate, 1)) })
     }
     async fn create_async(&mut self) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> { Err(AudioStreamError::Unsupported) }
@@ -299,6 +301,7 @@ impl VoiceHandler for SharedReceive {
                 };
                 if talked_over && this.music.pending_speech(this.guild).await > 0 {
                     this.talking.lock().expect("talking map poisoned").clear();
+                    wallis_core::stats::log("barge", format!("talked over for {barge_in} ms; speech cut off"));
                     cut_off_speech(&this.songbird, &this.music, this.guild).await;
                 }
                 let finished = this.segmenter.lock().expect("segmenter poisoned").tick(&heard, &silent);
@@ -557,7 +560,7 @@ mod speech_tests {
             let failed = wallis_core::tuning::Tuning { voice: "test-voice".into(), temp: 0.8, ..Default::default() };
             let speech = Speech { text: "Keep this reply".into(), tuning: Arc::new(Mutex::new(failed.clone())), send: Arc::new(move |event| { let _ = send.send(event); }), guild: 1, generation: 7, retried: prefix > 0, reported: Default::default() };
             let source = std::io::Read::chain(std::io::Read::take(std::io::repeat(0), prefix), Broken);
-            let mut stream = SpeechStream { stream: source, speech: speech.clone(), bytes: 0 };
+            let mut stream = SpeechStream { stream: source, speech: speech.clone(), bytes: 0, started: std::time::Instant::now() };
             let mut audio = Vec::new();
             assert!(std::io::Read::read_to_end(&mut stream, &mut audio).is_err());
             assert_eq!(audio.len(), prefix as usize);

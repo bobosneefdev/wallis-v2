@@ -150,7 +150,7 @@ impl Server {
             "stop_wallis" => { self.running.take(); Ok(json!({"state":"stopped","message":"Wallis is stopped."})) }
             "get_runtime_status" => Ok(match &self.running { None => json!({"state":"stopped","message":"Wallis is stopped."}), Some(r) => match r.failure.lock().unwrap().as_ref() { Some(e) => json!({"state":"unavailable","message":e}), None => json!({"state":"running","message":"Wallis is online."}) } }),
             "get_stats" => Ok(self.running.as_ref().and_then(|r| r.bot.lock().unwrap().as_ref().map(|b| json!(b.stats.snapshot()))).unwrap_or(Value::Null)),
-            "get_audit_log" => Ok(self.running.as_ref().and_then(|r| r.bot.lock().unwrap().as_ref().map(|b| json!(b.stats.audit_log()))).unwrap_or(json!([]))),
+            "get_log" => Ok(json!(wallis_core::stats::tail(args["since"].as_u64().unwrap_or(0)))),
             "get_profile" => serde_json::to_value(read_profile(data)?).map_err(|e| e.to_string()),
             "get_jobs" => Ok(json!(Jobs::open(&data.join("jobs.sqlite").to_string_lossy())?.with_status(&["queued","running","done","failed"])?)),
             "retry_job" => Ok(json!(Jobs::open(&data.join("jobs.sqlite").to_string_lossy())?.retry(args["id"].as_i64().ok_or("Missing job id.")?)?)),
