@@ -162,6 +162,24 @@ impl Drop for Agent {
 mod tests {
     use super::*;
 
+    /// Writes `body` as an executable stand-in for Pi in a fresh temp dir and starts it. Tests run in parallel, and a fork in
+    /// another test can briefly inherit this file's write handle, so exec may fail with ETXTBSY: retry until it is released.
+    fn fake(name: &str, body: &str, role: Role) -> (std::path::PathBuf, Agent) {
+        let dir = std::env::temp_dir().join(format!("wallis-agent-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join(format!("{name}.sh"));
+        std::fs::write(&script, body).unwrap();
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap(); }
+        let config = RoleConfig { provider: "openai-codex".into(), model: "gpt-6-sol".into(), effort: "low".into(), ..RoleConfig::default() };
+        for _ in 0..100 {
+            match Agent::spawn(script.to_str().unwrap(), role, &config, &dir.join("pi"), "system", &dir, None) {
+                Err(error) if error.contains("Text file busy") => std::thread::sleep(Duration::from_millis(10)),
+                result => return (dir, result.unwrap()),
+            }
+        }
+        panic!("{} stayed busy", script.display());
+    }
+
     /// A stand-in for Pi: streams text, asks the host for `say`, waits for the answer, then settles.
     const FAKE_PI: &str = r#"#!/bin/sh
 read prompt
@@ -177,13 +195,7 @@ sleep 5
 
     #[test]
     fn runs_a_turn_streams_text_and_answers_host_calls() {
-        let dir = std::env::temp_dir().join(format!("wallis-agent-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("fake-pi.sh");
-        std::fs::write(&script, FAKE_PI).unwrap();
-        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap(); }
-        let config = RoleConfig { provider: "openai-codex".into(), model: "gpt-6-sol".into(), effort: "low".into(), ..RoleConfig::default() };
-        let mut agent = Agent::spawn(script.to_str().unwrap(), Role::Realtime, &config, &dir.join("pi"), "system", &dir, None).unwrap();
+        let (dir, mut agent) = fake("turn", FAKE_PI, Role::Realtime);
         let (mut calls, mut streamed) = (vec![], String::new());
         let images = vec![crate::media::Image { r#type: "image".into(), data: "aGVsbG8=".into(), mime_type: "image/png".into() }];
         let reply = agent.turn_with_images("hello", &images, Duration::from_secs(5), &mut Vec::new, &mut |call| { calls.push((call.tool, call.args)); "spoken".into() }, &mut |delta| streamed.push_str(delta)).unwrap();
@@ -210,13 +222,7 @@ sleep 5
 
     #[test]
     fn steering_reaches_a_running_turn_without_aborting_it() {
-        let dir = std::env::temp_dir().join(format!("wallis-agent-steer-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("steerable.sh");
-        std::fs::write(&script, STEERABLE_PI).unwrap();
-        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap(); }
-        let config = RoleConfig { provider: "p".into(), model: "m".into(), ..RoleConfig::default() };
-        let mut agent = Agent::spawn(script.to_str().unwrap(), Role::Realtime, &config, &dir.join("pi"), "s", &dir, None).unwrap();
+        let (dir, mut agent) = fake("steer", STEERABLE_PI, Role::Realtime);
         let mut sent = false;
         let reply = agent.turn_steered("go", Duration::from_secs(5), &mut || if std::mem::replace(&mut sent, true) { vec![] } else { vec!["look left".into()] }, &mut |_| String::new(), &mut |_| {}).unwrap();
         assert_eq!(reply, "AB");
@@ -233,13 +239,7 @@ while read line; do case "$line" in *abort*) echo '{"type":"agent_settled","abor
 
     #[test]
     fn a_turn_past_its_limit_is_aborted_but_the_agent_survives() {
-        let dir = std::env::temp_dir().join(format!("wallis-agent-slow-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("slow.sh");
-        std::fs::write(&script, SLOW_PI).unwrap();
-        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap(); }
-        let config = RoleConfig { provider: "p".into(), model: "m".into(), ..RoleConfig::default() };
-        let mut agent = Agent::spawn(script.to_str().unwrap(), Role::Realtime, &config, &dir.join("pi"), "s", &dir, None).unwrap();
+        let (dir, mut agent) = fake("slow", SLOW_PI, Role::Realtime);
         agent.limit = Duration::from_millis(300);
         let started = Instant::now();
         assert!(agent.turn("x", Duration::from_secs(5), &mut |_| String::new(), &mut |_| {}).unwrap_err().contains("too long"));
@@ -249,13 +249,7 @@ while read line; do case "$line" in *abort*) echo '{"type":"agent_settled","abor
 
     #[test]
     fn times_out_when_pi_goes_silent() {
-        let dir = std::env::temp_dir().join(format!("wallis-agent-silent-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("silent.sh");
-        std::fs::write(&script, "#!/bin/sh\nsleep 5\n").unwrap();
-        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap(); }
-        let config = RoleConfig { provider: "p".into(), model: "m".into(), ..RoleConfig::default() };
-        let mut agent = Agent::spawn(script.to_str().unwrap(), Role::Worker, &config, &dir.join("pi"), "s", &dir, None).unwrap();
+        let (dir, mut agent) = fake("silent", "#!/bin/sh\nsleep 5\n", Role::Worker);
         assert!(agent.turn("x", Duration::from_millis(200), &mut |_| String::new(), &mut |_| {}).unwrap_err().contains("stopped responding"));
         std::fs::remove_dir_all(&dir).ok();
     }
