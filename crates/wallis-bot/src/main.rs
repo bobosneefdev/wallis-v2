@@ -133,7 +133,7 @@ impl Server {
         let settings = wallis_discord::Settings { token: token.into(), data_dir: DATA.into(), allowed_users: list(&c.discord_allowed_users), read_channels: list(&c.discord_read_channels), write_channels: list(&c.discord_write_channels), profile: Arc::new(|| profile_json(Path::new(DATA))) };
         runtime.spawn(async move {
             let ready = move |out: wallis_discord::Out| { *ready_out.lock().unwrap() = Some(out.clone()); std::thread::spawn(move || match bot::start(config, out) { Ok(started) => *ready_bot.lock().unwrap() = Some(started), Err(e) => *startup_failure.lock().unwrap() = Some(e) }); };
-            let event = move |event| { if let Some(bot) = event_bot.lock().unwrap().as_ref() { let _ = bot.sender.send(event); } };
+            let event = move |event| { if let Some(bot) = event_bot.lock().unwrap().as_ref() { bot.send(event); } };
             if let Err(e) = wallis_discord::run(settings, ready, event).await { *end_failure.lock().unwrap() = Some(e); }
         });
         self.running = Some(Running { bot, out, failure, _runtime: runtime, _speech: speech });

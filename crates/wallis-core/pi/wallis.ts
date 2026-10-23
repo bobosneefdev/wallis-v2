@@ -14,12 +14,17 @@ async function callHost(ctx: any, tool: string, args: unknown): Promise<string> 
 
 const text = (value: string) => ({ content: [{ type: "text" as const, text: value }], details: {} });
 
+// `done: true` ends the turn after this call instead of asking the model what to do next, which saves a whole model call
+// per reply. Pi stops only when every call in the batch says so, and never after a failure the model should see.
+const done = Type.Optional(Type.Boolean({ description: "True when this is the last thing you do this turn. Skips a round-trip, so reply faster." }));
+const finish = (params: { done?: boolean }, value: string) => ({ ...text(value), terminate: params.done === true && !value.startsWith("Failed:") });
+
 const tools = [
   defineTool({
     name: "say", label: "Say",
     description: "Speak one short sentence or clause aloud in the voice call. Call once per spoken chunk, as soon as it is ready.",
-    parameters: Type.Object({ text: Type.String() }),
-    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "say", params)); },
+    parameters: Type.Object({ text: Type.String(), done }),
+    async execute(_id, params, _signal, _update, ctx) { return finish(params, await callHost(ctx, "say", params)); },
   }),
   defineTool({
     name: "stop_speaking", label: "Stop speaking",
@@ -30,8 +35,8 @@ const tools = [
   defineTool({
     name: "message", label: "Message",
     description: "Post a text message in an allowed Discord channel.",
-    parameters: Type.Object({ channelId: Type.String(), text: Type.String() }),
-    async execute(_id, params, _signal, _update, ctx) { return text(await callHost(ctx, "message", params)); },
+    parameters: Type.Object({ channelId: Type.String(), text: Type.String(), done }),
+    async execute(_id, params, _signal, _update, ctx) { return finish(params, await callHost(ctx, "message", params)); },
   }),
   defineTool({
     name: "file", label: "File",
@@ -43,7 +48,8 @@ const tools = [
     name: "skip", label: "Skip",
     description: "Stay silent this turn. Use when others are talking to each other or you have nothing to add.",
     parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _update, ctx) { return text(await callHost(ctx, "skip", {})); },
+    // Staying silent always ends the turn.
+    async execute(_id, _params, _signal, _update, ctx) { return finish({ done: true }, await callHost(ctx, "skip", {})); },
   }),
   defineTool({
     name: "join_call", label: "Join call",

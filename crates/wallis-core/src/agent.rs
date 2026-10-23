@@ -17,7 +17,10 @@ struct Handle { child: Child, confined: bool }
 /// How often a running turn looks for steering messages.
 const POLL: Duration = Duration::from_millis(100);
 
-pub struct Agent { handle: Handle, stdin: Box<dyn Write + Send>, lines: Receiver<String>, next_id: u64 }
+pub struct Agent { handle: Handle, stdin: Box<dyn Write + Send>, lines: Receiver<String>, next_id: u64,
+    /// The longest one turn may spend waiting on the model before it is aborted (the worker's is five minutes). Time spent
+    /// running Wallis' own tools (a song download, joining a call) does not count.
+    pub limit: Duration }
 
 impl Agent {
     /// Starts Pi for `role`. `dir` is the role's own Pi config dir (auth, settings, MCP config) and also holds the extension file.
@@ -57,7 +60,7 @@ impl Agent {
                 for line in splitter.push(&buffer[..read]) { if sender.send(line).is_err() { return; } }
             }
         });
-        Ok(Self { handle, stdin, lines, next_id: 0 })
+        Ok(Self { handle, stdin, lines, next_id: 0, limit: Duration::from_secs(300) })
     }
 
     fn send(&mut self, value: &serde_json::Value) -> Result<(), String> {
@@ -83,12 +86,15 @@ impl Agent {
         let id = format!("wallis-{}", self.next_id);
         self.send(&json!({ "id": id, "type": "prompt", "message": message, "images": images }))?;
         let (mut reply, mut last_event) = (String::new(), Instant::now());
-        let started = Instant::now();
+        let (started, mut overdue, mut tools) = (Instant::now(), false, Duration::ZERO);
         loop {
             if self.handle.confined {
                 crate::mods::check_budget(Path::new("/var/lib/wallis"))?;
-                if started.elapsed() > Duration::from_secs(300) { return Err("Worker timed out.".into()); }
+                if started.elapsed() > self.limit { return Err("Worker timed out.".into()); }
             }
+            // Past the limit, a live agent aborts and lets Pi settle, so it keeps its context for the next turn.
+            // Queued steers survive an abort in Pi, so drop them first: what was said during this turn is stale by now.
+            if !overdue && started.elapsed().saturating_sub(tools) > self.limit { overdue = true; self.send(&json!({ "type": "clear_queue" }))?; self.abort(); }
             for text in steer() { self.send(&json!({ "type": "steer", "message": text }))?; }
             let line = match self.lines.recv_timeout(POLL.min(timeout)) {
                 Ok(line) => { last_event = Instant::now(); line }
@@ -98,20 +104,37 @@ impl Agent {
             };
             if let Some(call) = pi::parse_host_call(&line) {
                 let request_id = call.request_id.clone();
+                let running = Instant::now();
                 let result = on_host(call);
+                (tools, last_event) = (tools + running.elapsed(), Instant::now());
                 self.send(&pi::host_reply(&request_id, &result))?;
                 continue;
             }
             match pi::parse_event(&line)? {
                 Event::TextDelta(delta) => { on_delta(&delta); reply.push_str(&delta); }
                 Event::Response { id: Some(rid), success: false, error } if rid == id => return Err(error.unwrap_or_else(|| "Pi rejected the prompt.".into())),
-                Event::Settled { aborted } => return if aborted { Err("The turn was aborted.".into()) } else { Ok(reply) },
+                Event::Settled { aborted } => return if overdue { Err("The turn ran too long and was stopped.".into()) } else if aborted { Err("The turn was aborted.".into()) } else { Ok(reply) },
                 _ => {}
             }
         }
     }
 
     pub fn abort(&mut self) { let _ = self.send(&json!({ "type": "abort" })); }
+
+    /// Sends one RPC command between turns and returns its response's `data`.
+    pub fn command(&mut self, kind: &str, timeout: Duration) -> Result<serde_json::Value, String> {
+        self.next_id += 1;
+        let id = format!("wallis-{}", self.next_id);
+        self.send(&json!({ "id": id, "type": kind }))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let line = self.lines.recv_timeout(deadline.saturating_duration_since(Instant::now())).map_err(|_| format!("Pi did not answer {kind}."))?;
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            if value["type"] == "response" && value["id"] == id.as_str() {
+                return if value["success"] == true { Ok(value["data"].clone()) } else { Err(value["error"].as_str().unwrap_or("Pi refused the command.").into()) };
+            }
+        }
+    }
 }
 
 impl Drop for Agent {
@@ -181,6 +204,29 @@ sleep 5
         let reply = agent.turn_steered("go", Duration::from_secs(5), &mut || if std::mem::replace(&mut sent, true) { vec![] } else { vec!["look left".into()] }, &mut |_| String::new(), &mut |_| {}).unwrap();
         assert_eq!(reply, "AB");
         drop(agent);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Keeps "thinking" until it is told to abort, then settles like Pi does.
+    const SLOW_PI: &str = r#"#!/bin/sh
+read prompt
+echo '{"type":"response","id":"wallis-1","success":true}'
+while read line; do case "$line" in *abort*) echo '{"type":"agent_settled","aborted":true}';; esac; done
+"#;
+
+    #[test]
+    fn a_turn_past_its_limit_is_aborted_but_the_agent_survives() {
+        let dir = std::env::temp_dir().join(format!("wallis-agent-slow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("slow.sh");
+        std::fs::write(&script, SLOW_PI).unwrap();
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap(); }
+        let config = RoleConfig { provider: "p".into(), model: "m".into(), ..RoleConfig::default() };
+        let mut agent = Agent::spawn(script.to_str().unwrap(), Role::Realtime, &config, &dir.join("pi"), "s", &dir, None).unwrap();
+        agent.limit = Duration::from_millis(300);
+        let started = Instant::now();
+        assert!(agent.turn("x", Duration::from_secs(5), &mut |_| String::new(), &mut |_| {}).unwrap_err().contains("too long"));
+        assert!(started.elapsed() < Duration::from_secs(2));
         std::fs::remove_dir_all(&dir).ok();
     }
 

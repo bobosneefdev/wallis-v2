@@ -49,6 +49,8 @@ pub enum Incoming {
     MediaDelete { channel: u64, messages: Vec<u64> },
     /// A finished utterance of 48 kHz interleaved stereo PCM from an allow-listed speaker.
     Voice { guild: u64, channel: u64, user: u64, speaker: String, pcm: Vec<i16> },
+    /// A `Voice` utterance after transcription. The bot makes these off the brain thread; Discord never sends them.
+    Heard { guild: u64, channel: u64, user: u64, speaker: String, said: String },
     /// Someone joined, left or moved within Wallis's call. `from`/`to` are voice channel ids (0 = none); only changes touching his channel are sent.
     Presence { guild: u64, user: u64, speaker: String, from: u64, to: u64 },
     /// Includes synthesis startup and mid-stream playback failures.
