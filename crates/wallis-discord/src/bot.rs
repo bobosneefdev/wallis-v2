@@ -450,15 +450,20 @@ pub fn start(config: BotConfig, out: Out) -> Result<Bot, String> {
         let mut brain = Brain { config: brain_config, out: brain_out, jobs, reminders, stats: brain_stats, agent: None, convos: Default::default(), started: now, media: media::History::default(), last_text_reply: None, speech_notes: Default::default(), presence: Default::default(), announced: Default::default(), backlog: Default::default(), last_turn: now, compact_checked: true };
         let mut queue = Queue { rx: &receiver, later: Vec::new() };
         // Waking once a second is the reminder clock; events still arrive immediately.
+        // A panic while handling one event must not silently end this thread: he would look online but never answer again.
         loop {
-            match receiver.recv_timeout(Duration::from_secs(1)) {
-                Ok((at, event)) => brain.handle(at, event, &mut queue),
-                Err(RecvTimeoutError::Timeout) => brain.compact_when_idle(),
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-            brain.fire_due(&mut queue);
-            brain.deliver_jobs(&mut queue);
-            while !queue.later.is_empty() { let (at, next) = queue.later.remove(0); brain.handle(at, next, &mut queue); }
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match receiver.recv_timeout(Duration::from_secs(1)) {
+                    Ok((at, event)) => brain.handle(at, event, &mut queue),
+                    Err(RecvTimeoutError::Timeout) => brain.compact_when_idle(),
+                    Err(RecvTimeoutError::Disconnected) => return false,
+                }
+                brain.fire_due(&mut queue);
+                brain.deliver_jobs(&mut queue);
+                while !queue.later.is_empty() { let (at, next) = queue.later.remove(0); brain.handle(at, next, &mut queue); }
+                true
+            }));
+            match step { Ok(true) => {} Ok(false) => break, Err(_) => log("error", "realtime crashed handling an event (see runtime.log); carrying on") }
         }
     });
 

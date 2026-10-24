@@ -3,7 +3,7 @@
 pub mod bot;
 mod music;
 use songbird::driver::DecodeMode;
-use songbird::events::{CoreEvent, Event, EventContext, EventHandler as VoiceHandler};
+use songbird::events::{context_data::{DisconnectKind, DisconnectReason}, CoreEvent, Event, EventContext, EventHandler as VoiceHandler};
 use songbird::input::{core::io::{MediaSource, ReadOnlySource}, AudioStream, AudioStreamError, Compose, Input, RawAdapter};
 use songbird::shards::TwilightMap;
 use songbird::{Config as VoiceConfig, Songbird};
@@ -220,6 +220,7 @@ impl Out {
                 call.remove_all_global_events();
                 call.add_global_event(CoreEvent::SpeakingStateUpdate.into(), SharedReceive(receive.clone()));
                 call.add_global_event(CoreEvent::VoiceTick.into(), SharedReceive(receive));
+                call.add_global_event(CoreEvent::DriverDisconnect.into(), Rejoin { songbird: self.songbird.clone(), music: self.music.clone() });
             }
             self.songbird.join(guild, channel).await.map_err(|error| format!("Could not join that channel: {error}"))?;
             Ok(channel.get())
@@ -276,6 +277,37 @@ struct Receive { guild: u64, channel: u64, settings: Settings, send: Send, ssrc:
 async fn cut_off_speech(songbird: &Songbird, music: &music::Player, guild: u64) {
     music.reset_speech(guild).await;
     if let Some(call) = songbird.get(Id::<GuildMarker>::new(guild)) { call.lock().await.queue().stop(); }
+}
+
+/// Discord drops voice connections (voice server moves, expired sessions, network blips). Songbird gives up after its retries
+/// but still reports the channel, so `join` would see him as already there and he would sit in a dead call. Rejoin it instead,
+/// dropping speech that piled up while the call was down.
+struct Rejoin { songbird: Arc<Songbird>, music: Arc<music::Player> }
+
+#[async_trait::async_trait]
+impl VoiceHandler for Rejoin {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        let EventContext::DriverDisconnect(data) = ctx else { return None };
+        // Leaving and moving are deliberate; a failed first connect is a join attempt (this one or a tool's) that reports its own error.
+        if data.kind == DisconnectKind::Connect || matches!(data.reason, None | Some(DisconnectReason::Requested | DisconnectReason::AttemptDiscarded)) { return None; }
+        wallis_core::stats::log("error", format!("voice connection lost ({:?}, {:?}); rejoining", data.kind, data.reason));
+        let (songbird, music, guild, channel) = (self.songbird.clone(), self.music.clone(), data.guild_id, data.channel_id);
+        tokio::spawn(async move {
+            let Some(call) = songbird.get(guild) else { return };
+            if call.lock().await.current_channel() != Some(channel) { return; }
+            cut_off_speech(&songbird, &music, guild.0.get()).await;
+            for attempt in 1..=3 {
+                let _ = call.lock().await.leave().await;
+                // Discord echoes the leave; a join sent before that echo arrives would be cancelled by it.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                match songbird.join(guild, channel).await {
+                    Ok(_) => return wallis_core::stats::log("voice", "rejoined the call"),
+                    Err(error) => wallis_core::stats::log("error", format!("voice rejoin {attempt}/3: {error}")),
+                }
+            }
+        });
+        None
+    }
 }
 
 struct SharedReceive(Arc<Receive>);
