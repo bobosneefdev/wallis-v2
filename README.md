@@ -1,6 +1,6 @@
 # Wallis
 
-A Windows desktop Discord companion built with Tauri, Svelte, Twilight and Songbird. Wallis 0.7.0 runs the bot, agents, local speech, music and browser inside a private **WSL2** distro. Pi runs the realtime and worker agents; Mnemosyne provides local memory.
+A Windows desktop Discord companion built with Tauri, Svelte, Twilight and Songbird. Wallis 0.7.1 runs the bot, agents, local speech, music and browser inside a private **WSL2** distro. Pi runs the realtime and worker agents; Mnemosyne provides local memory.
 
 Install WSL2 before first setup: run `wsl --install --no-distribution` as administrator, restart Windows, then open Wallis. Virtualization must be enabled. First setup downloads a versioned, checksummed Ubuntu 26.04 runtime with CPU speech models and browser tools. It needs several GB of disk space. The Windows desktop manages settings, sign-in and updates; runtime control uses stdin/stdout without a listening port.
 
@@ -81,7 +81,7 @@ Using the provisioned Python environment, `python crates/wallis-core/py/media_ch
 Build the release image on an Ubuntu host with root privileges:
 
 ```sh
-sudo scripts/rootfs/build.sh target/release/wallis-bot /path/to/output 0.7.0
+sudo scripts/rootfs/build.sh target/release/wallis-bot /path/to/output 0.7.1
 ```
 
 This produces `wallis-rootfs.tar.gz.*` parts and the image checksum after sandbox, browser, mod and real speech roundtrip checks; GitHub caps one release asset at 2 GiB, so reassemble an importable image with `cat wallis-rootfs.tar.gz.[0-9]* > wallis-rootfs.tar.gz` and verify it against the checksum. The release workflow builds the Linux image first, then publishes it with the Windows installer under the matching version tag. Inside an imported test distro, run `/opt/wallis/bin/wallis-bot --self-check` as root for uid/filesystem isolation, browser navigation and a real Bun mod roundtrip. This initializes the workspace; use a disposable test distro. Stage `crates/wallis-core/py/speech_check.py` there and run it with `/opt/wallis/tools/venv/bin/python` as `wallis` to repeat the speech check.

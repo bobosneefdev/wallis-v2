@@ -131,15 +131,16 @@ async fn stop_wallis(app: tauri::AppHandle) -> Result<RuntimeStatus,String> {
     }).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]
-async fn get_runtime_status(app: tauri::AppHandle) -> RuntimeStatus {
+/// While another request (often the live log poll) holds the runtime, this fails and the page keeps the status it last showed.
+async fn get_runtime_status(app: tauri::AppHandle) -> Result<RuntimeStatus,String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let Ok(mut running) = state.running.try_lock() else { return status("running","The Linux runtime is busy…") };
-        match running.as_mut() {
+        let Ok(mut running) = state.running.try_lock() else { return Err("The Linux runtime is busy…".into()) };
+        Ok(match running.as_mut() {
             None => status("stopped","Wallis is stopped."),
             Some(session) => session.request("get_runtime_status",serde_json::json!({})).and_then(|v|serde_json::from_value(v).map_err(|e|e.to_string())).unwrap_or_else(|e|status("unavailable",e)),
-        }
-    }).await.unwrap_or_else(|e|status("unavailable",e.to_string()))
+        })
+    }).await.map_err(|e|e.to_string())?
 }
 fn poll(state: &AppState, command: &str, args: serde_json::Value, empty: serde_json::Value) -> Result<serde_json::Value,String> {
     let Ok(mut running) = state.running.try_lock() else { return Ok(empty) };
